@@ -404,6 +404,80 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt SweeperSchedule.Arn
 
+  # --- notifier: a Spot reclaim becomes a failed check run -------------------
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-notifier"
+      RetentionInDays: !Ref LogRetentionDays
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-notifier"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-notifier"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${NotifierLogGroup.Arn}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+
+  NotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-notifier"
+      Description: Reports a Spot reclaim as a failed check run.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt NotifierRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref NotifierLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          GITHUB_ORG: !Ref GitHubOrg
+          STACK_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: |
+          //@inline functions/notifier.js
+
+  # Matches every Spot warning (no tag filter); the notifier ignores the rest.
+  NotifierRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-notifier"
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Spot Instance Interruption Warning]
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+
+  NotifierRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NotifierRule.Arn
+
   # --- network: a VPC of its own, public subnets, no NAT --------------------
   Vpc:
     Type: AWS::EC2::VPC
