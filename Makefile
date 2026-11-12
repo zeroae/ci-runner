@@ -3,7 +3,7 @@ PROFILE ?= zeroae-code/AWSPowerUserAccess
 REGION  ?= us-east-1
 AWS      = aws --profile $(PROFILE) --region $(REGION)
 
-.PHONY: help test build validate deploy outputs hand-launch runners
+.PHONY: help test build validate deploy outputs hand-launch runners sweep
 .DEFAULT_GOAL := help
 
 help: ## List the targets
@@ -37,3 +37,6 @@ runners: ## List the stack's CI runner instances that are not terminated
 	  --filters Name=tag:ci-runner:stack,Values=$(STACK) \
 	    Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
 	  --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,LaunchTime]' --output text
+
+sweep: ## Run the sweeper now, and print what it terminated and removed
+	@$(AWS) lambda invoke --function-name $(STACK)-sweeper /dev/stdout --query FunctionError --output text
