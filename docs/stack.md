@@ -46,7 +46,11 @@ scripts/build-template.js   template.yaml -> build/template.yaml (git-ignored)
 - `make build`: writes `build/template.yaml` and prints its size against the
   **51,200-byte** limit (the largest template `aws cloudformation deploy` sends
   without an S3 bucket). The build fails at or over it, and
-  `test/build.test.js` checks it too.
+  `test/build.test.js` checks it too. To save room, the build drops whole-line
+  `//` comments from the inlined code and whole-line `#` comments from the
+  template (outside block scalars), so comment the source freely. If it fills
+  up again, the next step is deploying through an S3 bucket (`--s3-bucket`,
+  1 MB limit).
 - `make deploy`: test, build, then `cloudformation deploy` with
   `CAPABILITY_NAMED_IAM`, then print the outputs. It creates the stack the
   first time and updates it after. Override `STACK`, `PROFILE`, `REGION` on the

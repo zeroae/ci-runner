@@ -49,6 +49,14 @@ test('whole-line // comments are dropped, but not inside a template literal', ()
   assert.equal(load(code).t, 'a\n// kept: part of the string\nb');
 });
 
+test('whole-line YAML comments are dropped, but not inside a block scalar', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'tpl-'));
+  fs.writeFileSync(path.join(dir, 't.yaml'),
+    '# top\nDescription: >-\n  text\n  # kept: block content\nA:\n    # indented comment\n  B: 1 # trailing stays\n');
+  assert.equal(build(path.join(dir, 't.yaml')),
+    'Description: >-\n  text\n  # kept: block content\nA:\n  B: 1 # trailing stays\n');
+});
+
 test('the real template embeds every function, each runnable alone, under the inline size limit', () => {
   const out = build(path.join(root, 'template.yaml'));
   assert.doesNotMatch(out, /^ *\/\/@inline /m);
