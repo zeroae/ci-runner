@@ -133,10 +133,28 @@ toolcache, the cost model) are the part worth reading.
 | `ci-ondemand` | EC2 On-Demand, `.xlarge` | critical jobs |
 | (none; `ubuntu-latest`) | GitHub-hosted | short jobs |
 
-A consuming repo chooses per job. Each one routes through a repo variable so it
-can fall back without a code change (the variable's name is the repo's own):
-set, a moved job asks for `[self-hosted, ci-spot]` or
-`[self-hosted, ci-ondemand]`; unset, it asks for `ubuntu-latest`.
+A consuming repo chooses per job.
+
+#### Adopting the CI runners in a private repo (the pattern to follow)
+1. Install the App on the repo and add the repo to the `ci-runner` runner
+   group.
+2. Route each moved job through **one repo variable**, so the repo can fall
+   back to GitHub-hosted runners without a code change. The first consumer's
+   variable is `ZAE_CI_RUNNER`:
+
+   ```yaml
+   jobs:
+     tests:
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-spot"]') || 'ubuntu-latest' }}
+     apply:
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-ondemand"]') || 'ubuntu-latest' }}
+   ```
+
+   Unset (the default), every job runs on `ubuntu-latest`, so the change merges
+   dark. Set to any value, the moved jobs go to our runners. Unsetting it is the
+   rollback.
+3. Make the moved job's first step the repo's own toolset check.
+4. Set the variable, and watch the canary.
 
 **Rollout, per repo:** one job moves first as a canary (typically its test
 job). Its measured queued-to-started time *is* the boot time, and that number
@@ -423,3 +441,7 @@ About $0.40 a month.
 - A pre-built AMI or pre-pulled image (after boot time is measured).
 - Pinning the runner, base image and tools.
 - More instance sizes, and per-repo caps.
+- **Fargate capacity** (`ci-fargate`) for jobs that need no Docker daemon, such
+  as a test that only probes a deployed system over HTTP. Ruled out above for
+  jobs that build images or start containers, not for these. A consumer has
+  asked for it.
