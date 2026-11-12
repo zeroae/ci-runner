@@ -10,6 +10,7 @@ const PEM = privateKey.export({ type: 'pkcs1', format: 'pem' });
 const ENV = {
   GITHUB_ORG: 'zeroae', RUNNER_GROUP: 'ci-runner', STACK_NAME: 'ci-runner',
   LAUNCH_TEMPLATE_ID: 'lt-0abc', SUBNET_IDS: 'subnet-a,subnet-b,subnet-c',
+  QUEUE_URL: 'https://sqs.example/jobs', SPOT_CAP: '6', ONDEMAND_CAP: '2',
 };
 const JIT = 'ZW5jb2RlZGppdA==';
 
@@ -51,10 +52,18 @@ function fakeGitHub({ jobStatus = 'queued', jit = { status: 201 }, groups = [{ i
   return { fetch, calls, keys: () => calls.map((c) => c.key) };
 }
 
-function fakeEc2({ fleet = { Instances: [{ InstanceIds: ['i-0123'] }], Errors: [] } } = {}) {
+// `running` lists the stack's instances: { lifecycle: 'spot' | undefined, state }.
+function fakeEc2({ fleet = { Instances: [{ InstanceIds: ['i-0123'] }], Errors: [] }, running = [] } = {}) {
   const calls = [];
   return {
     calls,
+    describeInstances: async (input) => {
+      calls.push(['describe', input]);
+      const all = running.map((r, i) => ({ InstanceId: `i-r${i}`, State: { Name: r.state || 'running' }, ...(r.lifecycle ? { InstanceLifecycle: r.lifecycle } : {}) }));
+      // Two pages, to check NextToken is followed.
+      if (!input.NextToken) return { Reservations: [{ Instances: all.slice(0, 1) }], NextToken: all.length > 1 ? 'p2' : undefined };
+      return { Reservations: [{ Instances: all.slice(1) }] };
+    },
     createLaunchTemplateVersion: async (input) => { calls.push(['createVersion', input]); return { LaunchTemplateVersion: { VersionNumber: 9 } }; },
     createFleet: async (input) => { calls.push(['createFleet', input]); return fleet; },
     deleteLaunchTemplateVersions: async (input) => { calls.push(['deleteVersions', input]); return {}; },
@@ -63,11 +72,13 @@ function fakeEc2({ fleet = { Instances: [{ InstanceIds: ['i-0123'] }], Errors: [
 
 function setup({ gh = fakeGitHub(), ec2 = fakeEc2(), env = ENV } = {}) {
   const logs = [];
+  const sent = [];
+  const sqs = { sendMessage: async (input) => { sent.push(input); return {}; } };
   const handler = createHandler({
     secret: { get: async () => ({ app_id: 42, private_key: PEM, webhook_secret: 'w' }) },
-    fetch: gh.fetch, ec2, now: () => T0, env, log: (l) => logs.push(l),
+    fetch: gh.fetch, ec2, sqs, now: () => T0, env, log: (l) => logs.push(l),
   });
-  return { handler, gh, ec2, logs };
+  return { handler, gh, ec2, sqs: sent, logs };
 }
 
 const sqsEvent = (...msgs) => ({ Records: msgs.map((m, i) => ({ messageId: `m${i}`, body: JSON.stringify(m) })) });
@@ -93,9 +104,9 @@ test('a queued job mints a JIT config in the ci-runner group with its labels', a
 test('a queued job launches one Spot instance from the launch template, tagged with the job', async () => {
   const { handler, ec2, logs } = setup();
   assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] });
-  assert.deepEqual(ec2.calls.map((c) => c[0]), ['createVersion', 'createFleet', 'deleteVersions']);
+  assert.deepEqual(ec2.calls.map((c) => c[0]), ['describe', 'createVersion', 'createFleet', 'deleteVersions']);
 
-  const [, version] = ec2.calls[0];
+  const [, version] = ec2.calls[1];
   assert.equal(version.LaunchTemplateId, 'lt-0abc');
   assert.equal(version.SourceVersion, '$Default');
   const userData = Buffer.from(version.LaunchTemplateData.UserData, 'base64').toString();
@@ -103,7 +114,7 @@ test('a queued job launches one Spot instance from the launch template, tagged w
   assert.ok(userData.includes(`content: ${JIT}\n`), 'the JIT config is in the user-data');
   assert.deepEqual(Object.keys(version.LaunchTemplateData), ['UserData']);
 
-  const [, fleet] = ec2.calls[1];
+  const [, fleet] = ec2.calls[2];
   assert.equal(fleet.Type, 'instant');
   assert.deepEqual(fleet.TargetCapacitySpecification, { TotalTargetCapacity: 1, DefaultTargetCapacityType: 'spot' });
   assert.deepEqual(fleet.SpotOptions, { AllocationStrategy: 'capacity-optimized' });
@@ -117,7 +128,7 @@ test('a queued job launches one Spot instance from the launch template, tagged w
     'ci-runner:job-id': '555', 'ci-runner:run-id': '444', 'ci-runner:head-sha': 'abc123', 'ci-runner:job-name': 'tests',
   });
 
-  assert.deepEqual(ec2.calls[2][1], { LaunchTemplateId: 'lt-0abc', Versions: ['9'] });
+  assert.deepEqual(ec2.calls[3][1], { LaunchTemplateId: 'lt-0abc', Versions: ['9'] });
   assert.ok(logs.some((l) => /i-0123/.test(l)), 'the instance id is logged');
   assert.ok(!logs.some((l) => l.includes(JIT) || l.includes('ghs_install')), 'no secrets in the logs');
 });
@@ -149,7 +160,7 @@ test('a failed launch removes the registration, deletes the version, and retries
 test('a missing runner group fails the message so it is retried', async () => {
   const { handler, ec2 } = setup({ gh: fakeGitHub({ groups: [{ id: 1, name: 'Default' }] }) });
   assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [{ itemIdentifier: 'm0' }] });
-  assert.equal(ec2.calls.length, 0);
+  assert.deepEqual(ec2.calls.map((c) => c[0]), ['describe'], 'nothing launched');
 });
 
 test('a malformed message is dropped, not retried', async () => {
@@ -157,4 +168,66 @@ test('a malformed message is dropped, not retried', async () => {
   const res = await handler({ Records: [{ messageId: 'x', body: 'not json' }, { messageId: 'y', body: '{"repo":"zeroae/app"}' }] });
   assert.deepEqual(res, { batchItemFailures: [] });
   assert.equal(gh.calls.length, 0);
+});
+
+const SPOT = { lifecycle: 'spot' };
+const OD = {};
+const OD_MSG = { ...MSG, label: 'ci-ondemand', labels: ['self-hosted', 'ci-ondemand'] };
+const launched = (ec2) => ec2.calls.some((c) => c[0] === 'createFleet');
+
+test('the cap counts the stack\'s live instances by tag', async () => {
+  const { handler, ec2 } = setup();
+  await handler(sqsEvent(MSG));
+  const [, input] = ec2.calls[0];
+  assert.deepEqual(input.Filters, [
+    { Name: 'tag:ci-runner:stack', Values: ['ci-runner'] },
+    { Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
+  ]);
+});
+
+test('at the Spot cap, a Spot job goes back on the queue with a delay and nothing launches', async () => {
+  const ec2 = fakeEc2({ running: Array(6).fill(SPOT) });
+  const { handler, gh, sqs, logs } = setup({ ec2 });
+  assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] }, 'the original is consumed');
+  assert.deepEqual(sqs, [{ QueueUrl: 'https://sqs.example/jobs', MessageBody: JSON.stringify(MSG), DelaySeconds: 60 }]);
+  assert.ok(!launched(ec2));
+  assert.ok(!gh.keys().some((k) => k.includes('generate-jitconfig')), 'nothing is minted');
+  assert.ok(logs.some((l) => /"deferred"/.test(l)));
+});
+
+test('below the cap, a job launches and nothing is re-enqueued', async () => {
+  const ec2 = fakeEc2({ running: [...Array(5).fill(SPOT), OD] });
+  const { handler, sqs } = setup({ ec2 });
+  await handler(sqsEvent(MSG));
+  assert.ok(launched(ec2));
+  assert.deepEqual(sqs, []);
+});
+
+test('Spot and On-Demand are counted separately', async () => {
+  // Six Spot: On-Demand still has room.
+  let s = setup({ ec2: fakeEc2({ running: Array(6).fill(SPOT) }) });
+  await s.handler(sqsEvent(OD_MSG));
+  assert.ok(launched(s.ec2));
+
+  // Two On-Demand (an instance with no InstanceLifecycle is On-Demand): Spot has room, On-Demand doesn't.
+  s = setup({ ec2: fakeEc2({ running: [OD, OD] }) });
+  await s.handler(sqsEvent(MSG));
+  assert.ok(launched(s.ec2));
+  s = setup({ ec2: fakeEc2({ running: [OD, OD] }) });
+  await s.handler(sqsEvent(OD_MSG));
+  assert.ok(!launched(s.ec2));
+  assert.equal(s.sqs.length, 1);
+});
+
+test('the caps come from the environment', async () => {
+  const s = setup({ ec2: fakeEc2({ running: [SPOT] }), env: { ...ENV, SPOT_CAP: '1' } });
+  await s.handler(sqsEvent(MSG));
+  assert.ok(!launched(s.ec2));
+  assert.equal(s.sqs.length, 1);
+});
+
+test('a job no longer queued is dropped before the cap is checked', async () => {
+  const s = setup({ gh: fakeGitHub({ jobStatus: 'completed' }), ec2: fakeEc2({ running: Array(6).fill(SPOT) }) });
+  await s.handler(sqsEvent(MSG));
+  assert.deepEqual(s.sqs, []);
 });
