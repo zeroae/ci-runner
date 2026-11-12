@@ -90,8 +90,11 @@ toolcache, the cost model) are the part worth reading.
   role, which CloudFormation needs to create each function. **This is the
   first milestone's gate**:
   check it before writing anything else, because it decides whether the stack
-  can be deployed by the owner's SSO login at all. If it can't, stop and bring
-  it to the owner.
+  can be deployed by the owner's SSO login at all. If it can't, try the same
+  check under the `ZAEPowerUserAccess` role (*owner's call*), whose own limits on
+  creating roles and policies are also **not verified**. Check those in the same
+  pass, since they may change the naming and boundary rules above. If neither
+  role can pass the Lambdas' roles, stop and bring it to the owner.
 - **Region: `us-east-1`** (*builder's call*, where the prices were taken).
   The account's EC2 vCPU quotas must allow the caps: at least 24 Spot vCPUs and
   8 On-Demand standard vCPUs. Check them at the same gate; a new account's
