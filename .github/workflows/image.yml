@@ -1,0 +1,76 @@
+name: image
+
+on:
+  push:
+    paths:
+      - "image/**"
+      - ".github/workflows/image.yml"
+  schedule:
+    - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC: pick up base image and tool updates
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/zeroae/ci-runner
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: image
+          platforms: linux/amd64
+          pull: true
+          load: true
+          tags: ci-runner:smoke
+
+      - name: Smoke
+        run: >-
+          docker run --rm
+          -v "$PWD/image/smoke.sh:/smoke.sh:ro"
+          --entrypoint bash
+          ci-runner:smoke /smoke.sh
+
+      - name: Decide whether to publish
+        id: publish
+        run: |
+          publish=false
+          case "${{ github.event_name }}" in
+            schedule|workflow_dispatch) publish=true ;;
+            push)
+              case "${{ github.ref }}" in
+                refs/heads/main) publish=true ;;
+                # TODO(remove before main): lets later tickets use the image before main.
+                refs/heads/integration/ci-runner) publish=true ;;
+              esac ;;
+          esac
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: steps.publish.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish
+        if: steps.publish.outputs.publish == 'true'
+        run: |
+          tag="${{ steps.publish.outputs.date }}-${{ steps.publish.outputs.sha }}"
+          for t in latest "$tag"; do
+            docker tag ci-runner:smoke "$IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
+          echo "Published $IMAGE:latest and $IMAGE:$tag" >> "$GITHUB_STEP_SUMMARY"
