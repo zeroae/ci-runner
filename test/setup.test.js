@@ -170,6 +170,17 @@ test('a valid redirect exchanges the code and writes the App into the secret, lo
   assert.match(res.body, /zeroae-ci-runner/); // tells the person what to do next
 });
 
+test('the log says the App was stored, but carries neither its slug nor its id', async (t) => {
+  const logs = captureConsole(t);
+  const fetch = async () => ({ ok: true, status: 201, json: async () => CONVERSION });
+  const { handler } = setup({ fetch });
+  const { state, cookies } = await startFlow(handler);
+  await redirect(handler, state, cookies);
+  const text = logs.join('\n');
+  assert.match(text, /stored the App/);
+  assert.ok(!text.includes('zeroae-ci-runner') && !text.includes('424242'), text);
+});
+
 test('a conversion owned by another account is not stored', async (t) => {
   captureConsole(t);
   const fetch = async () => ({ ok: true, status: 201, json: async () => ({ ...CONVERSION, owner: { login: 'someone-else' } }) });

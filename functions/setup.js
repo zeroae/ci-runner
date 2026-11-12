@@ -115,7 +115,7 @@ function createHandler({ secret, fetch, now, env }) {
       private_key: app.pem,
       webhook_secret: app.webhook_secret,
     });
-    console.log(`setup: stored App ${app.slug} (id ${app.id})`);
+    console.log('setup: stored the App');
     return reply(200, `Stored the GitHub App ${app.slug} (id ${app.id}).\n` +
       `Next: install it on the selected repositories: https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new\n` +
       'This URL now refuses every request.');

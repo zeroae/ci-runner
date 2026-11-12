@@ -54,13 +54,14 @@ function fakeGitHub({ checkStatus = 201 } = {}) {
   return { fetch, calls, keys: () => calls.map((c) => c.key) };
 }
 
-function setup({ inst = instance(TAGS), gh = fakeGitHub(), creds = { app_id: 42, private_key: PEM } } = {}) {
+// ec2.describe returns DescribeInstances' output as EC2 gives it.
+function setup({ inst = instance(TAGS), raw = { Reservations: inst ? [{ Instances: [inst] }] : [] }, gh = fakeGitHub(), creds = { app_id: 42, private_key: PEM } } = {}) {
   const described = [];
   const logs = [];
   const handler = createHandler({
     secret: { get: async () => creds },
     fetch: gh.fetch,
-    ec2: { describe: async (id) => { described.push(id); return inst; } },
+    ec2: { describe: async (id) => { described.push(id); return raw; } },
     now: () => T0,
     env: ENV,
     log: (l) => logs.push(l),
@@ -86,6 +87,10 @@ test('an interruption of one of our instances creates a failed check run on the 
   assert.match(body.output.summary, /`tests`/);
   assert.ok(body.output.summary.includes(runUrl), 'links the run');
   assert.match(body.output.summary, /i-0123/);
+  for (const c of gh.calls) {
+    assert.equal(c.headers['x-github-api-version'], '2022-11-28');
+    assert.equal(c.headers['user-agent'], 'ci-runner');
+  }
 });
 
 test('a job name falls back to the job id when the tag is empty', async () => {
@@ -103,6 +108,15 @@ for (const [why, inst] of [
 ]) {
   test(`${why} is ignored`, async () => {
     const { handler, gh, logs } = setup({ inst });
+    await handler(EVENT);
+    assert.deepEqual(gh.keys(), []);
+    assert.match(logs.join('\n'), /ignored/);
+  });
+}
+
+for (const raw of [{}, { Reservations: [] }, { Reservations: [{}] }, { Reservations: [{ Instances: [] }] }]) {
+  test(`an empty DescribeInstances result ${JSON.stringify(raw)} is treated as not ours`, async () => {
+    const { handler, gh, logs } = setup({ raw });
     await handler(EVENT);
     assert.deepEqual(gh.keys(), []);
     assert.match(logs.join('\n'), /ignored/);

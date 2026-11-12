@@ -71,7 +71,7 @@ function createHandler({ secret, queue, env }) {
   };
 }
 
-module.exports = { createHandler, capacityLabel };
+module.exports = { createHandler };
 
 let live;
 module.exports.handler = async (event) => {

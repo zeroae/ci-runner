@@ -27,7 +27,7 @@ function verifyJwt(auth) {
 }
 
 // A fake GitHub: routes keyed "METHOD path". Records every call.
-function fakeGitHub({ jobStatus = 'queued', jit = { status: 201 }, groups = [{ id: 1, name: 'Default' }, { id: 3, name: 'ci-runner' }] } = {}) {
+function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }, groups = [{ id: 1, name: 'Default' }, { id: 3, name: 'ci-runner' }] } = {}) {
   const calls = [];
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
@@ -41,7 +41,7 @@ function fakeGitHub({ jobStatus = 'queued', jit = { status: 201 }, groups = [{ i
       return res(201, { token: 'ghs_install', expires_at: new Date(T0 + 3600e3).toISOString() });
     }
     assert.equal(init.headers.authorization, 'Bearer ghs_install', key);
-    if (key === 'GET /repos/zeroae/app/actions/jobs/555') return res(200, { id: 555, status: jobStatus });
+    if (key === 'GET /repos/zeroae/app/actions/jobs/555') return res(jobHttp, jobHttp === 200 ? { id: 555, status: jobStatus } : { message: 'x' });
     if (key === 'GET /orgs/zeroae/actions/runner-groups') return res(200, { total_count: groups.length, runner_groups: groups });
     if (key === 'POST /orgs/zeroae/actions/runners/generate-jitconfig') {
       return jit.status === 201 ? res(201, { runner: { id: 77, name: body.name }, encoded_jit_config: JIT }) : res(jit.status, { message: 'nope' });
@@ -92,6 +92,16 @@ test('a job that is no longer queued is dropped: no JIT config, no instance', as
     assert.deepEqual(gh.keys(), ['POST /app/installations/181/access_tokens', 'GET /repos/zeroae/app/actions/jobs/555']);
     assert.equal(ec2.calls.length, 0);
   }
+});
+
+test('a job GitHub no longer has (404) is dropped; any other failure retries the message', async () => {
+  const gone = setup({ gh: fakeGitHub({ jobHttp: 404 }) });
+  assert.deepEqual(await gone.handler(sqsEvent(MSG)), { batchItemFailures: [] });
+  assert.match(gone.logs.join('\n'), /job not found/);
+  const down = setup({ gh: fakeGitHub({ jobHttp: 502 }) });
+  assert.deepEqual(await down.handler(sqsEvent(MSG)), { batchItemFailures: [{ itemIdentifier: 'm0' }] });
+  assert.match(down.logs.join('\n'), /GET \/repos\/zeroae\/app\/actions\/jobs\/555: 502/);
+  for (const { ec2 } of [gone, down]) assert.equal(ec2.calls.length, 0);
 });
 
 test('a queued job mints a JIT config in the ci-runner group with its labels', async () => {

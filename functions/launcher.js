@@ -33,22 +33,12 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
 
   async function gh(method, path, token, body) {
     const res = await fetch(API + path, {
-      method,
-      headers: {
-        accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28',
-        'user-agent': 'ci-runner', authorization: `Bearer ${token}`,
-        ...(body ? { 'content-type': 'application/json' } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
+      method, body: body && JSON.stringify(body),
+      headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'ci-runner', authorization: `Bearer ${token}`, ...(body && { 'content-type': 'application/json' }) },
     });
-    const json = res.status === 204 ? null : await res.json().catch(() => null);
-    return { status: res.status, json };
-  }
-
-  async function must(method, path, token, body) {
-    const r = await gh(method, path, token, body);
-    if (r.status >= 300) throw new Error(`${method} ${path}: ${r.status} ${(r.json && r.json.message) || ''}`);
-    return r.json;
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw Object.assign(new Error(`${method} ${path}: ${res.status} ${(json && json.message) || ''}`), { status: res.status });
+    return json;
   }
 
   async function installationToken(id) {
@@ -59,7 +49,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
       if (!s.private_key) throw new Error('the App is not set up');
       app = { id: s.app_id, key: s.private_key };
     }
-    const r = await must('POST', `/app/installations/${id}/access_tokens`, appJwt(app.id, app.key, now()));
+    const r = await gh('POST', `/app/installations/${id}/access_tokens`, appJwt(app.id, app.key, now()));
     tokens.set(id, { token: r.token, until: Date.parse(r.expires_at) - 5 * 60e3 });
     return r.token;
   }
@@ -67,7 +57,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
   async function runnerGroup(token) {
     if (groupId) return groupId;
     for (let page = 1; ; page++) {
-      const r = await must('GET', `/orgs/${org}/actions/runner-groups?per_page=100&page=${page}`, token);
+      const r = await gh('GET', `/orgs/${org}/actions/runner-groups?per_page=100&page=${page}`, token);
       const g = r.runner_groups.find((x) => x.name === env.RUNNER_GROUP);
       if (g) return (groupId = g.id);
       if (r.runner_groups.length < 100) throw new Error(`no runner group named ${env.RUNNER_GROUP}`);
@@ -136,20 +126,19 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
   async function handle(m) {
     const job = { repo: m.repo, job_id: m.job_id };
     const token = await installationToken(m.installation_id);
-    const j = await gh('GET', `/repos/${m.repo}/actions/jobs/${m.job_id}`, token);
-    if (j.status === 404) return log(JSON.stringify({ ...job, dropped: 'job not found' }));
-    if (j.status >= 300) throw new Error(`job status: ${j.status}`);
-    if (j.json.status !== 'queued') return log(JSON.stringify({ ...job, dropped: j.json.status }));
+    const j = await gh('GET', `/repos/${m.repo}/actions/jobs/${m.job_id}`, token).catch((e) => { if (e.status !== 404) throw e; });
+    if (!j) return log(JSON.stringify({ ...job, dropped: 'job not found' }));
+    if (j.status !== 'queued') return log(JSON.stringify({ ...job, dropped: j.status }));
 
     // A soft cap: two launches at once may overshoot it by one. At the cap the
     // job goes back on the queue as a new message, so retries don't pile up
     // towards the dead-letter queue.
     const type = CAPACITY[m.label];
     const cap = Number(type === 'spot' ? env.SPOT_CAP : env.ONDEMAND_CAP);
-    const live = await count(type);
-    if (live >= cap) {
+    const running = await count(type);
+    if (running >= cap) {
       await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
-      return log(JSON.stringify({ ...job, deferred: `${live} of ${cap} ${type}` }));
+      return log(JSON.stringify({ ...job, deferred: `${running} of ${cap} ${type}` }));
     }
 
     // The sweeper reads the UTC mint stamp in the name as the registration's
@@ -159,14 +148,13 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     const r = await gh('POST', `/orgs/${org}/actions/runners/generate-jitconfig`, token, {
       name, runner_group_id: await runnerGroup(token), labels: m.labels, work_folder: '_work',
     });
-    if (r.status >= 300) throw new Error(`generate-jitconfig: ${r.status} ${(r.json && r.json.message) || ''}`);
 
     try {
-      const instance = await launchInstance(m, name, r.json.runner.id, r.json.encoded_jit_config);
+      const instance = await launchInstance(m, name, r.runner.id, r.encoded_jit_config);
       log(JSON.stringify({ ...job, launched: instance, runner: name, label: m.label }));
     } catch (e) {
       // Unregister now rather than leave it to the sweeper; the retry mints anew.
-      await gh('DELETE', `/orgs/${org}/actions/runners/${r.json.runner.id}`, token).catch(() => {});
+      await gh('DELETE', `/orgs/${org}/actions/runners/${r.runner.id}`, token).catch(() => {});
       throw e;
     }
   }
@@ -188,7 +176,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
   };
 }
 
-module.exports = { createHandler, appJwt };
+module.exports = { createHandler };
 
 let live;
 module.exports.handler = async (event) => {

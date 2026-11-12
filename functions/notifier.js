@@ -9,8 +9,7 @@ const crypto = require('node:crypto');
 const b64u = (s) => Buffer.from(s).toString('base64url');
 
 function appJwt(appId, pem, nowMs) {
-  // iat 60 s back allows for clock drift.
-  const iat = Math.floor(nowMs / 1000) - 60;
+  const iat = Math.floor(nowMs / 1000) - 60; // GitHub allows for clock drift this way
   const data = `${b64u(JSON.stringify({ alg: 'RS256', typ: 'JWT' }))}.${b64u(JSON.stringify({ iat, exp: iat + 540, iss: String(appId) }))}`;
   return `${data}.${crypto.sign('sha256', Buffer.from(data), pem).toString('base64url')}`;
 }
@@ -18,18 +17,19 @@ function appJwt(appId, pem, nowMs) {
 function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
   async function gh(method, path, token, body) {
     const res = await fetch('https://api.github.com' + path, {
-      method,
-      headers: { accept: 'application/vnd.github+json', 'user-agent': 'ci-runner', authorization: `Bearer ${token}` },
-      body: body && JSON.stringify(body),
+      method, body: body && JSON.stringify(body),
+      headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'ci-runner', authorization: `Bearer ${token}`, ...(body && { 'content-type': 'application/json' }) },
     });
-    if (!res.ok) throw new Error(`${method} ${path}: ${res.status}`);
-    return res.json();
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw Object.assign(new Error(`${method} ${path}: ${res.status} ${(json && json.message) || ''}`), { status: res.status });
+    return json;
   }
 
   return async (event) => {
     const id = event.detail && event.detail['instance-id'];
     const t = {};
-    for (const { Key, Value } of (id && (await ec2.describe(id)) || {}).Tags || []) t[Key.replace('ci-runner:', '')] = Value;
+    const inst = id && (await ec2.describe(id)).Reservations?.[0]?.Instances?.[0];
+    for (const { Key, Value } of inst?.Tags || []) t[Key.replace('ci-runner:', '')] = Value;
     const repo = t.repo || '';
     const jobId = t['job-id'];
     if (t.stack !== env.STACK_NAME || !t['head-sha'] || !jobId || repo.split('/')[0] !== env.GITHUB_ORG) {
@@ -39,8 +39,8 @@ function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
     const s = await secret.get();
     if (!s.private_key) throw new Error('the App is not set up');
     const jwt = appJwt(s.app_id, s.private_key, now());
-    const inst = await gh('GET', `/repos/${repo}/installation`, jwt);
-    const { token } = await gh('POST', `/app/installations/${inst.id}/access_tokens`, jwt);
+    const { id: installation } = await gh('GET', `/repos/${repo}/installation`, jwt);
+    const { token } = await gh('POST', `/app/installations/${installation}/access_tokens`, jwt);
 
     const job = t['job-name'] || `job ${jobId}`;
     const run = `https://github.com/${repo}/actions/runs/${t['run-id']}`;
@@ -69,7 +69,7 @@ module.exports.handler = async (event) => {
     live = createHandler({
       secret: { get: async () => JSON.parse((await smc.send(new sm.GetSecretValueCommand({ SecretId: process.env.SECRET_ARN }))).SecretString) },
       fetch,
-      ec2: { describe: async (id) => (await ec2c.send(new EC2.DescribeInstancesCommand({ InstanceIds: [id] }))).Reservations[0]?.Instances[0] },
+      ec2: { describe: (id) => ec2c.send(new EC2.DescribeInstancesCommand({ InstanceIds: [id] })) },
       now: Date.now,
       env: process.env,
     });

@@ -245,8 +245,13 @@ match on tags). For each warning it:
    the instance and linking the run, and `details_url` the job's page.
 
 A GitHub failure fails the invocation, and EventBridge's async invoke retries
-it. A duplicate event creates a second, identical check run. The JWT code is a
-copy of the launcher's: bundling it as a shared module costs more template
-bytes than the copy.
+it. A duplicate event creates a second, identical check run.
+
+The launcher, the notifier and the sweeper each carry their own copy of
+`appJwt()` and `gh()`, because bundling a shared module costs more template
+bytes than the copies. Keep the copies the same: the same signing call, the
+same headers (`x-github-api-version`, `user-agent: ci-runner`), and the same
+error, `<METHOD> <path>: <status> <message>`, with the HTTP status as
+`.status`.
 
 Its role allows `GetSecretValue` on the secret and `ec2:DescribeInstances`.

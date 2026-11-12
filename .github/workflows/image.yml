@@ -43,16 +43,10 @@ jobs:
       - name: Decide whether to publish
         id: publish
         run: |
+          # Only main publishes: a push to main, the schedule (which runs on
+          # main), or a dispatch run on main. Other branches build and smoke.
           publish=false
-          case "${{ github.event_name }}" in
-            schedule|workflow_dispatch) publish=true ;;
-            push)
-              case "${{ github.ref }}" in
-                refs/heads/main) publish=true ;;
-                # TODO(remove before main): lets later tickets use the image before main.
-                refs/heads/integration/ci-runner) publish=true ;;
-              esac ;;
-          esac
+          if [ "${{ github.ref }}" = refs/heads/main ]; then publish=true; fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"

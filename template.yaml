@@ -395,7 +395,7 @@ Resources:
       Environment:
         Variables:
           SECRET_ARN: !Ref AppSecret
-          STACK: !Ref AWS::StackName
+          STACK_NAME: !Ref AWS::StackName
           GITHUB_ORG: !Ref GitHubOrg
           RUNNER_GROUP: !Ref RunnerGroup
       Code:
