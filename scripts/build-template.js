@@ -8,7 +8,8 @@
 // relative to the template. A local `require('./x.js')` in an inlined file is
 // replaced by x.js itself, wrapped as a module, so one Lambda can share
 // another file (the launcher bundles cloud-config.js), and whole-line `//`
-// comments are dropped. Fails if the result is
+// comments are dropped, as are the template's own whole-line `#` comments.
+// Fails if the result is
 // not under LIMIT bytes, the largest template `aws cloudformation deploy`
 // sends inline.
 const fs = require('node:fs');
@@ -41,9 +42,23 @@ function bundle(file) {
 
 const ZIPFILE = /^( *)ZipFile: \|\n *\/\/@inline (\S+)[ \t]*$/gm;
 
+// Whole-line `#` comments in the template go too (they stay in the source),
+// except inside a block scalar (`key: |` or `key: >-`), where `#` is content.
+function dropYamlComments(text) {
+  let block = -1; // indent of the key that opened a block scalar, or -1
+  return text.split('\n').filter((line) => {
+    const indent = line.length - line.trimStart().length;
+    if (block >= 0 && (line.trim() === '' || indent > block)) return true;
+    block = -1;
+    if (/^\s*#/.test(line)) return false;
+    if (/:\s*[|>][-+]?\s*$/.test(line)) block = indent;
+    return true;
+  }).join('\n');
+}
+
 function build(templatePath) {
   const dir = path.dirname(templatePath);
-  return fs.readFileSync(templatePath, 'utf8')
+  return dropYamlComments(fs.readFileSync(templatePath, 'utf8'))
     .replace(ZIPFILE, (_, indent, file) => `${indent}ZipFile: ${JSON.stringify(bundle(path.join(dir, file)))}`);
 }
 

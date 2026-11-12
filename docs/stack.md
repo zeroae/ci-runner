@@ -46,7 +46,11 @@ scripts/build-template.js   template.yaml -> build/template.yaml (git-ignored)
 - `make build`: writes `build/template.yaml` and prints its size against the
   **51,200-byte** limit (the largest template `aws cloudformation deploy` sends
   without an S3 bucket). The build fails at or over it, and
-  `test/build.test.js` checks it too.
+  `test/build.test.js` checks it too. To save room, the build drops whole-line
+  `//` comments from the inlined code and whole-line `#` comments from the
+  template (outside block scalars), so comment the source freely. If it fills
+  up again, the next step is deploying through an S3 bucket (`--s3-bucket`,
+  1 MB limit).
 - `make deploy`: test, build, then `cloudformation deploy` with
   `CAPABILITY_NAMED_IAM`, then print the outputs. It creates the stack the
   first time and updates it after. Override `STACK`, `PROFILE`, `REGION` on the
@@ -209,3 +213,27 @@ which the launch template's `resolve:ssm:` image needs. It has no
 `iam:PassRole`. `CreateFleet`'s check on the instances, volumes and network
 interfaces it creates carries no launch-template key, so those resources
 are granted to `CreateFleet` without one. `RunInstances` keeps the condition.
+
+## Reporting a Spot reclaim: the notifier
+
+`functions/notifier.js` runs on every **EC2 Spot Instance Interruption
+Warning** in the region (the rule `${stack}-notifier`; an event pattern can't
+match on tags). For each warning it:
+
+1. Describes the instance, and ignores it (logged) unless it carries
+   `ci-runner:stack=<stack>`, `ci-runner:head-sha`, `ci-runner:job-id` and a
+   `ci-runner:repo` in `GITHUB_ORG`: the launcher's tags. An instance from
+   `make hand-launch` has no job tags and is ignored.
+2. Signs an App JWT, finds the repo's installation
+   (`GET /repos/{repo}/installation`) and gets its token.
+3. Creates a check run on the head sha: name `ci-runner / <job name>` (or
+   `job <id>` with no name), `completed`, conclusion `failure`, title
+   `Spot capacity reclaimed: re-run this job`, a summary naming the job and
+   the instance and linking the run, and `details_url` the job's page.
+
+A GitHub failure fails the invocation, and EventBridge's async invoke retries
+it. A duplicate event creates a second, identical check run. The JWT code is a
+copy of the launcher's: bundling it as a shared module costs more template
+bytes than the copy.
+
+Its role allows `GetSecretValue` on the secret and `ec2:DescribeInstances`.
