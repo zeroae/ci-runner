@@ -19,6 +19,10 @@ Parameters:
   LogRetentionDays:
     Type: Number
     Default: 30
+  RunnerGroup:
+    Type: String
+    Default: ci-runner
+    Description: The org runner group every CI runner registers into (created after the stack).
 
 Resources:
   # App id, private key and webhook secret. Created holding only `state_key`
@@ -111,7 +115,28 @@ Resources:
       Principal: "*"
       InvokedViaFunctionUrl: true
 
-  # --- webhook: stub (404) until its ticket lands -------------------------
+  # --- the job queue: webhook -> launcher -----------------------------------
+  # A message that fails 5 receives (2 minutes apart) goes to the DLQ. A job
+  # left queued that long is GitHub's to time out.
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-jobs"
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 86400
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  JobDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-jobs-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # --- webhook: verify, label contract, fence 3, enqueue ----------------------
   WebhookLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -137,6 +162,12 @@ Resources:
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub "${WebhookLogGroup.Arn}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt JobQueue.Arn
 
   WebhookFunction:
     Type: AWS::Lambda::Function
@@ -150,6 +181,11 @@ Resources:
       MemorySize: 256
       LoggingConfig:
         LogGroup: !Ref WebhookLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          QUEUE_URL: !Ref JobQueue
+          GITHUB_ORG: !Ref GitHubOrg
       Code:
         ZipFile: |
           //@inline functions/webhook.js
@@ -175,6 +211,117 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: "*"
       InvokedViaFunctionUrl: true
+
+  # --- launcher: one instance per still-queued job ---------------------------
+  LauncherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-launcher"
+      RetentionInDays: !Ref LogRetentionDays
+
+  LauncherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-launcher"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-launcher"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${LauncherLogGroup.Arn}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt JobQueue.Arn
+              # A version per launch carries the user-data.
+              - Effect: Allow
+                Action: [ec2:CreateLaunchTemplateVersion, ec2:DeleteLaunchTemplateVersions]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+              # The fleet, from this launch template, into this stack's subnets
+              # and security group only. No iam:PassRole: there is no role.
+              - Effect: Allow
+                Action: [ec2:CreateFleet, ec2:RunInstances]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:fleet/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet0}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet1}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet2}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+              # CreateFleet's check on what it creates carries no launch
+              # template key; the statement above already pins the template,
+              # subnets and security group. RunInstances does carry one.
+              - Effect: Allow
+                Action: ec2:CreateFleet
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+                Condition:
+                  ArnEquals:
+                    ec2:LaunchTemplate: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:*/*"
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: [CreateFleet, RunInstances]
+              # The launch template's image is resolve:ssm: at each launch.
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/ami-amazon-linux-latest/*"
+
+  LauncherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-launcher"
+      Description: Launches one CI runner instance per still-queued job from the queue.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LauncherRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref LauncherLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          GITHUB_ORG: !Ref GitHubOrg
+          RUNNER_GROUP: !Ref RunnerGroup
+          STACK_NAME: !Ref AWS::StackName
+          LAUNCH_TEMPLATE_ID: !Ref RunnerLaunchTemplate
+          SUBNET_IDS: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
+      Code:
+        ZipFile: |
+          //@inline functions/launcher.js
+
+  LauncherQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref LauncherFunction
+      EventSourceArn: !GetAtt JobQueue.Arn
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
 
   # --- sweeper: terminates strays, removes orphan registrations -------------
   SweeperLogGroup:
@@ -235,7 +382,7 @@ Resources:
           SECRET_ARN: !Ref AppSecret
           STACK: !Ref AWS::StackName
           GITHUB_ORG: !Ref GitHubOrg
-          RUNNER_GROUP: ci-runner
+          RUNNER_GROUP: !Ref RunnerGroup
       Code:
         ZipFile: |
           //@inline functions/sweeper.js
@@ -390,3 +537,7 @@ Outputs:
     Value: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
   SecurityGroupId:
     Value: !Ref RunnerSecurityGroup
+  JobQueueUrl:
+    Value: !Ref JobQueue
+  JobDeadLetterQueueUrl:
+    Value: !Ref JobDeadLetterQueue
