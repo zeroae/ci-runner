@@ -15,6 +15,10 @@ scripts/build-template.js   template.yaml -> build/template.yaml (git-ignored)
 1. Write `functions/<name>.js`. It must be self-contained: only `node:*`
    built-ins, plus `@aws-sdk/*` (shipped with the `nodejs22.x` runtime)
    required lazily inside `exports.handler`, never at the top of the file.
+   The one exception is a local `require('./<other>.js')` on one line, which
+   the build bundles in (the launcher bundles `cloud-config.js` this way). If
+   the file sets `module.exports = {...}`, export the handler with
+   `module.exports.handler = ...`, not `exports.handler`.
 2. Put the logic behind a `createHandler(deps)` factory that takes its
    adapters (AWS clients, `fetch`, clock) and returns the handler. Tests
    import the file and call `createHandler` with fakes. `exports.handler`
@@ -22,8 +26,11 @@ scripts/build-template.js   template.yaml -> build/template.yaml (git-ignored)
    example.
 3. In `template.yaml`, give it:
    - `Code: ZipFile: |` whose only line is `//@inline functions/<name>.js`,
-     indented as block content. The build replaces that line with the file,
-     indented to match. `Handler: index.handler`, `Runtime: nodejs22.x`.
+     indented as block content. The build replaces the pair with one line,
+     `ZipFile: "<the file as a JSON string>"` (YAML reads a JSON string as the
+     same text). That saves the block's indentation on every line. It also drops
+     the file's whole-line `//` comments, but not inside template literals.
+     `Handler: index.handler`, `Runtime: nodejs22.x`.
    - a `AWS::Logs::LogGroup` `/aws/lambda/${AWS::StackName}-<name>`, wired in
      through `LoggingConfig`;
    - its own role `PowerUserPB-${AWS::StackName}-<name>`, with
@@ -82,7 +89,7 @@ each launch first adds a launch template version (source `$Default`, only
 
 `functions/cloud-config.js` exports `renderCloudConfig({ jitConfig,
 idleSeconds = 900 })`, which returns the `#cloud-config` document. It has no
-`require()`, so the launcher can inline it.
+`require()`, so the launcher can bundle it.
 `test/cloud-config.test.js` covers it. On the instance:
 
 1. `bootcmd` creates `docker` with gid 123 before the `docker` package does.
@@ -144,3 +151,61 @@ Whatever launches a runner (`scripts/hand-launch.sh`, the launcher) must:
 
 Every instance not yet `terminated` counts, so a runner whose instance is
 shutting down is removed on a later run.
+
+## Launching for queued jobs: webhook, queue, launcher
+
+**webhook** (`functions/webhook.js`, the `WebhookUrl` Function URL, which the
+App's webhook points at), for each delivery:
+
+1. Verifies `X-Hub-Signature-256` against the secret's `webhook_secret`
+   (`401` otherwise; `503` before the App exists).
+2. Ignores (`200`) any event but `workflow_job`.
+3. **Fence 3:** refuses (`403`, logged) unless `repository.visibility` is
+   `private` and the owner is `GITHUB_ORG`.
+4. Ignores (`200`) actions other than `queued`, and jobs outside the label
+   contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, and
+   otherwise only `linux`/`x64` (case-insensitive).
+5. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, labels,
+   installation_id}` (`label` is the capacity label, lower case) and answers
+   `202`.
+
+Its role allows only `GetSecretValue` on the secret and `SendMessage` on the
+queue.
+
+**The queue** `${stack}-jobs` has a 120 s visibility timeout. A message that
+fails 5 receives goes to `${stack}-jobs-dlq` (kept 14 days). The outputs are
+`JobQueueUrl` and `JobDeadLetterQueueUrl`.
+
+**launcher** (`functions/launcher.js`, fed one message at a time, reporting
+failures per message), for each job:
+
+1. Drops a malformed message, or one whose repo isn't in `GITHUB_ORG`.
+2. Signs an App JWT and gets an installation token for the job's
+   installation. The token is cached until 5 minutes before it expires.
+3. `GET /repos/{repo}/actions/jobs/{job_id}`: anything but `queued` (or a
+   `404`) is dropped, and the message is consumed.
+4. Looks up the `RunnerGroup` parameter's group id by name (cached), and
+   mints a JIT config with the job's labels. The runner is named
+   `${stack}-<UTC YYYYmmddHHMMSS>-<job id>`, as the sweeper requires.
+5. Renders the `#cloud-config` and launches one instance as in "Launching one
+   by hand": Spot `capacity-optimized` for `ci-spot`, On-Demand `lowest-price`
+   for `ci-ondemand`. Tags: `ci-runner:runner`, `ci-runner:runner-id`,
+   `ci-runner:label`, `ci-runner:repo`, `ci-runner:job-id`, `ci-runner:run-id`,
+   `ci-runner:head-sha` and `ci-runner:job-name`, plus the launch template's
+   `ci-runner:stack`.
+6. If no instance launches, it removes the registration it just minted and
+   fails the message, which comes back 120 s later.
+
+There is no de-duplication on job id. A duplicate delivery launches a second
+runner at worst, and the idle exit and the sweeper remove it. There is no cap
+check yet either.
+
+The launcher's role allows `GetSecretValue`, the queue's receive and delete,
+`Create`/`DeleteLaunchTemplateVersions` on the launch template, and
+`CreateFleet`/`RunInstances` pinned to the launch template, the three subnets
+and the security group. It also allows `CreateTags` only while creating
+(`ec2:CreateAction`), and `ssm:GetParameters` on the public AL2023 parameters,
+which the launch template's `resolve:ssm:` image needs. It has no
+`iam:PassRole`. `CreateFleet`'s check on the instances, volumes and network
+interfaces it creates carries no launch-template key, so those resources
+are granted to `CreateFleet` without one. `RunInstances` keeps the condition.

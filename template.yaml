@@ -260,8 +260,18 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet2}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+              # CreateFleet's check on what it creates carries no launch
+              # template key; the statement above already pins the template,
+              # subnets and security group. RunInstances does carry one.
               - Effect: Allow
-                Action: [ec2:CreateFleet, ec2:RunInstances]
+                Action: ec2:CreateFleet
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+              - Effect: Allow
+                Action: ec2:RunInstances
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
