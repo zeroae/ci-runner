@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ci-runner: single-use EC2 self-hosted GitHub Actions runners for zeroae's
+  private repos. Source template; `make build` inlines functions/*.js.
+
+# Layout rules (see docs/stack.md):
+# - every role and policy is PowerUserPB-${AWS::StackName}-<suffix> with the
+#   PowerUserAccess permissions boundary;
+# - each function's code is `//@inline functions/<name>.js` under `ZipFile: |`.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: zeroae
+  AppName:
+    Type: String
+    Default: zeroae-ci-runner
+    Description: Name of the GitHub App the setup URL registers (globally unique on GitHub).
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Resources:
+  # App id, private key and webhook secret. Created holding only `state_key`
+  # (the setup function's HMAC key for `state`); setup replaces the whole value
+  # once, from the manifest conversion. Do not edit GenerateSecretString: a
+  # change makes CloudFormation regenerate the value and wipe the App's key.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/github-app"
+      Description: GitHub App credentials for ci-runner (written once by the setup function).
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: state_key
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # --- setup: one-time App registration (manifest flow) ---------------------
+  SetupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-setup"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-setup"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-setup"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${SetupLogGroup.Arn}"
+              # The only function allowed to write the secret.
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:PutSecretValue]
+                Resource: !Ref AppSecret
+
+  SetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-setup"
+      Description: One-time GitHub App registration through the manifest flow.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt SetupRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref SetupLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          WEBHOOK_URL: !GetAtt WebhookUrl.FunctionUrl
+          GITHUB_ORG: !Ref GitHubOrg
+          APP_NAME: !Ref AppName
+      Code:
+        ZipFile: |
+          //@inline functions/setup.js
+
+  SetupUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref SetupFunction
+      AuthType: NONE
+
+  SetupUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SetupFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  SetupUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SetupFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  # --- webhook: stub (404) until its ticket lands -------------------------
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-webhook"
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-webhook"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-webhook"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${WebhookLogGroup.Arn}"
+
+  WebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-webhook"
+      Description: GitHub workflow_job webhook receiver.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt WebhookRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref WebhookLogGroup
+      Code:
+        ZipFile: |
+          //@inline functions/webhook.js
+
+  WebhookUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref WebhookFunction
+      AuthType: NONE
+
+  WebhookUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  WebhookUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  SetupUrl:
+    Description: Open in a browser to create the GitHub App (refuses everything once done).
+    Value: !GetAtt SetupUrl.FunctionUrl
+  WebhookUrl:
+    Value: !GetAtt WebhookUrl.FunctionUrl
+  AppSecretArn:
+    Value: !Ref AppSecret
