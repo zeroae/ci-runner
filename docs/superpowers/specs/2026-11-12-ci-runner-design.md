@@ -7,14 +7,13 @@ session; the decisions below are the owner's unless marked *builder's call*).
 
 zeroae pays for GitHub Actions minutes on its private repos. The org is on the
 GitHub **Free** plan: 2,000 private-repo minutes a month, then
-$0.006/min for Linux 2-core (the January 2026 rate). In November 2026 one repo,
-`zeroae/foresight`, was on track for about **12,500 billed minutes a month
-(about $75)**, and mycel had started paying too.
+$0.006/min for Linux 2-core (the January 2026 rate). In November 2026 the
+busiest private repo alone was on track for about **12,500 billed minutes a
+month (about $75)**, and a second repo had started paying too.
 
 The money is not the point by itself. The owner wants to **run far more of each
-repo's test suites in CI** (foresight runs only its offline `infra` scripts
-today, out of about a dozen suites), and at GitHub's rate every added suite is a
-recurring bill. On our own Spot capacity, 1,000 extra suite-minutes cost about
+repo's test suites in CI** (the busiest repo runs only a fraction of its suites
+in CI today), and at GitHub's rate every added suite is a recurring bill. On our own Spot capacity, 1,000 extra suite-minutes cost about
 $1.30 instead of $6.
 
 So this repo provides **self-hosted GitHub Actions runners on AWS**: single-use
@@ -32,8 +31,8 @@ toolcache, the cost model) are the part worth reading.
 - **CI runner**: the machine one GitHub Actions job runs on. Either
   GitHub-hosted, or one of ours: a single-use machine that takes exactly one job
   and is then destroyed. It holds no AWS access of its own. Never write "runner"
-  alone for it in a repo that already has its own meaning for "runner"
-  (foresight does: a session's sandbox).
+  alone for it in a consuming repo that already has its own meaning for
+  "runner".
 - **Long job**: a job whose own run time is longer than the time it takes one
   of our CI runners to come up. It runs on **Spot**.
 - **Critical job**: a job whose failure part-way needs a person to repair state
@@ -48,7 +47,7 @@ toolcache, the cost model) are the part worth reading.
    terminates.
 2. The job's environment is Ubuntu 24.04, close enough to `ubuntu-latest` that
    existing workflows, including `actions/setup-*`, run unchanged.
-3. A job lost to a Spot reclaim says so in its own log.
+3. A job lost to a Spot reclaim is reported as one, on the job's commit.
 4. Nothing is left running: no instance outlives its job by long, and no runner
    registration outlives its instance.
 5. Cost stays well under what the same minutes cost on GitHub (estimate below).
@@ -67,8 +66,7 @@ toolcache, the cost model) are the part worth reading.
 - More than one instance size. Start with `.xlarge`; flavours come later.
 - Per-repo caps or a per-repo cost split.
 - Any deploy permission. AWS access for deploys stays exactly as each consuming
-  repo has it today (for foresight: GitHub OIDC into its zae deploy role,
-  foresight's ADR 0085).
+  repo has it today (typically GitHub OIDC into the repo's own deploy role).
 
 ## Anti-goals (a failure even if it works)
 
@@ -99,9 +97,9 @@ toolcache, the cost model) are the part worth reading.
   8 On-Demand standard vCPUs. Check them at the same gate; a new account's
   defaults can be lower.
 - **Deploy access is unaffected.** A consuming repo's OIDC trust is keyed on the
-  token's `sub` claim, which doesn't depend on the runner. Checked for
-  foresight: its deploy role trusts `repo:zeroae/foresight:*` subjects only, with
-  no `runner_environment` condition. A repo whose trust policy *does* pin
+  token's `sub` claim (`repo:zeroae/<repo>:...`), which doesn't depend on the
+  runner; the first consumer's trust policy was checked and has no
+  `runner_environment` condition. A repo whose trust policy *does* pin
   `runner_environment: github-hosted` must change it before moving a deploy job.
 - **GitHub: org `zeroae`, Free plan.** The org can create runner groups beyond
   Default (the owner checked in the UI), and a group can be limited to selected
@@ -136,19 +134,14 @@ toolcache, the cost model) are the part worth reading.
 | (none; `ubuntu-latest`) | GitHub-hosted | short jobs |
 
 A consuming repo chooses per job. Each one routes through a repo variable so it
-can fall back without a code change (foresight uses `ZAE_CI_RUNNER`): set, a
-moved job asks for `[self-hosted, ci-spot]` or `[self-hosted, ci-ondemand]`;
-unset, it asks for `ubuntu-latest`.
+can fall back without a code change (the variable's name is the repo's own):
+set, a moved job asks for `[self-hosted, ci-spot]` or
+`[self-hosted, ci-ondemand]`; unset, it asks for `ubuntu-latest`.
 
-**Rollout, per repo:** one job moves first as a canary (foresight: `tests`). Its
-measured queued-to-started time *is* the boot time, and that number decides
-which other jobs are long enough to move.
-
-Foresight's starting assignment, from its November run data: `tests`, `plan`,
-`e2e` to `ci-spot`; `apply` to `ci-ondemand`; `changes`, `status-rollup`,
-`zae-drift`, `plugins-update-check` stay on GitHub. (The foresight side is
-foresight's change, not this repo's; listed so the builder knows the first
-consumer.)
+**Rollout, per repo:** one job moves first as a canary (typically its test
+job). Its measured queued-to-started time *is* the boot time, and that number
+decides which other jobs are long enough to move. Which jobs move is each
+consuming repo's change, not this repo's.
 
 ### 2. GitHub side
 
@@ -362,7 +355,7 @@ One Secrets Manager secret holding App id, private key and webhook secret.
 Readable by webhook, launcher, notifier and sweeper; writable only by setup.
 About $0.40 a month.
 
-### 4. Cost (estimate, us-east-1, at foresight's November volume)
+### 4. Cost (estimate, us-east-1, at the busiest repo's November volume)
 
 | Item | Per month |
 |---|---|
@@ -390,9 +383,9 @@ About $0.40 a month.
   | A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public |
   | A job fails "The runner has received a shutdown signal" or "lost communication", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
 
-- Each consuming repo's own toolset check (foresight:
-  `scripts/ci/runner-tools.sh`, first step of each moved job, naming any
-  missing tool and printing each version) lives in **that** repo, not here.
+- Each consuming repo's own toolset check (a script as the first step of each
+  moved job, naming any missing tool and printing each version) lives in
+  **that** repo, not here.
 
 ## Accepted risks (the owner's calls)
 
@@ -430,6 +423,3 @@ About $0.40 a month.
 - A pre-built AMI or pre-pulled image (after boot time is measured).
 - Pinning the runner, base image and tools.
 - More instance sizes, and per-repo caps.
-- In foresight: folding `changes` into the jobs that use it, and running `e2e`
-  as an ECS task (both now for speed, not cost); running every `run-tests.sh`
-  suite in CI.
