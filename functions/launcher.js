@@ -24,7 +24,7 @@ function valid(m, org) {
     && Array.isArray(m.labels);
 }
 
-function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
+function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log }) {
   const org = env.GITHUB_ORG;
   const subnets = env.SUBNET_IDS.split(',');
   const tokens = new Map(); // installation id -> { token, until }
@@ -72,6 +72,25 @@ function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
       if (g) return (groupId = g.id);
       if (r.runner_groups.length < 100) throw new Error(`no runner group named ${env.RUNNER_GROUP}`);
     }
+  }
+
+  // Live instances of this stack by capacity. On-Demand ones have no
+  // InstanceLifecycle, so anything without the Spot marker counts as On-Demand.
+  async function count(type) {
+    let n = 0;
+    let NextToken;
+    do {
+      const r = await ec2.describeInstances({
+        Filters: [
+          { Name: 'tag:ci-runner:stack', Values: [env.STACK_NAME] },
+          { Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
+        ],
+        NextToken,
+      });
+      for (const res of r.Reservations || []) for (const i of res.Instances || []) n += (i.InstanceLifecycle === 'spot') === (type === 'spot');
+      NextToken = r.NextToken;
+    } while (NextToken);
+    return n;
   }
 
   async function launchInstance(m, name, runnerId, jitConfig) {
@@ -122,6 +141,17 @@ function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
     if (j.status >= 300) throw new Error(`job status: ${j.status}`);
     if (j.json.status !== 'queued') return log(JSON.stringify({ ...job, dropped: j.json.status }));
 
+    // A soft cap: two launches at once may overshoot it by one. At the cap the
+    // job goes back on the queue as a new message, so retries don't pile up
+    // towards the dead-letter queue.
+    const type = CAPACITY[m.label];
+    const cap = Number(type === 'spot' ? env.SPOT_CAP : env.ONDEMAND_CAP);
+    const live = await count(type);
+    if (live >= cap) {
+      await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
+      return log(JSON.stringify({ ...job, deferred: `${live} of ${cap} ${type}` }));
+    }
+
     // The sweeper reads the UTC mint stamp in the name as the registration's
     // grace period, and matches the runner to its instance by these tags.
     const stamp = new Date(now()).toISOString().replace(/\D/g, '').slice(0, 14);
@@ -165,6 +195,8 @@ module.exports.handler = async (event) => {
   if (!live) {
     const sm = require('@aws-sdk/client-secrets-manager');
     const EC2 = require('@aws-sdk/client-ec2');
+    const SQS = require('@aws-sdk/client-sqs');
+    const sqsc = new SQS.SQSClient({});
     const smc = new sm.SecretsManagerClient({});
     const ec2c = new EC2.EC2Client({});
     live = createHandler({
@@ -174,7 +206,9 @@ module.exports.handler = async (event) => {
         createLaunchTemplateVersion: (i) => ec2c.send(new EC2.CreateLaunchTemplateVersionCommand(i)),
         createFleet: (i) => ec2c.send(new EC2.CreateFleetCommand(i)),
         deleteLaunchTemplateVersions: (i) => ec2c.send(new EC2.DeleteLaunchTemplateVersionsCommand(i)),
+        describeInstances: (i) => ec2c.send(new EC2.DescribeInstancesCommand(i)),
       },
+      sqs: { sendMessage: (i) => sqsc.send(new SQS.SendMessageCommand(i)) },
       now: Date.now,
       env: process.env,
     });

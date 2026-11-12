@@ -188,23 +188,35 @@ failures per message), for each job:
    installation. The token is cached until 5 minutes before it expires.
 3. `GET /repos/{repo}/actions/jobs/{job_id}`: anything but `queued` (or a
    `404`) is dropped, and the message is consumed.
-4. Looks up the `RunnerGroup` parameter's group id by name (cached), and
+4. **The cap:** counts the stack's instances (`ci-runner:stack` tag) that are
+   `pending`, `running`, `stopping` or `stopped`, split by capacity: an
+   instance with `InstanceLifecycle: spot` is Spot, any other is On-Demand.
+   At the job's cap (`SpotCap`, default 6; `OnDemandCap`, default 2) it
+   sends the message to the queue again with a 60 s delay and consumes the
+   original, so waiting doesn't count towards the dead-letter queue. Nothing
+   is minted. It's a soft cap: messages checked at the same moment can
+   overshoot it. A shutting-down instance no longer counts.
+5. Looks up the `RunnerGroup` parameter's group id by name (cached), and
    mints a JIT config with the job's labels. The runner is named
    `${stack}-<UTC YYYYmmddHHMMSS>-<job id>`, as the sweeper requires.
-5. Renders the `#cloud-config` and launches one instance as in "Launching one
+6. Renders the `#cloud-config` and launches one instance as in "Launching one
    by hand": Spot `capacity-optimized` for `ci-spot`, On-Demand `lowest-price`
    for `ci-ondemand`. Tags: `ci-runner:runner`, `ci-runner:runner-id`,
    `ci-runner:label`, `ci-runner:repo`, `ci-runner:job-id`, `ci-runner:run-id`,
    `ci-runner:head-sha` and `ci-runner:job-name`, plus the launch template's
    `ci-runner:stack`.
-6. If no instance launches, it removes the registration it just minted and
+7. If no instance launches, it removes the registration it just minted and
    fails the message, which comes back 120 s later.
 
 There is no de-duplication on job id. A duplicate delivery launches a second
-runner at worst, and the idle exit and the sweeper remove it. There is no cap
-check yet either.
+runner at worst, and the idle exit and the sweeper remove it.
 
-The launcher's role allows `GetSecretValue`, the queue's receive and delete,
+`cloudformation deploy` keeps a parameter's previous value unless it's
+overridden, so after lowering a cap for a test, restore it explicitly
+(`--parameter-overrides SpotCap=6 OnDemandCap=2`).
+
+The launcher's role allows `GetSecretValue`, the queue's receive, delete and
+send, `ec2:DescribeInstances` (for the cap),
 `Create`/`DeleteLaunchTemplateVersions` on the launch template, and
 `CreateFleet`/`RunInstances` pinned to the launch template, the three subnets
 and the security group. It also allows `CreateTags` only while creating

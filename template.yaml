@@ -23,6 +23,14 @@ Parameters:
     Type: String
     Default: ci-runner
     Description: The org runner group every CI runner registers into (created after the stack).
+  SpotCap:
+    Type: Number
+    Default: 6
+    Description: Most Spot CI runners at once (soft).
+  OnDemandCap:
+    Type: Number
+    Default: 2
+    Description: Most On-Demand CI runners at once (soft).
 
 Resources:
   # App id, private key and webhook secret. Created holding only `state_key`
@@ -242,8 +250,12 @@ Resources:
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref AppSecret
               - Effect: Allow
-                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility, sqs:SendMessage]
                 Resource: !GetAtt JobQueue.Arn
+              # The cap counts instances; no resource-level permissions.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
               # A version per launch carries the user-data.
               - Effect: Allow
                 Action: [ec2:CreateLaunchTemplateVersion, ec2:DeleteLaunchTemplateVersions]
@@ -311,6 +323,9 @@ Resources:
           STACK_NAME: !Ref AWS::StackName
           LAUNCH_TEMPLATE_ID: !Ref RunnerLaunchTemplate
           SUBNET_IDS: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
+          QUEUE_URL: !Ref JobQueue
+          SPOT_CAP: !Ref SpotCap
+          ONDEMAND_CAP: !Ref OnDemandCap
       Code:
         ZipFile: |
           //@inline functions/launcher.js
