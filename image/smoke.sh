@@ -26,7 +26,7 @@ expect() {
 }
 
 echo "== tools"
-check runner         bash -c "/home/runner/config.sh --version | tail -n1"
+check runner         bash -c "/home/runner/config.sh --version | grep -Ex '[0-9]+\.[0-9]+\.[0-9]+'"
 check docker         docker --version
 check buildx         docker buildx version
 check compose        docker compose version
