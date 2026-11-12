@@ -176,6 +176,125 @@ Resources:
       Principal: "*"
       InvokedViaFunctionUrl: true
 
+  # --- network: a VPC of its own, public subnets, no NAT --------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.77.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  Subnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [10.77.0.0/16, 3, 12]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-0" }]
+
+  Subnet0Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet0
+      RouteTableId: !Ref RouteTable
+
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [10.77.0.0/16, 3, 12]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-1" }]
+
+  Subnet1Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet1
+      RouteTableId: !Ref RouteTable
+
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [10.77.0.0/16, 3, 12]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-2" }]
+
+  Subnet2Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet2
+      RouteTableId: !Ref RouteTable
+
+  # No inbound rules: nothing reaches a CI runner. Outbound open.
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ci-runner instances (no inbound)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  # --- launch template: one CI runner instance -------------------------------
+  # No instance type (each launch passes the .xlarge overrides), no user-data
+  # (each launch adds a version carrying its own #cloud-config), and no
+  # instance profile, ever: the instance holds no AWS credentials.
+  RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-runner"
+      LaunchTemplateData:
+        # Resolved by EC2 at every launch: always the latest AL2023.
+        ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+        InstanceInitiatedShutdownBehavior: terminate
+        SecurityGroupIds: [!Ref RunnerSecurityGroup]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 50, VolumeType: gp3, DeleteOnTermination: true, Encrypted: true }
+        # IMDSv2 only, one hop: a job's containers can't reach the metadata service.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+              - { Key: Name, Value: !Sub "${AWS::StackName}-runner" }
+          - ResourceType: volume
+            Tags:
+              - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
 Outputs:
   SetupUrl:
     Description: Open in a browser to create the GitHub App (refuses everything once done).
@@ -184,3 +303,9 @@ Outputs:
     Value: !GetAtt WebhookUrl.FunctionUrl
   AppSecretArn:
     Value: !Ref AppSecret
+  LaunchTemplateId:
+    Value: !Ref RunnerLaunchTemplate
+  SubnetIds:
+    Value: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
+  SecurityGroupId:
+    Value: !Ref RunnerSecurityGroup

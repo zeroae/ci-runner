@@ -3,11 +3,11 @@ PROFILE ?= zeroae-code/AWSPowerUserAccess
 REGION  ?= us-east-1
 AWS      = aws --profile $(PROFILE) --region $(REGION)
 
-.PHONY: help test build validate deploy outputs
+.PHONY: help test build validate deploy outputs hand-launch runners
 .DEFAULT_GOAL := help
 
 help: ## List the targets
-	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-9s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-12s %s\n", $$1, $$2}'
 	@echo "  Layout and conventions: docs/stack.md"
 
 test: ## Run the unit tests (node --test, no npm deps)
@@ -28,3 +28,12 @@ deploy: test build ## Create or update the stack ($(STACK)) from one command
 outputs: ## Print the stack's outputs (setup URL, webhook URL, secret ARN)
 	@$(AWS) cloudformation describe-stacks --stack-name $(STACK) \
 	  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text
+
+hand-launch: ## Launch one CI runner by hand for one ci-spot job (needs gh with admin:org)
+	STACK=$(STACK) PROFILE=$(PROFILE) REGION=$(REGION) scripts/hand-launch.sh
+
+runners: ## List the stack's CI runner instances that are not terminated
+	@$(AWS) ec2 describe-instances \
+	  --filters Name=tag:ci-runner:stack,Values=$(STACK) \
+	    Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+	  --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,LaunchTime]' --output text
