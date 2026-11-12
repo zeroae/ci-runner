@@ -49,8 +49,12 @@ $AWS cloudformation describe-stacks --stack-name ci-runner \
   --query 'Stacks[0].Parameters' --output table
 ```
 
+Before raising a cap, check the EC2 quota still covers it (see "Measured
+numbers").
+
 The built template must stay under 51,200 bytes (`make build` prints its
-size and fails at the limit). See the traps table.
+size and fails at the limit). There's little headroom left (see "Measured
+numbers" and the traps table).
 
 ## Create the App and the runner group (the wizard)
 
@@ -269,6 +273,29 @@ on GitHub-hosted runners in the meantime.
        --description "restarted $(date -u +%FT%TZ) after re-registering the App" >/dev/null
    done
    ```
+
+## Measured numbers
+
+Measured on the canary repo when the stack first went live (2026-11-12).
+Re-measure after any change to the image, the cloud-config or the instance
+types.
+
+- **Boot time:** about 100 s from queued to started, so a job is worth
+  moving when it runs well over 2 minutes. The first job after a deploy took
+  about 3½ minutes, while the stack's functions were still cold. A hand
+  launch (`make hand-launch`) took about 97 s to pick up its job.
+- **EC2 quotas** in `us-east-1`: 256 Spot and 384 On-Demand vCPUs. At 4 vCPUs
+  per `.xlarge`, the default caps use 24 Spot and 8 On-Demand vCPUs. Other
+  workloads in the account share the quotas, so check them before raising a
+  cap:
+
+  ```bash
+  $AWS service-quotas get-service-quota --service-code ec2 --quota-code L-34B43A08  # Spot
+  $AWS service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A  # On-Demand
+  ```
+
+- **Template size:** 49,890 of 51,200 bytes (97%). A new function, or a big
+  addition to one, will need the S3-bucket deploy.
 
 ## Traps
 

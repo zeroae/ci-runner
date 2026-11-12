@@ -10,7 +10,7 @@ on it. Short jobs stay on GitHub-hosted runners.
 
 | Label in `runs-on` | Capacity | For |
 |---|---|---|
-| `ci-spot` | EC2 Spot, `.xlarge` (`m7i`/`m6i`/`m6a`/`m7a`) | long jobs: a job that runs longer than a CI runner takes to come up (a few minutes) |
+| `ci-spot` | EC2 Spot, `.xlarge` (`m7i`/`m6i`/`m6a`/`m7a`) | long jobs: a job that runs well over 2 minutes, which is about how long a CI runner takes to come up |
 | `ci-ondemand` | EC2 On-Demand, `.xlarge` | critical jobs: a job that, cut off half-way, leaves state a person must repair (`terraform apply`) |
 | (none; `ubuntu-latest`) | GitHub-hosted | everything else |
 
@@ -47,7 +47,7 @@ it's in both.
    that names any missing tool and prints each tool's version.
 4. Move one job first, as a canary (usually the test job). Its queued-to-started
    time is the boot time, and that tells you which other jobs are long enough to
-   move.
+   move. The runbook's "Measured numbers" has what the canary repo measured.
 5. Set the variable (`gh variable set ZAE_CI_RUNNER --body 1`) and watch the
    canary.
 
