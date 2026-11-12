@@ -227,7 +227,7 @@ banner "ci-runner: create the GitHub App and the runner group"
 
 # ── 1 ─────────────────────────────────────────────────────────────────────
 stage "AWS session and the stack's URLs"
-for tool in aws gh jq curl; do command -v "$tool" >/dev/null || die "$tool is not installed"; done
+for tool in aws gh jq curl node; do command -v "$tool" >/dev/null || die "$tool is not installed"; done
 until aws_ sts get-caller-identity >/dev/null 2>&1; do
   warn "no live AWS session for $PROFILE."
   step "In another terminal: aws sso login --profile $PROFILE --use-device-code"
@@ -317,11 +317,26 @@ else OK=0; warn "group $GROUP settings are wrong: $(jq -c '{visibility,allows_pu
 GR=$(gh api "orgs/$ORG/actions/runner-groups/$GROUP_ID/repositories" --jq '[.repositories[].name]|join(",")')
 [[ "$GR" == "$CI_RUNNER_CANARY_REPO" ]] && say "${GREEN}✓${RESET} group repos: $GR" \
   || { OK=0; warn "group repos are '$GR', expected only $CI_RUNNER_CANARY_REPO"; }
-INST=$(gh api /user/installations --paginate --jq ".installations[]|select(.app_slug==\"$APP_SLUG\" and .account.login==\"$ORG\")")
+INST=$(gh api "orgs/$ORG/installations" --paginate --jq ".installations[]|select(.app_slug==\"$APP_SLUG\")")
 if [[ -z "$INST" ]]; then OK=0; warn "no installation of $APP_SLUG on $ORG found"
 else
   INST_ID=$(jq -r .id <<<"$INST")
-  IR=$(gh api "/user/installations/$INST_ID/repositories" --paginate --jq '[.repositories[].name]|join(",")')
+  # A user token can't list an App installation's repos; ask as the App itself
+  # (JWT from the key in the secret, never printed).
+  IR=$(aws_ secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text \
+    | INST_ID="$INST_ID" node -e '
+      const c = require("crypto"); let s = "";
+      process.stdin.on("data", d => s += d).on("end", async () => {
+        const x = JSON.parse(s), n = Math.floor(Date.now() / 1000);
+        const b = o => Buffer.from(JSON.stringify(o)).toString("base64url");
+        const u = b({ alg: "RS256", typ: "JWT" }) + "." + b({ iat: n - 60, exp: n + 540, iss: String(x.app_id) });
+        const jwt = u + "." + c.sign("RSA-SHA256", Buffer.from(u), x.private_key).toString("base64url");
+        const t = await (await fetch(`https://api.github.com/app/installations/${process.env.INST_ID}/access_tokens`,
+          { method: "POST", headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json" } })).json();
+        const r = await (await fetch("https://api.github.com/installation/repositories",
+          { headers: { Authorization: `token ${t.token}` } })).json();
+        console.log(r.repositories.map(x => x.name).join(","));
+      });') || IR="?"
   if [[ "$(jq -r .repository_selection <<<"$INST")" == selected && "$IR" == "$CI_RUNNER_CANARY_REPO" ]]; then
     say "${GREEN}✓${RESET} App installed on $ORG, selected repos: $IR"
   else OK=0; warn "App installation covers '$IR' ($(jq -r .repository_selection <<<"$INST")), expected only $CI_RUNNER_CANARY_REPO"; fi
