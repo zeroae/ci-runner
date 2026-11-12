@@ -294,7 +294,10 @@ REPO_ID=$(gh api "repos/$ORG/$CI_RUNNER_CANARY_REPO" --jq .id)
 GROUP_ID=$(gh api "orgs/$ORG/actions/runner-groups" --paginate \
   --jq ".runner_groups[]|select(.name==\"$GROUP\").id")
 if [[ -z "$GROUP_ID" ]]; then
-  confirm "Create org runner group '$GROUP' (only $CI_RUNNER_CANARY_REPO, no public repos)?" || die "stopped"
+  printf '\n'
+  say "Next: create the org runner group '$GROUP', limited to $CI_RUNNER_CANARY_REPO, public repos off."
+  confirm "Create it now? (type y, then Enter)" \
+    || die "runner group not created; re-run this wizard and answer y at this prompt"
   GROUP_ID=$(jq -n --argjson r "$REPO_ID" --arg n "$GROUP" \
       '{name:$n, visibility:"selected", selected_repository_ids:[$r], allows_public_repositories:false}' \
     | gh api -X POST "orgs/$ORG/actions/runner-groups" --input - --jq .id)
