@@ -249,9 +249,7 @@ it. A duplicate event creates a second, identical check run.
 
 The launcher, the notifier and the sweeper each carry their own copy of
 `appJwt()` and `gh()`, because bundling a shared module costs more template
-bytes than the copies. Keep the copies the same: the same signing call, the
-same headers (`x-github-api-version`, `user-agent: ci-runner`), and the same
-error, `<METHOD> <path>: <status> <message>`, with the HTTP status as
-`.status`.
+bytes than the copies. `test/conventions.test.js` fails if the copies differ,
+so change all three at once.
 
 Its role allows `GetSecretValue` on the secret and `ec2:DescribeInstances`.

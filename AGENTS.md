@@ -1,5 +1,9 @@
 # AGENTS.md
 
+- Changing the stack, a function or the build: read `docs/stack.md`.
+- Operating the live stack (deploy, the wizard, logs, a lost job): read `docs/runbook.md`.
+- Reviewing a change: apply `CODING_STANDARDS.md`.
+
 ## Agent skills
 
 ### Issue tracker
