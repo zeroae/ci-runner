@@ -1,19 +1,35 @@
 'use strict';
-// Builds build/template.yaml from template.yaml: every line `<indent>//@inline <file>`
-// (inside a `ZipFile: |` block) is replaced by that file, each line indented to
-// match. Paths are relative to the template. A local `require('./x.js')` in an
-// inlined file is replaced by x.js itself, wrapped as a module, so one Lambda
-// can share another file (the launcher bundles cloud-config.js). Fails if the result is not under
-// LIMIT bytes, the largest template `aws cloudformation deploy` sends inline.
+// Builds build/template.yaml from template.yaml. Each pair of lines
+//   <indent>ZipFile: |
+//   <indent+2>//@inline <file>
+// becomes one line, `<indent>ZipFile: "<file as a JSON string>"`, which YAML
+// reads as the same text: a double-quoted scalar is a superset of a JSON
+// string. It saves the block's indentation on every line of code. Paths are
+// relative to the template. A local `require('./x.js')` in an inlined file is
+// replaced by x.js itself, wrapped as a module, so one Lambda can share
+// another file (the launcher bundles cloud-config.js), and whole-line `//`
+// comments are dropped. Fails if the result is
+// not under LIMIT bytes, the largest template `aws cloudformation deploy`
+// sends inline.
 const fs = require('node:fs');
 const path = require('node:path');
 
 const LIMIT = 51200;
-const MARKER = /^( *)\/\/@inline (\S+)\s*$/;
 const LOCAL_REQUIRE = /require\('\.\/([\w.-]+\.js)'\)/;
 
+// Whole-line `//` comments go, except inside a template literal (tracked by
+// counting backticks on the lines kept).
+function dropComments(lines) {
+  let inLiteral = false;
+  return lines.filter((line) => {
+    if (!inLiteral && /^\s*\/\//.test(line)) return false;
+    if ((line.match(/`/g) || []).length % 2) inLiteral = !inLiteral;
+    return true;
+  });
+}
+
 function bundle(file) {
-  return fs.readFileSync(file, 'utf8').replace(/\n$/, '').split('\n').map((line) => {
+  return dropComments(fs.readFileSync(file, 'utf8').replace(/\n$/, '').split('\n')).map((line) => {
     const m = LOCAL_REQUIRE.exec(line);
     if (!m) return line;
     const dep = bundle(path.join(path.dirname(file), m[1]));
@@ -23,14 +39,12 @@ function bundle(file) {
   }).join('\n');
 }
 
+const ZIPFILE = /^( *)ZipFile: \|\n *\/\/@inline (\S+)[ \t]*$/gm;
+
 function build(templatePath) {
   const dir = path.dirname(templatePath);
-  return fs.readFileSync(templatePath, 'utf8').split('\n').map((line) => {
-    const m = MARKER.exec(line);
-    if (!m) return line;
-    const code = bundle(path.join(dir, m[2]));
-    return code.split('\n').map((l) => (l ? m[1] + l : l)).join('\n');
-  }).join('\n');
+  return fs.readFileSync(templatePath, 'utf8')
+    .replace(ZIPFILE, (_, indent, file) => `${indent}ZipFile: ${JSON.stringify(bundle(path.join(dir, file)))}`);
 }
 
 if (require.main === module) {

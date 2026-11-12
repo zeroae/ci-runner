@@ -74,7 +74,7 @@ function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
     }
   }
 
-  async function launchInstance(m, name, jitConfig) {
+  async function launchInstance(m, name, runnerId, jitConfig) {
     const lt = env.LAUNCH_TEMPLATE_ID;
     const userData = renderCloudConfig({ jitConfig, ...(env.IDLE_SECONDS ? { idleSeconds: Number(env.IDLE_SECONDS) } : {}) });
     // CreateFleet can't override user-data: a version per launch carries it.
@@ -97,7 +97,7 @@ function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
         TagSpecifications: [{
           ResourceType: 'instance',
           Tags: [
-            tag('ci-runner:runner', name), tag('ci-runner:label', m.label), tag('ci-runner:repo', m.repo),
+            tag('ci-runner:runner', name), tag('ci-runner:runner-id', runnerId), tag('ci-runner:label', m.label), tag('ci-runner:repo', m.repo),
             tag('ci-runner:job-id', m.job_id), tag('ci-runner:run-id', m.run_id), tag('ci-runner:head-sha', m.head_sha),
             tag('ci-runner:job-name', m.job_name),
           ],
@@ -122,19 +122,20 @@ function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
     if (j.status >= 300) throw new Error(`job status: ${j.status}`);
     if (j.json.status !== 'queued') return log(JSON.stringify({ ...job, dropped: j.json.status }));
 
-    const name = `${env.STACK_NAME}-${m.job_id}`;
+    // The sweeper reads the UTC mint stamp in the name as the registration's
+    // grace period, and matches the runner to its instance by these tags.
+    const stamp = new Date(now()).toISOString().replace(/\D/g, '').slice(0, 14);
+    const name = `${env.STACK_NAME}-${stamp}-${m.job_id}`;
     const r = await gh('POST', `/orgs/${org}/actions/runners/generate-jitconfig`, token, {
       name, runner_group_id: await runnerGroup(token), labels: m.labels, work_folder: '_work',
     });
-    // The runner is named after the job: a second delivery of it conflicts.
-    if (r.status === 409) return log(JSON.stringify({ ...job, dropped: 'duplicate', runner: name }));
     if (r.status >= 300) throw new Error(`generate-jitconfig: ${r.status} ${(r.json && r.json.message) || ''}`);
 
     try {
-      const instance = await launchInstance(m, name, r.json.encoded_jit_config);
+      const instance = await launchInstance(m, name, r.json.runner.id, r.json.encoded_jit_config);
       log(JSON.stringify({ ...job, launched: instance, runner: name, label: m.label }));
     } catch (e) {
-      // Unregister, so the retry can mint the same name again.
+      // Unregister now rather than leave it to the sweeper; the retry mints anew.
       await gh('DELETE', `/orgs/${org}/actions/runners/${r.json.runner.id}`, token).catch(() => {});
       throw e;
     }

@@ -87,7 +87,7 @@ test('a queued job mints a JIT config in the ci-runner group with its labels', a
   const { handler, gh } = setup();
   await handler(sqsEvent(MSG));
   const mint = gh.calls.find((c) => c.key === 'POST /orgs/zeroae/actions/runners/generate-jitconfig');
-  assert.deepEqual(mint.body, { name: 'ci-runner-555', runner_group_id: 3, labels: ['self-hosted', 'ci-spot'], work_folder: '_work' });
+  assert.deepEqual(mint.body, { name: 'ci-runner-20261112120000-555', runner_group_id: 3, labels: ['self-hosted', 'ci-spot'], work_folder: '_work' });
 });
 
 test('a queued job launches one Spot instance from the launch template, tagged with the job', async () => {
@@ -113,7 +113,7 @@ test('a queued job launches one Spot instance from the launch template, tagged w
   assert.deepEqual(new Set(cfg.Overrides.map((o) => o.InstanceType)), new Set(['m7i.xlarge', 'm6i.xlarge', 'm6a.xlarge', 'm7a.xlarge']));
   assert.deepEqual(new Set(cfg.Overrides.map((o) => o.SubnetId)), new Set(['subnet-a', 'subnet-b', 'subnet-c']));
   assert.deepEqual(tags(fleet), {
-    'ci-runner:runner': 'ci-runner-555', 'ci-runner:label': 'ci-spot', 'ci-runner:repo': 'zeroae/app',
+    'ci-runner:runner': 'ci-runner-20261112120000-555', 'ci-runner:runner-id': '77', 'ci-runner:label': 'ci-spot', 'ci-runner:repo': 'zeroae/app',
     'ci-runner:job-id': '555', 'ci-runner:run-id': '444', 'ci-runner:head-sha': 'abc123', 'ci-runner:job-name': 'tests',
   });
 
@@ -135,12 +135,6 @@ test('the group id and the installation token are cached across messages', async
   await handler(sqsEvent(MSG, MSG));
   assert.equal(gh.keys().filter((k) => k.endsWith('/runner-groups')).length, 1);
   assert.equal(gh.keys().filter((k) => k.endsWith('/access_tokens')).length, 1);
-});
-
-test('a runner already minted for the job (a duplicate delivery) is dropped without a launch', async () => {
-  const { handler, ec2 } = setup({ gh: fakeGitHub({ jit: { status: 409 } }) });
-  assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] });
-  assert.equal(ec2.calls.length, 0);
 });
 
 test('a failed launch removes the registration, deletes the version, and retries the message', async () => {
