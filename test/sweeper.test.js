@@ -5,7 +5,7 @@ const { createHandler } = require('../functions/sweeper.js');
 
 const NOW = Date.parse('2026-11-12T12:00:00Z');
 const ago = (min) => new Date(NOW - min * 60 * 1000);
-const env = { STACK: 'ci-runner', GITHUB_ORG: 'zeroae', RUNNER_GROUP: 'ci-runner' };
+const env = { STACK_NAME: 'ci-runner', GITHUB_ORG: 'zeroae', RUNNER_GROUP: 'ci-runner' };
 
 function instance(id, minutesOld, { state = 'running', tags = { 'ci-runner:stack': 'ci-runner' } } = {}) {
   return {
@@ -68,7 +68,7 @@ function verifyJwt(auth) {
 const json = (status, body) => ({ ok: status < 300, status, json: async () => body });
 
 // A fake GitHub: the App's org installation, one runner group and its runners.
-function fakeGitHub(runners) {
+function fakeGitHub(runners, groups = [{ id: 1, name: 'Default' }, { id: 3, name: 'ci-runner' }]) {
   const deleted = [];
   const jwts = [];
   const fetch = async (url, opts = {}) => {
@@ -84,8 +84,12 @@ function fakeGitHub(runners) {
       return json(201, { token: 'ghs_install' });
     }
     assert.equal(auth, 'Bearer ghs_install');
+    assert.equal(opts.headers['x-github-api-version'], '2022-11-28');
+    assert.equal(opts.headers['user-agent'], 'ci-runner');
     if (method === 'GET' && pathname === '/orgs/zeroae/actions/runner-groups') {
-      return json(200, { total_count: 2, runner_groups: [{ id: 1, name: 'Default' }, { id: 3, name: 'ci-runner' }] });
+      const per = Number(searchParams.get('per_page'));
+      const page = Number(searchParams.get('page') || 1);
+      return json(200, { total_count: groups.length, runner_groups: groups.slice((page - 1) * per, page * per) });
     }
     if (method === 'GET' && pathname === '/orgs/zeroae/actions/runner-groups/3/runners') {
       const per = Number(searchParams.get('per_page'));
@@ -148,11 +152,27 @@ test('pages through a group with more than 100 runners', async () => {
   assert.equal(gh.deleted.length, 150);
 });
 
+test('finds the runner group past the first page of groups', async () => {
+  const groups = Array.from({ length: 100 }, (_, i) => ({ id: 100 + i, name: `g${i}` })).concat({ id: 3, name: 'ci-runner' });
+  const gh = fakeGitHub([runner(30, 'ci-runner-orphan')], groups);
+  await createHandler({ ec2: fakeEc2([]), secret: app, fetch: gh.fetch, now: () => NOW, env })({});
+  assert.deepEqual(gh.deleted, [30]);
+});
+
+test('logs what it did through the injected log', async (t) => {
+  t.mock.method(console, 'log', () => assert.fail('logged to the console'));
+  const logs = [];
+  const gh = fakeGitHub([runner(40, 'ci-runner-orphan')]);
+  await createHandler({ ec2: fakeEc2([instance('i-old', 200)]), secret: app, fetch: gh.fetch, now: () => NOW, env, log: (l) => logs.push(l) })({});
+  assert.match(logs.join('\n'), /terminated i-old/);
+  assert.match(logs.join('\n'), /removed runner ci-runner-orphan/);
+});
+
 test('a GitHub failure does not stop the terminations, but fails the run', async () => {
   const ec2 = fakeEc2([instance('i-old', 200)]);
   const fetch = async () => json(500, {});
   const sweep = createHandler({ ec2, secret: app, fetch, now: () => NOW, env });
-  await assert.rejects(sweep({}), /HTTP 500/);
+  await assert.rejects(sweep({}), /: 500/);
   assert.deepEqual(ec2.terminated, ['i-old']);
 });
 

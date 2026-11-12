@@ -425,6 +425,30 @@ About $0.40 a month.
   commits). Its key lives only in the stack's secret.
 - **Spot reclaims.** Expected to be rare for jobs of 1–15 minutes (a guess, not
   a measurement); a lost job is re-run by a person.
+- **The launcher can write any launch template version.** IAM can't constrain
+  what a `CreateLaunchTemplateVersion` contains, so a compromised launcher could
+  write one with weaker metadata-service settings. It still can't give an
+  instance a role: it has no `iam:PassRole`.
+
+## As built (the builder's calls)
+
+Where the build departs from the text above, or settles what it left open:
+
+- **The `docker` group** is made by a `bootcmd` `groupadd -g 123`, not
+  cloud-init's `groups`, which can't set a gid.
+- **The runner group's id** is looked up by name in the launcher (and cached),
+  not configured.
+- **Setup's `state` is not stored.** It is `<expiry>.<nonce>.<HMAC>`, keyed by a
+  key in the stack's secret, and must match a `Secure; HttpOnly` cookie set by
+  the `GET`, so only the browser that started the flow can finish it.
+- **A launch is an EC2 Fleet of type `instant`** for one instance. `CreateFleet`
+  can't override user-data, so each launch adds a launch template version that
+  carries it and deletes the version after. That is why the launcher's role has
+  `CreateLaunchTemplateVersion`/`DeleteLaunchTemplateVersions`, and
+  `ssm:GetParameters` for the template's `resolve:ssm:` image. It also has the
+  queue grants its SQS trigger needs.
+- **The build drops comments** (whole-line `//` in the inlined code, whole-line
+  `#` in the template) to stay under the template size limit (the owner's call).
 
 ## Left to the builder
 

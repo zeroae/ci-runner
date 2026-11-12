@@ -17,9 +17,18 @@ const GRACE_MS = 10 * 60 * 1000;
 const STAMP = /(?:^|-)(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:-|$)/;
 const API = 'https://api.github.com';
 
+const b64u = (s) => Buffer.from(s).toString('base64url');
+
+function appJwt(appId, pem, nowMs) {
+  const iat = Math.floor(nowMs / 1000) - 60; // GitHub allows for clock drift this way
+  const data = `${b64u(JSON.stringify({ alg: 'RS256', typ: 'JWT' }))}.${b64u(JSON.stringify({ iat, exp: iat + 540, iss: String(appId) }))}`;
+  return `${data}.${crypto.sign('sha256', Buffer.from(data), pem).toString('base64url')}`;
+}
+
 const tagOf = (inst, key) => ((inst.Tags || []).find((t) => t.Key === key) || {}).Value;
 
-function createHandler({ ec2, secret, fetch, now, env }) {
+function createHandler({ ec2, secret, fetch, now, env, log = console.log }) {
+  const org = env.GITHUB_ORG;
   // Instances that can still be (or become) a runner: everything not terminated.
   const alive = (i) => i.State.Name !== 'terminated';
   // Instances we may terminate: shutting-down ones are already on their way.
@@ -27,52 +36,42 @@ function createHandler({ ec2, secret, fetch, now, env }) {
 
   async function sweepInstances(instances) {
     const strays = instances
-      .filter((i) => tagOf(i, STACK_TAG) === env.STACK && killable(i))
+      .filter((i) => tagOf(i, STACK_TAG) === env.STACK_NAME && killable(i))
       .filter((i) => now() - new Date(i.LaunchTime).getTime() > MAX_AGE_MS)
       .map((i) => i.InstanceId);
     if (strays.length) {
       await ec2.terminate(strays);
-      console.log(`sweeper: terminated ${strays.join(' ')}`);
+      log(`sweeper: terminated ${strays.join(' ')}`);
     }
     return strays;
   }
 
-  async function gh(token, method, path) {
-    const res = await fetch(`${API}${path}`, {
-      method,
-      headers: {
-        accept: 'application/vnd.github+json',
-        authorization: `Bearer ${token}`,
-        'x-github-api-version': '2022-11-28',
-        'user-agent': 'ci-runner-sweeper',
-      },
+  async function gh(method, path, token, body) {
+    const res = await fetch(API + path, {
+      method, body: body && JSON.stringify(body),
+      headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'ci-runner', authorization: `Bearer ${token}`, ...(body && { 'content-type': 'application/json' }) },
     });
-    if (!res.ok) throw new Error(`sweeper: ${method} ${path.split('?')[0]} returned HTTP ${res.status}`);
-    return res.status === 204 ? undefined : res.json();
-  }
-
-  function appJwt(appId, key) {
-    const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
-    const iat = Math.floor(now() / 1000) - 60; // GitHub allows for clock drift
-    const body = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iat, exp: iat + 540, iss: String(appId) })}`;
-    return `${body}.${crypto.sign('RSA-SHA256', Buffer.from(body), key).toString('base64url')}`;
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw Object.assign(new Error(`${method} ${path}: ${res.status} ${(json && json.message) || ''}`), { status: res.status });
+    return json;
   }
 
   async function installationToken(creds) {
-    const jwt = appJwt(creds.app_id, creds.private_key);
-    const org = encodeURIComponent(env.GITHUB_ORG);
-    const inst = await gh(jwt, 'GET', `/orgs/${org}/installation`);
-    return (await gh(jwt, 'POST', `/app/installations/${inst.id}/access_tokens`)).token;
+    const jwt = appJwt(creds.app_id, creds.private_key, now());
+    const inst = await gh('GET', `/orgs/${org}/installation`, jwt);
+    return (await gh('POST', `/app/installations/${inst.id}/access_tokens`, jwt)).token;
   }
 
   async function listGroupRunners(token) {
-    const org = encodeURIComponent(env.GITHUB_ORG);
-    const groups = await gh(token, 'GET', `/orgs/${org}/actions/runner-groups?per_page=100`);
-    const group = groups.runner_groups.find((g) => g.name === env.RUNNER_GROUP);
-    if (!group) { console.log(`sweeper: no runner group named ${env.RUNNER_GROUP} yet`); return []; }
+    let group;
+    for (let page = 1; !group; page++) {
+      const r = await gh('GET', `/orgs/${org}/actions/runner-groups?per_page=100&page=${page}`, token);
+      group = r.runner_groups.find((g) => g.name === env.RUNNER_GROUP);
+      if (!group && r.runner_groups.length < 100) { log(`sweeper: no runner group named ${env.RUNNER_GROUP} yet`); return []; }
+    }
     const runners = [];
     for (let page = 1; ; page++) {
-      const r = await gh(token, 'GET', `/orgs/${org}/actions/runner-groups/${group.id}/runners?per_page=100&page=${page}`);
+      const r = await gh('GET', `/orgs/${org}/actions/runner-groups/${group.id}/runners?per_page=100&page=${page}`, token);
       runners.push(...r.runners);
       if (r.runners.length < 100 || runners.length >= r.total_count) return runners;
     }
@@ -84,16 +83,15 @@ function createHandler({ ec2, secret, fetch, now, env }) {
   }
 
   async function sweepRunners(token, runners, instances) {
-    const live = instances.filter(alive);
-    const names = new Set(live.map((i) => tagOf(i, RUNNER_TAG)).filter(Boolean));
-    const ids = new Set(live.map((i) => tagOf(i, RUNNER_ID_TAG)).filter(Boolean));
+    const present = instances.filter(alive);
+    const names = new Set(present.map((i) => tagOf(i, RUNNER_TAG)).filter(Boolean));
+    const ids = new Set(present.map((i) => tagOf(i, RUNNER_ID_TAG)).filter(Boolean));
     const young = (r) => { const t = minted(r.name); return t !== undefined && now() - t < GRACE_MS; };
     const orphans = runners.filter((r) => r.status === 'offline' && !r.busy
       && !names.has(r.name) && !ids.has(String(r.id)) && !young(r));
-    const org = encodeURIComponent(env.GITHUB_ORG);
     for (const r of orphans) {
-      await gh(token, 'DELETE', `/orgs/${org}/actions/runners/${r.id}`);
-      console.log(`sweeper: removed runner ${r.name} (id ${r.id})`);
+      await gh('DELETE', `/orgs/${org}/actions/runners/${r.id}`, token);
+      log(`sweeper: removed runner ${r.name} (id ${r.id})`);
     }
     return orphans.map((r) => r.id);
   }
@@ -108,11 +106,11 @@ function createHandler({ ec2, secret, fetch, now, env }) {
         token = await installationToken(creds);
         runners = await listGroupRunners(token);
       } else {
-        console.log('sweeper: the GitHub App is not set up yet; registrations skipped');
+        log('sweeper: the GitHub App is not set up yet; registrations skipped');
       }
     } catch (err) { failure = err; }
 
-    const instances = (await ec2.describe()).filter((i) => tagOf(i, STACK_TAG) === env.STACK);
+    const instances = (await ec2.describe()).filter((i) => tagOf(i, STACK_TAG) === env.STACK_NAME);
     const terminated = await sweepInstances(instances);
     if (failure) throw failure;
     const removed = runners ? await sweepRunners(token, runners, instances) : [];
@@ -140,7 +138,7 @@ exports.handler = async (event) => {
         describe: async () => {
           const out = [];
           const pages = ec2sdk.paginateDescribeInstances({ client: ec2c },
-            { Filters: [{ Name: `tag:${STACK_TAG}`, Values: [process.env.STACK] }] });
+            { Filters: [{ Name: `tag:${STACK_TAG}`, Values: [process.env.STACK_NAME] }] });
           for await (const page of pages) for (const r of page.Reservations || []) out.push(...r.Instances);
           return out;
         },
