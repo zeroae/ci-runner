@@ -106,3 +106,41 @@ sweeper (or GitHub, for ephemeral runners) removes it.
 instance as above. It prints the instance id. `IDLE_SECONDS=120` shortens the
 idle exit for a test. `make runners` lists the stack's instances that are not
 terminated.
+
+## The sweeper
+
+`functions/sweeper.js` runs every 10 minutes (an EventBridge rule). Each run:
+
+1. Reads the secret. Once it holds `private_key`, it signs an App JWT
+   (RS256, `iss` = `app_id`), gets the org installation's token, and lists the
+   runners in the `ci-runner` group. Before the App exists it skips this.
+2. Describes the instances tagged `ci-runner:stack=<stack>`, and terminates
+   those `pending`, `running`, `stopping` or `stopped` and launched over
+   **2 hours** ago.
+3. Removes each runner in the group that is `offline`, not busy, and has no
+   instance (see below). A GitHub failure doesn't stop step 2, but fails the
+   run.
+
+Runners are listed before instances are described, so a runner whose
+instance launches between the two is still seen with its instance.
+
+Its role allows `GetSecretValue` on the secret, `ec2:DescribeInstances`, and
+`ec2:TerminateInstances` only on instances whose `aws:ResourceTag/ci-runner:stack`
+is the stack's name. A `TerminateInstances` naming an untagged instance, or
+another stack's, is denied.
+
+### How a runner finds its instance
+
+Whatever launches a runner (`scripts/hand-launch.sh`, the launcher) must:
+
+- tag the instance `ci-runner:runner=<runner name>`, the name it gave
+  `generate-jitconfig`. It may also tag `ci-runner:runner-id=<runner id>`;
+  either tag matching keeps the registration.
+- put a UTC `YYYYmmddHHMMSS` timestamp of the mint in the name as its own
+  `-`-separated token, for example `ci-runner-20261112113000-<job id>`.
+  The registration exists before its instance does, so the sweeper leaves a
+  runner alone for 10 minutes after that time. A name with no stamp gets no
+  grace.
+
+Every instance not yet `terminated` counts, so a runner whose instance is
+shutting down is removed on a later run.

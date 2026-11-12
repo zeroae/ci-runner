@@ -18,7 +18,7 @@ test('an inline marker is replaced by the file, indented to the marker', () => {
 test('the real template embeds every function and is under the inline size limit', () => {
   const out = build(path.join(root, 'template.yaml'));
   assert.doesNotMatch(out, /^ *\/\/@inline /m);
-  for (const fn of ['setup', 'webhook']) {
+  for (const fn of ['setup', 'webhook', 'sweeper']) {
     const firstCodeLine = fs.readFileSync(path.join(root, 'functions', `${fn}.js`), 'utf8').split('\n')[2];
     assert.ok(out.includes(firstCodeLine.trim()), `${fn} not inlined`);
   }
