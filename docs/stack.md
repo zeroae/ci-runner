@@ -57,3 +57,52 @@ call answers 410.
 created with, valid for 15 minutes, and must match a `Secure; HttpOnly;
 SameSite=Lax` cookie set by the `GET`, so a code is only accepted in the
 browser that started the flow. Nothing is stored for it.
+
+## The network and the launch template
+
+The stack has its own VPC (`10.77.0.0/16`): three public subnets in the
+region's first three AZs (`MapPublicIpOnLaunch`), one route table with a
+default route to an internet gateway, no NAT, no flow logs, no endpoints. The
+security group `RunnerSecurityGroup` has no inbound rules.
+
+`RunnerLaunchTemplate` holds everything a CI runner instance shares: the AL2023
+image through `resolve:ssm:` (resolved at each launch), 50 GB encrypted gp3
+deleted on termination, IMDSv2 required with hop limit 1, shutdown behaviour
+`terminate`, the tag `ci-runner:stack=<stack>` on instance and volume. It has
+**no instance profile, no instance type and no user-data**.
+
+A launch is an EC2 Fleet of type `instant` for one instance: overrides for
+`m7i`/`m6i`/`m6a`/`m7a` `.xlarge` in each of the three subnets, Spot
+`capacity-optimized` for `ci-spot`. `CreateFleet` can't override user-data, so
+each launch first adds a launch template version (source `$Default`, only
+`UserData`), launches from it, and deletes that version again. The outputs
+`LaunchTemplateId`, `SubnetIds` and `SecurityGroupId` are what a launch needs.
+
+## The instance's user-data
+
+`functions/cloud-config.js` exports `renderCloudConfig({ jitConfig,
+idleSeconds = 900 })`, which returns the `#cloud-config` document. It has no
+`require()`, so the launcher can inline it.
+`test/cloud-config.test.js` covers it. On the instance:
+
+1. `bootcmd` creates `docker` with gid 123 before the `docker` package does.
+2. `write_files` puts the JIT config in `/etc/ci-runner/jitconfig` (`0600`)
+   and the start script in `/usr/local/sbin/ci-runner`.
+3. `runcmd` starts Docker and runs the start script, which pulls
+   `ghcr.io/zeroae/ci-runner:latest` and runs it with the host's socket and
+   `/home/runner/_work` mounted at the same path, as `./run.sh --jitconfig`.
+   If the container's log has no `Running job` line after `idleSeconds`, the
+   script stops the container. When the container exits, the script's `EXIT`
+   trap runs `shutdown -h now`, which terminates the instance.
+
+A runner stopped by the idle exit stays registered, offline, until the
+sweeper (or GitHub, for ephemeral runners) removes it.
+
+## Launching one by hand
+
+`make hand-launch` (`scripts/hand-launch.sh`) mints an org JIT config for the
+`ci-runner` group with labels `self-hosted`, `ci-spot` through the owner's
+`gh`, which needs `admin:org`. It then renders the user-data and launches one
+instance as above. It prints the instance id. `IDLE_SECONDS=120` shortens the
+idle exit for a test. `make runners` lists the stack's instances that are not
+terminated.
