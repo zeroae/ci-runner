@@ -294,7 +294,7 @@ types.
   $AWS service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A  # On-Demand
   ```
 
-- **Template size:** 49,890 of 51,200 bytes (97%). A new function, or a big
+- **Template size:** 49,908 of 51,200 bytes (97%). A new function, or a big
   addition to one, will need the S3-bucket deploy.
 
 ## Traps

@@ -1,9 +1,10 @@
 STACK   ?= ci-runner
 PROFILE ?= zeroae-code/AWSPowerUserAccess
 REGION  ?= us-east-1
+ORG     ?= zeroae
 AWS      = aws --profile $(PROFILE) --region $(REGION)
 
-.PHONY: help test build validate deploy outputs hand-launch runners sweep
+.PHONY: help test build validate deploy outputs hand-launch runners sweep canary-runs
 .DEFAULT_GOAL := help
 
 help: ## List the targets
@@ -40,3 +41,7 @@ runners: ## List the stack's CI runner instances that are not terminated
 
 sweep: ## Run the sweeper now, and print what it terminated and removed
 	@$(AWS) lambda invoke --function-name $(STACK)-sweeper /dev/stdout --query FunctionError --output text
+
+canary-runs: ## List the canary repo's recent workflow runs (CI_RUNNER_CANARY_REPO, from .env)
+	@test -f .env || { echo "no .env: run scripts/setup-github.sh first" >&2; exit 1; }
+	@. ./.env && gh run list --repo $(ORG)/$$CI_RUNNER_CANARY_REPO --limit 10

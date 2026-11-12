@@ -6,6 +6,7 @@
 // more template bytes than the copy does.
 const crypto = require('node:crypto');
 
+const API = 'https://api.github.com';
 const b64u = (s) => Buffer.from(s).toString('base64url');
 
 function appJwt(appId, pem, nowMs) {
@@ -16,7 +17,7 @@ function appJwt(appId, pem, nowMs) {
 
 function createHandler({ secret, fetch, ec2, now, env, log = console.log }) {
   async function gh(method, path, token, body) {
-    const res = await fetch('https://api.github.com' + path, {
+    const res = await fetch(API + path, {
       method, body: body && JSON.stringify(body),
       headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'ci-runner', authorization: `Bearer ${token}`, ...(body && { 'content-type': 'application/json' }) },
     });
