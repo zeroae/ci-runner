@@ -152,9 +152,10 @@ A repo is served when all of these hold:
 
 ## Read a lost job
 
-When AWS reclaims a Spot instance, GitHub marks the job failed with *The
-runner has received a shutdown signal* or *lost communication with the
-server*. On the same commit there is a failed check run from the App, named
+When AWS reclaims a Spot instance, GitHub marks the job failed, with *The
+runner has received a shutdown signal*, *lost communication with the server*,
+or (seen in the live FIS test) just *Process completed with exit code 130*
+on the running step. On the same commit there is a failed check run from the App, named
 `ci-runner / <job name>` and titled `Spot capacity reclaimed: re-run this job`.
 Its summary names the instance and links the run. That is the whole story:
 re-run the failed job. Nothing retries it automatically.
@@ -278,7 +279,7 @@ on GitHub-hosted runners in the meantime.
 | `setup-python` fails, or picks up a broken Python | `AGENT_TOOLSDIRECTORY` isn't `/opt/hostedtoolcache` |
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
 | A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, and otherwise only `linux`/`x64`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all) |
-| A job fails "The runner has received a shutdown signal" or "lost communication", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
+| A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
 | A cap lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotCap=6 OnDemandCap=2` |
 | The launcher logs `no instance launched`, with an authorization error from `CreateFleet` | `CreateFleet`'s check on the instance, volumes and network interfaces it creates carries no `ec2:LaunchTemplate` key, so a policy that adds that condition to them denies the launch. Grant those to `CreateFleet` without the condition; `RunInstances` keeps it |
 | The wizard stops with `runner group not created` | Enter at its **y/N** prompt means no. Re-run it, and type `y` at that prompt |
