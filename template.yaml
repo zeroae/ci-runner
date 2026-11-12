@@ -1,0 +1,632 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ci-runner: single-use EC2 self-hosted GitHub Actions runners for zeroae's
+  private repos. Source template; `make build` inlines functions/*.js.
+
+# Layout rules (see docs/stack.md):
+# - every role and policy is PowerUserPB-${AWS::StackName}-<suffix> with the
+#   PowerUserAccess permissions boundary;
+# - each function's code is `//@inline functions/<name>.js` under `ZipFile: |`.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: zeroae
+  AppName:
+    Type: String
+    Default: zeroae-ci-runner
+    Description: Name of the GitHub App the setup URL registers (globally unique on GitHub).
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  RunnerGroup:
+    Type: String
+    Default: ci-runner
+    Description: The org runner group every CI runner registers into (created after the stack).
+  SpotCap:
+    Type: Number
+    Default: 6
+    Description: Most Spot CI runners at once (soft).
+  OnDemandCap:
+    Type: Number
+    Default: 2
+    Description: Most On-Demand CI runners at once (soft).
+
+Resources:
+  # App id, private key and webhook secret. Created holding only `state_key`
+  # (the setup function's HMAC key for `state`); setup replaces the whole value
+  # once, from the manifest conversion. Do not edit GenerateSecretString: a
+  # change makes CloudFormation regenerate the value and wipe the App's key.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/github-app"
+      Description: GitHub App credentials for ci-runner (written once by the setup function).
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: state_key
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # --- setup: one-time App registration (manifest flow) ---------------------
+  SetupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-setup"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-setup"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-setup"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${SetupLogGroup.Arn}"
+              # The only function allowed to write the secret.
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:PutSecretValue]
+                Resource: !Ref AppSecret
+
+  SetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-setup"
+      Description: One-time GitHub App registration through the manifest flow.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt SetupRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref SetupLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          WEBHOOK_URL: !GetAtt WebhookUrl.FunctionUrl
+          GITHUB_ORG: !Ref GitHubOrg
+          APP_NAME: !Ref AppName
+      Code:
+        ZipFile: |
+          //@inline functions/setup.js
+
+  SetupUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref SetupFunction
+      AuthType: NONE
+
+  SetupUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SetupFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  SetupUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SetupFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  # --- the job queue: webhook -> launcher -----------------------------------
+  # A message that fails 5 receives (2 minutes apart) goes to the DLQ. A job
+  # left queued that long is GitHub's to time out.
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-jobs"
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 86400
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  JobDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-jobs-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # --- webhook: verify, label contract, fence 3, enqueue ----------------------
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-webhook"
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-webhook"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-webhook"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${WebhookLogGroup.Arn}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt JobQueue.Arn
+
+  WebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-webhook"
+      Description: GitHub workflow_job webhook receiver.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt WebhookRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref WebhookLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          QUEUE_URL: !Ref JobQueue
+          GITHUB_ORG: !Ref GitHubOrg
+      Code:
+        ZipFile: |
+          //@inline functions/webhook.js
+
+  WebhookUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref WebhookFunction
+      AuthType: NONE
+
+  WebhookUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  WebhookUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  # --- launcher: one instance per still-queued job ---------------------------
+  LauncherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-launcher"
+      RetentionInDays: !Ref LogRetentionDays
+
+  LauncherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-launcher"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-launcher"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${LauncherLogGroup.Arn}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility, sqs:SendMessage]
+                Resource: !GetAtt JobQueue.Arn
+              # The cap counts instances; no resource-level permissions.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              # A version per launch carries the user-data.
+              - Effect: Allow
+                Action: [ec2:CreateLaunchTemplateVersion, ec2:DeleteLaunchTemplateVersions]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+              # The fleet, from this launch template, into this stack's subnets
+              # and security group only. No iam:PassRole: there is no role.
+              - Effect: Allow
+                Action: [ec2:CreateFleet, ec2:RunInstances]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:fleet/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet0}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet1}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet2}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+              # CreateFleet's check on what it creates carries no launch
+              # template key; the statement above already pins the template,
+              # subnets and security group. RunInstances does carry one.
+              - Effect: Allow
+                Action: ec2:CreateFleet
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+                Condition:
+                  ArnEquals:
+                    ec2:LaunchTemplate: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:*/*"
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: [CreateFleet, RunInstances]
+              # The launch template's image is resolve:ssm: at each launch.
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/ami-amazon-linux-latest/*"
+
+  LauncherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-launcher"
+      Description: Launches one CI runner instance per still-queued job from the queue.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LauncherRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref LauncherLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          GITHUB_ORG: !Ref GitHubOrg
+          RUNNER_GROUP: !Ref RunnerGroup
+          STACK_NAME: !Ref AWS::StackName
+          LAUNCH_TEMPLATE_ID: !Ref RunnerLaunchTemplate
+          SUBNET_IDS: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
+          QUEUE_URL: !Ref JobQueue
+          SPOT_CAP: !Ref SpotCap
+          ONDEMAND_CAP: !Ref OnDemandCap
+      Code:
+        ZipFile: |
+          //@inline functions/launcher.js
+
+  LauncherQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref LauncherFunction
+      EventSourceArn: !GetAtt JobQueue.Arn
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # --- sweeper: terminates strays, removes orphan registrations -------------
+  SweeperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-sweeper"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SweeperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-sweeper"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-sweeper"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${SweeperLogGroup.Arn}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+              # DescribeInstances supports no resource-level permissions.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              # Only this stack's instances: a call naming any other instance,
+              # or an untagged one, is denied as a whole.
+              - Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
+
+  SweeperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sweeper"
+      Description: Terminates CI runner instances over 2 hours old; removes offline runner registrations with no instance.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt SweeperRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref SweeperLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          STACK_NAME: !Ref AWS::StackName
+          GITHUB_ORG: !Ref GitHubOrg
+          RUNNER_GROUP: !Ref RunnerGroup
+      Code:
+        ZipFile: |
+          //@inline functions/sweeper.js
+
+  SweeperSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-sweeper"
+      ScheduleExpression: rate(10 minutes)
+      Targets:
+        - Id: sweeper
+          Arn: !GetAtt SweeperFunction.Arn
+
+  SweeperSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SweeperFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SweeperSchedule.Arn
+
+  # --- notifier: a Spot reclaim becomes a failed check run -------------------
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-notifier"
+      RetentionInDays: !Ref LogRetentionDays
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-notifier"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-notifier"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${NotifierLogGroup.Arn}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+
+  NotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-notifier"
+      Description: Reports a Spot reclaim as a failed check run.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt NotifierRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref NotifierLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          GITHUB_ORG: !Ref GitHubOrg
+          STACK_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: |
+          //@inline functions/notifier.js
+
+  # Matches every Spot warning (no tag filter); the notifier ignores the rest.
+  NotifierRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-notifier"
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Spot Instance Interruption Warning]
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+
+  NotifierRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NotifierRule.Arn
+
+  # --- network: a VPC of its own, public subnets, no NAT --------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.77.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  Subnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [10.77.0.0/16, 3, 12]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-0" }]
+
+  Subnet0Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet0
+      RouteTableId: !Ref RouteTable
+
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [10.77.0.0/16, 3, 12]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-1" }]
+
+  Subnet1Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet1
+      RouteTableId: !Ref RouteTable
+
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [10.77.0.0/16, 3, 12]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-2" }]
+
+  Subnet2Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet2
+      RouteTableId: !Ref RouteTable
+
+  # No inbound rules: nothing reaches a CI runner. Outbound open.
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ci-runner instances (no inbound)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  # --- launch template: one CI runner instance -------------------------------
+  # No instance type (each launch passes the .xlarge overrides), no user-data
+  # (each launch adds a version carrying its own #cloud-config), and no
+  # instance profile, ever: the instance holds no AWS credentials.
+  RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-runner"
+      LaunchTemplateData:
+        # Resolved by EC2 at every launch: always the latest AL2023.
+        ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+        InstanceInitiatedShutdownBehavior: terminate
+        SecurityGroupIds: [!Ref RunnerSecurityGroup]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 50, VolumeType: gp3, DeleteOnTermination: true, Encrypted: true }
+        # IMDSv2 only, one hop: a job's containers can't reach the metadata service.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+              - { Key: Name, Value: !Sub "${AWS::StackName}-runner" }
+          - ResourceType: volume
+            Tags:
+              - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
+Outputs:
+  SetupUrl:
+    Description: Open in a browser to create the GitHub App (refuses everything once done).
+    Value: !GetAtt SetupUrl.FunctionUrl
+  WebhookUrl:
+    Value: !GetAtt WebhookUrl.FunctionUrl
+  AppSecretArn:
+    Value: !Ref AppSecret
+  LaunchTemplateId:
+    Value: !Ref RunnerLaunchTemplate
+  SubnetIds:
+    Value: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
+  SecurityGroupId:
+    Value: !Ref RunnerSecurityGroup
+  JobQueueUrl:
+    Value: !Ref JobQueue
+  JobDeadLetterQueueUrl:
+    Value: !Ref JobDeadLetterQueue
