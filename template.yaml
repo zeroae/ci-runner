@@ -176,6 +176,87 @@ Resources:
       Principal: "*"
       InvokedViaFunctionUrl: true
 
+  # --- sweeper: terminates strays, removes orphan registrations -------------
+  SweeperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-sweeper"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SweeperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-sweeper"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-sweeper"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${SweeperLogGroup.Arn}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+              # DescribeInstances supports no resource-level permissions.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              # Only this stack's instances: a call naming any other instance,
+              # or an untagged one, is denied as a whole.
+              - Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
+
+  SweeperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sweeper"
+      Description: Terminates CI runner instances over 2 hours old; removes offline runner registrations with no instance.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt SweeperRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      LoggingConfig:
+        LogGroup: !Ref SweeperLogGroup
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref AppSecret
+          STACK: !Ref AWS::StackName
+          GITHUB_ORG: !Ref GitHubOrg
+          RUNNER_GROUP: ci-runner
+      Code:
+        ZipFile: |
+          //@inline functions/sweeper.js
+
+  SweeperSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-sweeper"
+      ScheduleExpression: rate(10 minutes)
+      Targets:
+        - Id: sweeper
+          Arn: !GetAtt SweeperFunction.Arn
+
+  SweeperSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SweeperFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SweeperSchedule.Arn
+
   # --- network: a VPC of its own, public subnets, no NAT --------------------
   Vpc:
     Type: AWS::EC2::VPC

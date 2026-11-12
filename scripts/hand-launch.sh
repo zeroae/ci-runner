@@ -35,7 +35,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 chmod 700 "$work"
 
-name="$STACK-hand-$(date +%Y%m%d%H%M%S)"
+name="$STACK-hand-$(date -u +%Y%m%d%H%M%S)"
 gh api -X POST "orgs/$ORG/actions/runners/generate-jitconfig" \
   -f name="$name" -F runner_group_id="$group_id" -f work_folder=_work \
   -f 'labels[]=self-hosted' -f "labels[]=$LABEL" \

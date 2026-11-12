@@ -30,7 +30,7 @@ test('an inlined file\'s local require() is bundled in, so the result runs on it
 test('the real template embeds every function and is under the inline size limit', () => {
   const out = build(path.join(root, 'template.yaml'));
   assert.doesNotMatch(out, /^ *\/\/@inline /m);
-  for (const fn of ['setup', 'webhook', 'launcher']) {
+  for (const fn of ['setup', 'webhook', 'launcher', 'sweeper']) {
     const firstCodeLine = fs.readFileSync(path.join(root, 'functions', `${fn}.js`), 'utf8').split('\n')[2];
     assert.ok(out.includes(firstCodeLine.trim()), `${fn} not inlined`);
   }
