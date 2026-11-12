@@ -1,7 +1,8 @@
 # The stack: layout and conventions
 
 One CloudFormation stack, `ci-runner`, in `zeroae-code` / `us-east-1`.
-`make help` lists the targets.
+`make help` lists the targets. The owner's procedures and the traps table are in
+[runbook.md](runbook.md).
 
 ```
 template.yaml               source template (valid YAML, with inline markers)
