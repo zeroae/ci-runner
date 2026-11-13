@@ -132,11 +132,15 @@ A repo is served when all of these hold:
    gh api orgs/zeroae/actions/runner-groups/$GROUP_ID/repositories --jq '.repositories[].name'
    ```
 
-3. Set the variable once the repo's workflow routes through it:
+3. Set the variable last, once the repo's workflow routes through it:
 
    ```bash
    gh variable set ZAE_CI_RUNNER --repo zeroae/<repo> --body 1
    ```
+
+   A job that queued while a step above was missing never gets a runner, even
+   after the step is done: the webhook acts only on a job's `queued` event,
+   and that came before the repo was served. Cancel the job and re-run it.
 
 **Off:**
 
@@ -301,11 +305,11 @@ types.
 
 | Symptom | Cause |
 |---|---|
-| A job's `docker run -v ...` sees an empty directory | the work directory isn't at the same path on host and container (`/home/runner/_work`) |
+| A job's `docker run -v ...` sees an empty directory, fails `error mounting "...": not a directory`, or hits `read-only file system` inside a mounted config directory, only on our runners | the source isn't under a path shared with the host, so Docker mounts an empty host path (for a missing file, a directory it creates). Only `/tmp` and `/home/runner` are shared, at the same paths; mount from one of those. If `/tmp` or `$HOME` itself fails, the start script's mounts (`functions/cloud-config.js`) changed |
 | `permission denied` on `/var/run/docker.sock` | the host's `docker` group isn't gid 123 |
 | `setup-python` fails, or picks up a broken Python | `AGENT_TOOLSDIRECTORY` isn't `/opt/hostedtoolcache` |
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
-| A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, and otherwise only `linux`/`x64`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all) |
+| A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, and otherwise only `linux`/`x64`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
 | A cap lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotCap=6 OnDemandCap=2` |
 | The launcher logs `no instance launched`, with an authorization error from `CreateFleet` | `CreateFleet`'s check on the instance, volumes and network interfaces it creates carries no `ec2:LaunchTemplate` key, so a policy that adds that condition to them denies the launch. Grant those to `CreateFleet` without the condition; `RunInstances` keeps it |

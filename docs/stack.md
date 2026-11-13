@@ -101,8 +101,13 @@ idleSeconds = 900 })`, which returns the `#cloud-config` document. It has no
 2. `write_files` puts the JIT config in `/etc/ci-runner/jitconfig` (`0600`)
    and the start script in `/usr/local/sbin/ci-runner`.
 3. `runcmd` starts Docker and runs the start script, which pulls
-   `ghcr.io/zeroae/ci-runner:latest` and runs it with the host's socket and
-   `/home/runner/_work` mounted at the same path, as `./run.sh --jitconfig`.
+   `ghcr.io/zeroae/ci-runner:latest`, copies the image's `/home/runner` (the
+   runner itself) onto the host, and runs the image with the host's socket,
+   `/tmp` and `/home/runner` mounted at the same paths (the host's `/tmp` is
+   Amazon Linux's tmpfs, so a root-disk directory is bind-mounted over it first), as
+   `./run.sh --jitconfig`. A job's `docker run -v` goes to the host's daemon,
+   so its source must be a host path; sharing those two gives a job the same
+   paths as a GitHub-hosted runner.
    If the container's log has no `Running job` line after `idleSeconds`, the
    script stops the container. When the container exits, the script's `EXIT`
    trap runs `shutdown -h now`, which terminates the instance.

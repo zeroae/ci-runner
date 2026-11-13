@@ -19,11 +19,37 @@ test('the docker group gets gid 123 before the docker package is installed', () 
   assert.match(out, /^packages:\n {2}- docker\n/m);
 });
 
-test('the work dir is mounted at the same path on host and container', () => {
+test('a job sees /tmp and its home at the same paths as the host docker daemon', () => {
+  // The job drives the host's daemon, so a `docker run -v` source is a host
+  // path: mktemp files and $HOME config must exist there too.
   const out = renderCloudConfig({ jitConfig: JIT });
-  assert.match(out, / -v \/home\/runner\/_work:\/home\/runner\/_work /);
-  assert.match(out, / -v \/var\/run\/docker\.sock:\/var\/run\/docker\.sock /);
+  const run = out.slice(out.indexOf('docker run -d'), out.indexOf('./run.sh'));
+  assert.match(run, / -v \/tmp:\/tmp /);
+  assert.match(run, / -v \/home\/runner:\/home\/runner /);
+  assert.match(run, / -v \/var\/run\/docker\.sock:\/var\/run\/docker\.sock /);
   assert.match(out, /ghcr\.io\/zeroae\/ci-runner:latest \.\/run\.sh --jitconfig /);
+});
+
+test('the host home is seeded from the image before it is mounted over the runner', () => {
+  // The image keeps the runner itself in /home/runner; an empty host dir
+  // mounted there would hide run.sh.
+  const out = renderCloudConfig({ jitConfig: JIT });
+  const seed = out.indexOf(' -a /home/runner/. /seed/ || exit 1');
+  assert.ok(seed > 0, 'no seed copy');
+  assert.match(out, /docker run --rm --user 0 --entrypoint cp -v \/home\/runner:\/seed ghcr\.io\/zeroae\/ci-runner:latest -a \/home\/runner\/\. \/seed\/ /);
+  assert.ok(out.indexOf('docker pull') < seed);
+  assert.ok(seed < out.indexOf('docker run -d'));
+});
+
+test('the shared /tmp is on the root disk, not the host tmpfs', () => {
+  // Amazon Linux 2023 mounts /tmp as tmpfs (half the RAM); a GitHub-hosted
+  // runner's /tmp is disk. The disk dir goes over it before the job starts.
+  const out = renderCloudConfig({ jitConfig: JIT });
+  const bind = out.indexOf('mount --bind /var/tmp/ci-runner /tmp');
+  assert.ok(bind > 0, 'no bind of a disk dir over /tmp');
+  assert.match(out, /install -d -m 1777 \/var\/tmp\/ci-runner\n/);
+  assert.ok(out.indexOf('install -d -m 1777 /var/tmp/ci-runner') < bind);
+  assert.ok(bind < out.indexOf('docker run -d'));
 });
 
 test('the JIT config is written root-only, 0600, and handed to run.sh', () => {

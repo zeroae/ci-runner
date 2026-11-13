@@ -45,10 +45,13 @@ it's in both.
    holds any value, the moved jobs run on our runners. To roll back, unset it.
 3. Make the moved job's first step the repo's own toolset check: a script
    that names any missing tool and prints each tool's version.
-4. Move one job first, as a canary (usually the test job). Its queued-to-started
+4. Give each moved job a `timeout-minutes` under 120 (110 leaves room). The
+   sweeper terminates any instance 2 hours after launch, so a job without one
+   dies with its machine instead of failing on a timeout that names it.
+5. Move one job first, as a canary (usually the test job). Its queued-to-started
    time is the boot time, and that tells you which other jobs are long enough to
    move. The runbook's "Measured numbers" has what the canary repo measured.
-5. Set the variable (`gh variable set ZAE_CI_RUNNER --body 1`) and watch the
+6. Set the variable (`gh variable set ZAE_CI_RUNNER --body 1`) and watch the
    canary.
 
 **The label contract:** `runs-on` must include `self-hosted` and exactly one of
@@ -60,9 +63,13 @@ comes.
 sudo), Docker through the host's socket, the `docker compose` and `buildx`
 plugins, `gh`, `jq`, `make`, `git`, `curl`, `zstd`, Python 3.12 as `python3`,
 Node.js and AWS CLI v2. `actions/setup-*` work, but there is no warm toolcache,
-so each job downloads its runtime again. The checkout is at the same path on
-the host and in the container (`/home/runner/_work`), so a job's own
-`docker run -v` bind mounts work. Nothing is pinned: every boot pulls
+so each job downloads its runtime again. The job runs in a container that drives
+the host's Docker daemon, so a `docker run -v` source is a path on the host.
+`/tmp` and the runner's home (`/home/runner`: `$HOME`, and the work directory
+`_work` with the checkout and `$RUNNER_TEMP`) are at the same paths on both, so
+a bind mount from any of them works as it does on a GitHub-hosted runner,
+`mktemp` files and `~/` config included. Both are on the 50 GB root disk. A mount from anywhere else (`/opt`,
+`/etc`, `/var`) gets an empty host path. Nothing is pinned: every boot pulls
 `:latest`, and the image is rebuilt weekly.
 
 **Deploy jobs** keep their AWS access as before (typically GitHub OIDC into the
