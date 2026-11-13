@@ -103,7 +103,8 @@ idleSeconds = 900 })`, which returns the `#cloud-config` document. It has no
 3. `runcmd` starts Docker and runs the start script, which pulls
    `ghcr.io/zeroae/ci-runner:latest`, copies the image's `/home/runner` (the
    runner itself) onto the host, and runs the image with the host's socket,
-   `/tmp` and `/home/runner` mounted at the same paths, as
+   `/tmp` and `/home/runner` mounted at the same paths (the host's `/tmp` is
+   Amazon Linux's tmpfs, so a root-disk directory is bind-mounted over it first), as
    `./run.sh --jitconfig`. A job's `docker run -v` goes to the host's daemon,
    so its source must be a host path; sharing those two gives a job the same
    paths as a GitHub-hosted runner.

@@ -68,7 +68,7 @@ the host's Docker daemon, so a `docker run -v` source is a path on the host.
 `/tmp` and the runner's home (`/home/runner`: `$HOME`, and the work directory
 `_work` with the checkout and `$RUNNER_TEMP`) are at the same paths on both, so
 a bind mount from any of them works as it does on a GitHub-hosted runner,
-`mktemp` files and `~/` config included. A mount from anywhere else (`/opt`,
+`mktemp` files and `~/` config included. Both are on the 50 GB root disk. A mount from anywhere else (`/opt`,
 `/etc`, `/var`) gets an empty host path. Nothing is pinned: every boot pulls
 `:latest`, and the image is rebuilt weekly.
 

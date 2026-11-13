@@ -41,6 +41,17 @@ test('the host home is seeded from the image before it is mounted over the runne
   assert.ok(seed < out.indexOf('docker run -d'));
 });
 
+test('the shared /tmp is on the root disk, not the host tmpfs', () => {
+  // Amazon Linux 2023 mounts /tmp as tmpfs (half the RAM); a GitHub-hosted
+  // runner's /tmp is disk. The disk dir goes over it before the job starts.
+  const out = renderCloudConfig({ jitConfig: JIT });
+  const bind = out.indexOf('mount --bind /var/tmp/ci-runner /tmp');
+  assert.ok(bind > 0, 'no bind of a disk dir over /tmp');
+  assert.match(out, /install -d -m 1777 \/var\/tmp\/ci-runner\n/);
+  assert.ok(out.indexOf('install -d -m 1777 /var/tmp/ci-runner') < bind);
+  assert.ok(bind < out.indexOf('docker run -d'));
+});
+
 test('the JIT config is written root-only, 0600, and handed to run.sh', () => {
   const out = renderCloudConfig({ jitConfig: JIT });
   assert.match(out,
