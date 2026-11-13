@@ -33,6 +33,9 @@ check compose        docker compose version
 check gh             gh --version
 check jq             jq --version
 check make           make --version
+check cc             cc --version
+check c++            c++ --version
+check pkg-config     pkg-config --version
 check git            git --version
 check curl           curl --version
 check zstd           zstd --version
