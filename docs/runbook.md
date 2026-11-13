@@ -305,8 +305,7 @@ types.
 
 | Symptom | Cause |
 |---|---|
-| A job's `docker run -v ...` sees an empty directory | the work directory isn't at the same path on host and container (`/home/runner/_work`) |
-| `error mounting "/tmp/...": not a directory`, or `read-only file system` inside a mounted config directory, only on our runners | the job mounts a path outside the work directory (`$HOME`, `/tmp`, a `mktemp` file), so Docker mounts an empty host path (for a file, a directory it creates). Keep what is mounted under `$RUNNER_TEMP`, and set `TMPDIR=$RUNNER_TEMP` through `$GITHUB_ENV` early in the job |
+| A job's `docker run -v ...` sees an empty directory, fails `error mounting "...": not a directory`, or hits `read-only file system` inside a mounted config directory, only on our runners | the source isn't under a path shared with the host, so Docker mounts an empty host path (for a missing file, a directory it creates). Only `/tmp` and `/home/runner` are shared, at the same paths; mount from one of those. If `/tmp` or `$HOME` itself fails, the start script's mounts (`functions/cloud-config.js`) changed |
 | `permission denied` on `/var/run/docker.sock` | the host's `docker` group isn't gid 123 |
 | `setup-python` fails, or picks up a broken Python | `AGENT_TOOLSDIRECTORY` isn't `/opt/hostedtoolcache` |
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
