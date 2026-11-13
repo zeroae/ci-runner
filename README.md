@@ -61,7 +61,7 @@ comes.
 
 **What the job gets:** Ubuntu 24.04, the runner as user `runner` (passwordless
 sudo), Docker through the host's socket, the `docker compose` and `buildx`
-plugins, `gh`, `jq`, `make`, `git`, `curl`, `zstd`, Python 3.12 as `python3`,
+plugins, `gh`, `jq`, `make`, a C and C++ compiler (`build-essential`: `cc`, `c++`), `pkg-config`, `git`, `curl`, `zstd`, Python 3.12 as `python3`,
 Node.js and AWS CLI v2. `actions/setup-*` work, but there is no warm toolcache,
 so each job downloads its runtime again. The job runs in a container that drives
 the host's Docker daemon, so a `docker run -v` source is a path on the host.
