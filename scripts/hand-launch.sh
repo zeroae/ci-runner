@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Launches one CI runner by hand: mints an org JIT config for the runner group
 # (with the owner's gh, which needs admin:org), renders its #cloud-config and
-# launches one Spot instance of size SIZE from the stack's launch template. The
-# instance takes one job labelled [self-hosted, LABEL, SIZE, ARCH] (or a subset
-# of them) and terminates; given no job, it terminates after the idle exit (15
-# minutes; IDLE_SECONDS overrides it).
+# launches one Spot instance of size SIZE from the stack's launch template for
+# ARCH (x64 or arm64). The instance takes one job labelled [self-hosted, LABEL,
+# SIZE, ARCH] (or a subset of them) and terminates; given no job, it terminates
+# after the idle exit (15 minutes; IDLE_SECONDS overrides it).
 #
 #   scripts/hand-launch.sh                  # or: make hand-launch
 #   SIZE=ci-cpu-8 scripts/hand-launch.sh    # or: make hand-launch SIZE=ci-cpu-8
+#   ARCH=arm64 scripts/hand-launch.sh       # or: make hand-launch ARCH=arm64
 #
 # Prints the instance id. Overrides: STACK PROFILE REGION ORG GROUP LABEL SIZE ARCH IDLE_SECONDS
 set -euo pipefail
@@ -25,8 +26,12 @@ case $SIZE in
   ci-cpu-2) size=large ;; ci-cpu-4) size=xlarge ;; ci-cpu-8) size=2xlarge ;; ci-cpu-16) size=4xlarge ;;
   *) echo "unknown size $SIZE: one of ci-cpu-2, ci-cpu-4, ci-cpu-8, ci-cpu-16" >&2; exit 1 ;;
 esac
-[[ $ARCH == x64 ]] || { echo "unknown architecture $ARCH: only x64 is served yet" >&2; exit 1; }
-TYPES=(m7i.$size m6i.$size m6a.$size m7a.$size)
+# The architecture's launch template and families, as the launcher picks them.
+case $ARCH in
+  x64) lt_output=LaunchTemplateId; TYPES=(m7i.$size m6i.$size m6a.$size m7a.$size) ;;
+  arm64) lt_output=Arm64LaunchTemplateId; TYPES=(m7g.$size m6g.$size m8g.$size) ;;
+  *) echo "unknown architecture $ARCH: one of x64, arm64" >&2; exit 1 ;;
+esac
 aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -34,7 +39,7 @@ output() {
   aws cloudformation describe-stacks --stack-name "$STACK" \
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
 }
-lt=$(output LaunchTemplateId)
+lt=$(output $lt_output)
 IFS=, read -r -a subnets <<<"$(output SubnetIds)"
 
 group_id=$(gh api "orgs/$ORG/actions/runner-groups" --paginate \

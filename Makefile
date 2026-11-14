@@ -36,7 +36,7 @@ outputs: ## Print the stack's outputs (setup URL, webhook URL, secret ARN)
 	@$(AWS) cloudformation describe-stacks --stack-name $(STACK) \
 	  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text
 
-hand-launch: ## Launch one CI runner by hand for one ci-spot job; SIZE=ci-cpu-8 picks its size (needs gh with admin:org)
+hand-launch: ## Launch one CI runner by hand for one ci-spot job; SIZE=ci-cpu-8 and ARCH=arm64 pick its shape (needs gh with admin:org)
 	STACK=$(STACK) PROFILE=$(PROFILE) REGION=$(REGION) SIZE=$(SIZE) ARCH=$(ARCH) scripts/hand-launch.sh
 
 runners: ## List the stack's CI runner instances that are not terminated
