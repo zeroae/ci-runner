@@ -40,4 +40,4 @@ The most vCPUs that the CI runners of one capacity may hold at once. A job that 
 _Avoid_: "cap" in prose (that was the old runner count). The parameters that set the budgets are still named `*VcpuCap` (`SpotVcpuCap`, `OnDemandVcpuCap`, `FargateSpotVcpuCap`, `FargateVcpuCap`).
 
 **Spot reclaim**:
-AWS taking back Spot capacity, EC2 or Fargate, while a job runs. The job is lost and is reported as one on its commit.
+AWS taking back Spot capacity, EC2 or Fargate, while a job runs. The job is lost, unless it finishes inside AWS's 2-minute warning, and a lost job is reported as a reclaim on its commit.

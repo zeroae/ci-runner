@@ -192,6 +192,10 @@ Resources:
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt JobQueue.Arn
+              # Tell the notifier a job succeeded, so it can clear a reclaim report.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt NotifierFunction.Arn
               # Swap repair: find a runner's instance, and re-tag it with the
               # job it really runs. Only the job tags, only the stack's instances.
               - Effect: Allow
@@ -239,6 +243,7 @@ Resources:
         Variables:
           SECRET_ARN: !Ref AppSecret
           QUEUE_URL: !Ref JobQueue
+          NOTIFIER_FUNCTION: !Ref NotifierFunction
           GITHUB_ORG: !Ref GitHubOrg
           STACK_NAME: !Ref AWS::StackName
           CLUSTER: !Ref RunnerCluster

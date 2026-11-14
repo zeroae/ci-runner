@@ -1,7 +1,8 @@
 'use strict';
 // webhook: GitHub workflow_job receiver behind a Function URL. Verifies the
 // delivery, applies the label contract and fence 3, and enqueues the job for
-// the launcher. It launches nothing itself, but repairs swaps (ADR-0003).
+// the launcher. It launches nothing itself, but repairs swaps (ADR-0003) and
+// tells the notifier when a job of this stack's runners succeeds.
 // Inlined into the template; keep it one dependency-free CommonJS file.
 const crypto = require('node:crypto');
 
@@ -56,7 +57,7 @@ const ecsTag = ([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_'
 // keyed without the ci-runner: prefix.
 const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x.key).replace(/^ci-runner:/, ''), x.Value ?? x.value]));
 
-function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
+function createHandler({ secret, queue, notifier, ec2, ecs, env, log = console.log }) {
   // The runner's task in the cluster, not yet told to stop, with its tags.
   async function findTask(name) {
     let nextToken;
@@ -74,14 +75,21 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
 
   let key; // the webhook secret, cached once the App exists
 
+  // The job id a runner of this stack was launched for, from its name
+  // `${stack}-<14-digit stamp>-<job id>`; null for any other runner.
+  function launchJobOf(runnerName) {
+    const m = String(runnerName || '').match(/^(.+)-\d{14}-(\d+)$/);
+    return m && m[1] === env.STACK_NAME ? Number(m[2]) : null;
+  }
+
   // A swap: a runner of this stack, named `${stack}-<stamp>-<job id>`, started
   // a job other than the one it was launched for. Re-queue that one, so the
   // launcher's "still queued?" check launches it a runner or drops it, and
   // re-tag the instance or task so the notifier names the job it runs.
   async function repairSwap(p, repo, job) {
     const name = String(job.runner_name || '');
-    const m = name.match(/^(.+)-\d{14}-(\d+)$/);
-    if (!m || m[1] !== env.STACK_NAME || Number(m[2]) === job.id) return reply(200, 'ignored: no swap');
+    const launchJob = launchJobOf(name);
+    if (launchJob === null || launchJob === job.id) return reply(200, 'ignored: no swap');
     const r = await ec2.describeInstances({
       Filters: [
         { Name: 'tag:ci-runner:stack', Values: [env.STACK_NAME] },
@@ -117,6 +125,18 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
     return reply(202, 'swap repaired');
   }
 
+  // A job that finished with success on a runner of this stack. The notifier
+  // clears its reclaim report for the job, if the job had one: AWS warns 2
+  // minutes before it takes a Spot machine, and a job can finish inside that.
+  async function reportSuccess(p, repo, job) {
+    if (job.conclusion !== 'success' || launchJobOf(job.runner_name) === null) return reply(200, 'ignored: not a success of ours');
+    await notifier.send({ jobSucceeded: {
+      repo: repo.full_name, job_id: job.id, run_id: job.run_id, head_sha: job.head_sha, job_name: job.name,
+      installation_id: p.installation && p.installation.id,
+    } });
+    return reply(202, 'notifier told');
+  }
+
   return async (event) => {
     if (!key) key = (await secret.get()).webhook_secret;
     if (!key) return reply(503, 'not set up');
@@ -136,6 +156,7 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
       return reply(403, 'refused: only private repos of ' + env.GITHUB_ORG);
     }
     if (p.action === 'in_progress') return repairSwap(p, repo, job);
+    if (p.action === 'completed') return reportSuccess(p, repo, job);
     if (p.action !== 'queued') return reply(200, 'ignored: action');
     const shape = shapeOf(job.labels);
     if (!shape) return reply(200, 'ignored: labels');
@@ -160,15 +181,20 @@ module.exports.handler = async (event) => {
   if (!live) {
     const sm = require('@aws-sdk/client-secrets-manager');
     const sqs = require('@aws-sdk/client-sqs');
+    const LAMBDA = require('@aws-sdk/client-lambda');
     const EC2 = require('@aws-sdk/client-ec2');
     const smc = new sm.SecretsManagerClient({});
     const sqsc = new sqs.SQSClient({});
+    const lambdac = new LAMBDA.LambdaClient({});
     const ECS = require('@aws-sdk/client-ecs');
     const ec2c = new EC2.EC2Client({});
     const ecsc = new ECS.ECSClient({});
     live = createHandler({
       secret: { get: async () => JSON.parse((await smc.send(new sm.GetSecretValueCommand({ SecretId: process.env.SECRET_ARN }))).SecretString) },
       queue: { send: async (m) => { await sqsc.send(new sqs.SendMessageCommand({ QueueUrl: process.env.QUEUE_URL, MessageBody: JSON.stringify(m) })); } },
+      notifier: {
+        send: async (m) => { await lambdac.send(new LAMBDA.InvokeCommand({ FunctionName: process.env.NOTIFIER_FUNCTION, InvocationType: 'Event', Payload: JSON.stringify(m) })); },
+      },
       ec2: {
         describeInstances: (i) => ec2c.send(new EC2.DescribeInstancesCommand(i)),
         createTags: (i) => ec2c.send(new EC2.CreateTagsCommand(i)),

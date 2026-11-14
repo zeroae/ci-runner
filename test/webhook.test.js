@@ -11,6 +11,7 @@ const SECRET = 'whsec-test';
 // tasks: the cluster's tasks, as { taskArn, desiredStatus, tags: { key: value } }.
 function setup({ secretValue = { webhook_secret: SECRET }, instances = [], tasks = [] } = {}) {
   const sent = [];
+  const notified = [];
   const described = [];
   const tagged = [];
   const taskTagged = [];
@@ -19,6 +20,7 @@ function setup({ secretValue = { webhook_secret: SECRET }, instances = [], tasks
   const handler = createHandler({
     secret: { get: async () => { reads++; return secretValue; } },
     queue: { send: async (msg) => { sent.push(msg); } },
+    notifier: { send: async (msg) => { notified.push(msg); } },
     ec2: {
       describeInstances: async (input) => {
         described.push(input);
@@ -51,16 +53,17 @@ function setup({ secretValue = { webhook_secret: SECRET }, instances = [], tasks
     env: { GITHUB_ORG: 'zeroae', STACK_NAME: 'ci-runner', CLUSTER: 'ci-runner' },
     log: (line) => logs.push(JSON.parse(line)),
   });
-  return { handler, sent, described, tagged, taskTagged, logs, reads: () => reads };
+  return { handler, sent, notified, described, tagged, taskTagged, logs, reads: () => reads };
 }
 
 // A workflow_job payload as GitHub sends it (only the fields that matter).
-function job({ action = 'queued', labels = ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'], visibility = 'private', owner = 'zeroae', runner } = {}) {
+function job({ action = 'queued', labels = ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'], visibility = 'private', owner = 'zeroae', runner, conclusion } = {}) {
   return {
     action,
     workflow_job: {
       id: 555, run_id: 444, head_sha: 'abc123', name: 'tests', labels,
       ...(runner && { runner_name: runner, runner_id: 77 }),
+      ...(conclusion && { conclusion }),
     },
     repository: { full_name: `${owner}/app`, name: 'app', visibility, private: visibility !== 'public', owner: { login: owner } },
     installation: { id: 181 },
@@ -241,6 +244,30 @@ test('other actions and other events are ignored', async () => {
 
 // A runner the launcher started for job 999 of run 888, and its instance.
 const RUNNER = 'ci-runner-20261113120000-999';
+
+// The notifier is told when a job of this stack's runners finishes with
+// success, so it can clear a reclaim report for a job that survived the warning.
+test('a job that completes with success on one of our runners is passed to the notifier', async () => {
+  const { handler, notified, sent } = setup();
+  const res = await handler(delivery(job({ action: 'completed', runner: RUNNER, conclusion: 'success' })));
+  assert.equal(res.statusCode, 202);
+  assert.deepEqual(notified, [{ jobSucceeded: { repo: 'zeroae/app', job_id: 555, run_id: 444, head_sha: 'abc123', job_name: 'tests', installation_id: 181 } }]);
+  assert.equal(sent.length, 0);
+});
+
+for (const [why, opts] of [
+  ['a job that failed', { runner: RUNNER, conclusion: 'failure' }],
+  ['a job that was cancelled', { runner: RUNNER, conclusion: 'cancelled' }],
+  ['a job on a GitHub-hosted runner', { runner: 'GitHub Actions 12', conclusion: 'success' }],
+  ['a job on another stack\'s runner', { runner: 'other-20261113120000-999', conclusion: 'success' }],
+  ['a job that never had a runner', { conclusion: 'success' }],
+]) {
+  test(`${why} is not passed to the notifier`, async () => {
+    const { handler, notified } = setup();
+    assert.equal((await handler(delivery(job({ action: 'completed', ...opts })))).statusCode, 200);
+    assert.deepEqual(notified, []);
+  });
+}
 const instance = (tags = {}) => ({
   InstanceId: 'i-0abc',
   Tags: {

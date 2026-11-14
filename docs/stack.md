@@ -209,15 +209,27 @@ App's webhook points at), for each delivery:
 3. **Fence 3:** refuses (`403`, logged) unless `repository.visibility` is
    `private` and the owner is `GITHUB_ORG`.
 4. On `in_progress`, repairs a swap (below) and answers.
-5. Ignores (`200`) actions other than `queued`, and jobs outside the label
+5. On `completed`, tells the notifier when the job succeeded on a runner of
+   this stack (below) and answers.
+6. Ignores (`200`) actions other than `queued`, and jobs outside the label
    contract (case-insensitive): `self-hosted`, exactly one of
    `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`, `-4`, `-8`,
    `-16`), exactly one of `x64`/`arm64`, and optionally `linux`. None has a
    default: a missing size or architecture label, an unknown `ci-cpu-*`, or
    both `x64` and `arm64`, are outside it.
-6. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
+7. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
    labels, installation_id}` (`label` is the capacity label, lower case;
    `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
+
+**Telling the notifier a job succeeded.** On `workflow_job` `completed` with
+conclusion `success`, and a `runner_name` that is `${stack}-<14-digit
+stamp>-<job id>` (a job on a GitHub-hosted runner, another stack's, or none is
+ignored, `200`), the webhook invokes the notifier asynchronously
+(`lambda:InvokeFunction` on it, env `NOTIFIER_FUNCTION`) with `{jobSucceeded:
+{repo, job_id, run_id, head_sha, job_name, installation_id}}` and answers
+`202`. The App's `workflow_job` subscription already delivers every action
+(about 3 deliveries per job: `queued`, `in_progress`, `completed`), so nothing
+about the App changes. The webhook does no GitHub call itself.
 
 **Swap repair** (ADR-0003). GitHub gives a queued job to any idle runner whose
 labels cover it, so a runner launched for job Y may take job X. Left alone,
@@ -254,7 +266,7 @@ tags and repairs again. Re-queueing a job that another runner already took is
 harmless: the launcher drops it.
 
 Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue,
-`ec2:DescribeInstances`, and `ec2:CreateTags` only on instances tagged
+`lambda:InvokeFunction` on the notifier, `ec2:DescribeInstances`, and `ec2:CreateTags` only on instances tagged
 `ci-runner:stack=<stack>` and only for the five job tag keys. On ECS:
 `ecs:ListTasks` with the condition `ecs:cluster` = the cluster, and
 `ecs:DescribeTasks` and `ecs:TagResource` only on the cluster's tasks, the
@@ -470,18 +482,51 @@ For each event it:
    as is a task whose tags are gone.
 2. Signs an App JWT, finds the repo's installation
    (`GET /repos/{repo}/installation`) and gets its token.
-3. For a task, reads the job's real name from
-   `GET /repos/{repo}/actions/jobs/{job_id}` (the tag has `_` for brackets and
-   commas), falling back to the tag.
-4. Skips the job if the commit already has its reclaim check run (same name,
-   `external_id` the job id, the title below), so a task's later changes and a
-   repeated event report nothing more.
-5. Creates a check run on the head sha: name `ci-runner / <job name>` (or
+3. Reads the job from GitHub (`GET /repos/{repo}/actions/jobs/{job_id}`), the
+   job the tags name: the one the machine was launched for, or the one it took
+   in a swap (the webhook re-tags it). It **reports only a job the machine's CI
+   runner is running**: `status` `in_progress` and `runner_name` equal to the
+   machine's `ci-runner:runner` tag. Otherwise it logs `ignored <id>: its runner
+   is not running job <id> (...)` and posts nothing: the job is `queued`, or
+   `completed`, or another CI runner runs it. The usual case is an idle CI
+   runner: another CI runner took the job it was launched for, it took none,
+   and so its tags are still the launch tags. A swapped job that the webhook
+   has not yet re-tagged, in the moments after it started, is missed the same
+   way.
+4. Takes the job's real name from that job, falling back to the tag: a tag is
+   cut at 256 characters, and a task's has `_` for brackets and commas. The
+   webhook's word (step 8) carries GitHub's name too, so the two meet.
+5. Skips the job if the commit already has its reclaim check run (same name,
+   `external_id` the job id, the title below or the survived title), so a task's
+   later changes and a repeated event report nothing more.
+6. Creates a check run on the head sha: name `ci-runner / <job name>` (or
    `job <id>` with no name), `completed`, conclusion `failure`, title
    `Spot capacity reclaimed: re-run this job`, a summary naming the job and
    the instance or task and linking the run, and `details_url` the job's page.
    An EC2 reclaim and a Fargate one give the same check run, but for the
    summary's machine.
+7. Reads the job once more after posting: a job that finished with `success`
+   while this ran is cleared as in step 8.
+8. **Clears a report the job survived.** AWS warns 2 minutes before it takes
+   the machine, and a job can finish inside that. A job that finishes with
+   `success` was not lost, so its reclaim check run changes to `neutral`,
+   titled `The job finished despite the Spot reclaim warning`, and the notifier
+   logs `survived: <repo> <job name>`. Three paths clear a report:
+   - **the webhook's word** (above): the notifier gets the token (the event
+     carries the installation id), lists the commit's check runs named `ci-runner
+     / <job name>`, and clears each reclaim `failure` whose `details_url` is
+     under the job's run. That takes in the report of an earlier attempt of the
+     job: a re-run's job has a new id, but the same run. With none to clear it
+     logs `nothing to clear` and changes nothing;
+   - **a retry or a later change** of a reclaim event that finds its own
+     standing `failure` (step 5) for a job that has since finished with
+     `success`;
+   - **step 7**, for the word that came before the report existed.
+
+   A job that ends with any other conclusion keeps the `failure`. If the
+   webhook's invoke of the notifier fails, the delivery fails (`502`): redeliver
+   it from the App's advanced settings, or the retry and later-change paths
+   clear the report.
 
 A GitHub failure fails the invocation, and EventBridge's async invoke retries
 it. Two events handled at the same moment can still report twice.
