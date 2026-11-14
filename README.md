@@ -30,8 +30,9 @@ working. **They will become required**: add `ci-cpu-4` and `x64` (or the size
 you want) to every moved job now, so the change to the required contract
 doesn't strand it.
 
-At most 6 Spot and 2 On-Demand CI runners run at once, across all repos. A
-job over the cap waits in a queue until one finishes. If a Spot reclaim kills
+The CI runners hold at most 24 Spot and 8 On-Demand vCPUs at once, across all
+repos (six and two `ci-cpu-4` runners). A job that would go over that waits in
+a queue until enough finish. If a Spot reclaim kills
 a job, a failed check run named `ci-runner / <job name>` appears on its
 commit. Nothing retries it automatically: a person re-runs it.
 
