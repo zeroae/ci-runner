@@ -8,7 +8,8 @@ const crypto = require('node:crypto');
 const CAPACITY = ['ci-spot', 'ci-ondemand', 'ci-fargate-spot', 'ci-fargate'];
 const SIZE = { 'ci-cpu-2': 2, 'ci-cpu-4': 4, 'ci-cpu-8': 8, 'ci-cpu-16': 16 };
 const ARCH = ['x64', 'arm64'];
-// The shape of an instance launched before the shape tags.
+// The shape of an instance or task launched before the shape tags, which
+// swap repair re-queues with it. The launcher carries a copy.
 const DEFAULT_SHAPE = { vcpus: 4, arch: 'x64' };
 
 function reply(statusCode, text) {
