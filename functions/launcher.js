@@ -7,7 +7,10 @@ const crypto = require('node:crypto');
 const { renderCloudConfig } = require('./cloud-config.js');
 
 const API = 'https://api.github.com';
-const TYPES = ['m7i.xlarge', 'm6i.xlarge', 'm6a.xlarge', 'm7a.xlarge'];
+// A size label's vCPUs -> the instance size, at 4 GB per vCPU, per family.
+const SIZES = { 2: 'large', 4: 'xlarge', 8: '2xlarge', 16: '4xlarge' };
+// An architecture -> its families, offered at every size in the stack's AZs.
+const FAMILIES = { x64: ['m7i', 'm6i', 'm6a', 'm7a'], arm64: ['m7g', 'm6g', 'm8g'] };
 const CAPACITY = { 'ci-spot': 'spot', 'ci-ondemand': 'on-demand' };
 
 const b64u = (s) => Buffer.from(s).toString('base64url');
@@ -18,10 +21,15 @@ function appJwt(appId, pem, nowMs) {
   return `${data}.${crypto.sign('sha256', Buffer.from(data), pem).toString('base64url')}`;
 }
 
+// A message enqueued before the size labels has no vcpus or arch: it gets
+// today's shape.
+const shapeOf = (m) => ({ vcpus: m.vcpus === undefined ? 4 : m.vcpus, arch: m.arch === undefined ? 'x64' : m.arch });
+
 function valid(m, org) {
   return m && typeof m.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(m.repo) && m.repo.split('/')[0] === org
     && Number.isInteger(m.job_id) && Number.isInteger(m.installation_id) && m.label in CAPACITY
-    && Array.isArray(m.labels);
+    && Array.isArray(m.labels) && Number.isInteger(shapeOf(m).vcpus) && Object.hasOwn(SIZES, shapeOf(m).vcpus)
+    && Object.hasOwn(FAMILIES, shapeOf(m).arch);
 }
 
 function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log }) {
@@ -64,9 +72,10 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     }
   }
 
-  // Live instances of this stack by capacity. On-Demand ones have no
-  // InstanceLifecycle, so anything without the Spot marker counts as On-Demand.
-  async function count(type) {
+  // vCPUs of this stack's live instances on one capacity, from the shape tags.
+  // An instance launched before them has no tags: it is 4 vCPUs, and its
+  // capacity is Spot only with the Spot marker (On-Demand has no InstanceLifecycle).
+  async function vcpusIn(type) {
     let n = 0;
     let NextToken;
     do {
@@ -77,14 +86,22 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
         ],
         NextToken,
       });
-      for (const res of r.Reservations || []) for (const i of res.Instances || []) n += (i.InstanceLifecycle === 'spot') === (type === 'spot');
+      for (const res of r.Reservations || []) {
+        for (const i of res.Instances || []) {
+          const t = Object.fromEntries((i.Tags || []).map((x) => [x.Key, x.Value]));
+          const capacity = CAPACITY[t['ci-runner:capacity']] || (i.InstanceLifecycle === 'spot' ? 'spot' : 'on-demand');
+          if (capacity === type) n += Number(t['ci-runner:vcpus']) || 4;
+        }
+      }
       NextToken = r.NextToken;
     } while (NextToken);
     return n;
   }
 
   async function launchInstance(m, name, runnerId, jitConfig) {
-    const lt = env.LAUNCH_TEMPLATE_ID;
+    const { vcpus, arch } = shapeOf(m);
+    // Each architecture has its own launch template, for its own AL2023 image.
+    const lt = arch === 'arm64' ? env.ARM64_LAUNCH_TEMPLATE_ID : env.LAUNCH_TEMPLATE_ID;
     const userData = renderCloudConfig({ jitConfig, ...(env.IDLE_SECONDS ? { idleSeconds: Number(env.IDLE_SECONDS) } : {}) });
     // CreateFleet can't override user-data: a version per launch carries it.
     const v = await ec2.createLaunchTemplateVersion({
@@ -101,7 +118,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
         ...(type === 'spot' ? { SpotOptions: { AllocationStrategy: 'capacity-optimized' } } : { OnDemandOptions: { AllocationStrategy: 'lowest-price' } }),
         LaunchTemplateConfigs: [{
           LaunchTemplateSpecification: { LaunchTemplateId: lt, Version: version },
-          Overrides: TYPES.flatMap((InstanceType) => subnets.map((SubnetId) => ({ InstanceType, SubnetId }))),
+          Overrides: FAMILIES[arch].flatMap((f) => subnets.map((SubnetId) => ({ InstanceType: `${f}.${SIZES[vcpus]}`, SubnetId }))),
         }],
         TagSpecifications: [{
           ResourceType: 'instance',
@@ -109,6 +126,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
             tag('ci-runner:runner', name), tag('ci-runner:runner-id', runnerId), tag('ci-runner:label', m.label), tag('ci-runner:repo', m.repo),
             tag('ci-runner:job-id', m.job_id), tag('ci-runner:run-id', m.run_id), tag('ci-runner:head-sha', m.head_sha),
             tag('ci-runner:job-name', m.job_name), tag('ci-runner:labels', m.labels.join(',')),
+            tag('ci-runner:capacity', m.label), tag('ci-runner:vcpus', vcpus), tag('ci-runner:arch', arch),
           ],
         }],
       });
@@ -130,15 +148,16 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     if (!j) return log(JSON.stringify({ ...job, dropped: 'job not found' }));
     if (j.status !== 'queued') return log(JSON.stringify({ ...job, dropped: j.status }));
 
-    // A soft cap: two launches at once may overshoot it by one. At the cap the
-    // job goes back on the queue as a new message, so retries don't pile up
-    // towards the dead-letter queue.
+    // A soft budget: launches checked at the same moment may overshoot it. A
+    // job that would go over it goes back on the queue as a new message, so
+    // retries don't pile up towards the dead-letter queue.
     const type = CAPACITY[m.label];
-    const cap = Number(type === 'spot' ? env.SPOT_CAP : env.ONDEMAND_CAP);
-    const running = await count(type);
-    if (running >= cap) {
+    const budget = Number(type === 'spot' ? env.SPOT_VCPU_CAP : env.ONDEMAND_VCPU_CAP);
+    const held = await vcpusIn(type);
+    const { vcpus } = shapeOf(m);
+    if (held + vcpus > budget) {
       await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
-      return log(JSON.stringify({ ...job, deferred: `${running} of ${cap} ${type}` }));
+      return log(JSON.stringify({ ...job, deferred: `${held}+${vcpus} of ${budget} ${type} vCPUs` }));
     }
 
     // The sweeper reads the UTC mint stamp in the name as the registration's
@@ -151,7 +170,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
 
     try {
       const instance = await launchInstance(m, name, r.runner.id, r.encoded_jit_config);
-      log(JSON.stringify({ ...job, launched: instance, runner: name, label: m.label }));
+      log(JSON.stringify({ ...job, launched: instance, runner: name, label: m.label, ...shapeOf(m) }));
     } catch (e) {
       // Unregister now rather than leave it to the sweeper; the retry mints anew.
       await gh('DELETE', `/orgs/${org}/actions/runners/${r.runner.id}`, token).catch(() => {});

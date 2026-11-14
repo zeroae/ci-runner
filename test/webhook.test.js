@@ -65,8 +65,37 @@ test('an accepted ci-spot job is enqueued with every field', async () => {
   assert.equal(res.statusCode, 202);
   assert.deepEqual(sent, [{
     repo: 'zeroae/app', job_id: 555, run_id: 444, head_sha: 'abc123', job_name: 'tests',
-    label: 'ci-spot', labels: ['self-hosted', 'ci-spot'], installation_id: 181,
+    label: 'ci-spot', vcpus: 4, arch: 'x64', labels: ['self-hosted', 'ci-spot'], installation_id: 181,
   }]);
+});
+
+test('every size label is enqueued with its vCPUs and the architecture', async () => {
+  for (const [size, vcpus] of [['ci-cpu-2', 2], ['ci-cpu-4', 4], ['ci-cpu-8', 8], ['ci-cpu-16', 16]]) {
+    for (const cap of ['ci-spot', 'ci-ondemand']) {
+      const labels = ['self-hosted', cap, size, 'x64'];
+      const { handler, sent } = setup();
+      assert.equal((await handler(delivery(job({ labels })))).statusCode, 202, labels.join(','));
+      assert.deepEqual(
+        { label: sent[0].label, vcpus: sent[0].vcpus, arch: sent[0].arch, labels: sent[0].labels },
+        { label: cap, vcpus, arch: 'x64', labels },
+      );
+    }
+  }
+});
+
+test('a missing size or architecture label defaults to ci-cpu-4 and x64', async () => {
+  for (const labels of [['self-hosted', 'ci-spot', 'x64'], ['self-hosted', 'ci-spot', 'ci-cpu-4'], ['self-hosted', 'linux', 'ci-ondemand']]) {
+    const { handler, sent } = setup();
+    await handler(delivery(job({ labels })));
+    assert.equal(sent[0].vcpus, 4, labels.join(','));
+    assert.equal(sent[0].arch, 'x64', labels.join(','));
+  }
+});
+
+test('the size label is read case-insensitively', async () => {
+  const { handler, sent } = setup();
+  await handler(delivery(job({ labels: ['Self-Hosted', 'CI-Spot', 'CI-CPU-16', 'X64'] })));
+  assert.equal(sent[0].vcpus, 16);
 });
 
 test('a base64-encoded body is verified on its decoded bytes', async () => {
@@ -101,19 +130,45 @@ test('the webhook secret is read once and cached', async () => {
   assert.equal(reads(), 1);
 });
 
-test('the label contract: self-hosted plus exactly one capacity label, otherwise only linux/x64', async () => {
+test('an arm64 job is enqueued with arch arm64, on either capacity and at every size', async () => {
+  for (const cap of ['ci-spot', 'ci-ondemand']) {
+    for (const size of ['ci-cpu-2', 'ci-cpu-4', 'ci-cpu-8', 'ci-cpu-16']) {
+      const labels = ['self-hosted', cap, size, 'arm64'];
+      const { handler, sent } = setup();
+      assert.equal((await handler(delivery(job({ labels })))).statusCode, 202, labels.join(','));
+      assert.equal(sent[0].arch, 'arm64', labels.join(','));
+    }
+  }
+  const { handler, sent } = setup();
+  await handler(delivery(job({ labels: ['Self-Hosted', 'CI-Spot', 'ARM64'] })));
+  assert.deepEqual([sent[0].vcpus, sent[0].arch], [4, 'arm64']);
+});
+
+test('the label contract: self-hosted, exactly one capacity label, at most one size and one architecture label, and linux', async () => {
   const accepted = [
     ['self-hosted', 'ci-spot'],
     ['self-hosted', 'ci-ondemand'],
     ['self-hosted', 'linux', 'x64', 'ci-spot'],
     ['Self-Hosted', 'CI-Spot'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'x64'],
+    ['self-hosted', 'linux', 'ci-ondemand', 'ci-cpu-2'],
+    ['self-hosted', 'ci-spot', 'arm64'],
+    ['self-hosted', 'linux', 'ci-spot', 'ci-cpu-8', 'arm64'],
   ];
   const ignored = [
     ['ci-spot'],
     ['self-hosted'],
     ['self-hosted', 'ci-spot', 'ci-ondemand'],
     ['self-hosted', 'ci-spot', 'gpu'],
-    ['self-hosted', 'ci-spot', 'arm64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'ci-cpu-8'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'ci-cpu-8'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-3'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-32'],
+    ['self-hosted', 'ci-spot', 'x64', 'arm64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'ARM64', 'x64'],
+    ['self-hosted', 'ci-spot', 'arm64', 'arm64'],
+    ['self-hosted', 'ci-spot', 'aarch64'],
+    ['self-hosted', 'ci-spot', 'x64', 'x64'],
     ['ubuntu-latest'],
     [],
   ];
@@ -165,7 +220,8 @@ const instance = (tags = {}) => ({
   InstanceId: 'i-0abc',
   Tags: {
     'ci-runner:stack': 'ci-runner', 'ci-runner:runner': RUNNER, 'ci-runner:runner-id': '77',
-    'ci-runner:label': 'ci-spot', 'ci-runner:labels': 'self-hosted,ci-spot,linux',
+    'ci-runner:label': 'ci-spot', 'ci-runner:labels': 'self-hosted,ci-spot,ci-cpu-8,arm64,linux',
+    'ci-runner:capacity': 'ci-spot', 'ci-runner:vcpus': '8', 'ci-runner:arch': 'arm64',
     'ci-runner:repo': 'zeroae/lib', 'ci-runner:job-id': '999', 'ci-runner:run-id': '888',
     'ci-runner:head-sha': 'fff000', 'ci-runner:job-name': 'build',
     ...tags,
@@ -178,7 +234,7 @@ test('a swap: the runner\'s own job is re-queued from its tags, and the instance
   assert.equal(res.statusCode, 202);
   assert.deepEqual(sent, [{
     repo: 'zeroae/lib', job_id: 999, run_id: 888, head_sha: 'fff000', job_name: 'build',
-    label: 'ci-spot', labels: ['self-hosted', 'ci-spot', 'linux'], installation_id: 181,
+    label: 'ci-spot', vcpus: 8, arch: 'arm64', labels: ['self-hosted', 'ci-spot', 'ci-cpu-8', 'arm64', 'linux'], installation_id: 181,
   }]);
   assert.deepEqual(tagged, [{
     Resources: ['i-0abc'],
@@ -222,12 +278,12 @@ test('a repeated in_progress after the re-tag does nothing more', async () => {
   assert.deepEqual([sent, tagged], [[], []]);
 });
 
-test('a swap on an instance launched without the labels tag re-queues with self-hosted and its capacity label', async () => {
+test('a swap on an instance launched before the labels and shape tags re-queues a ci-cpu-4 x64 job with self-hosted and its capacity label', async () => {
   const old = instance();
-  delete old.Tags['ci-runner:labels'];
+  for (const k of ['labels', 'capacity', 'vcpus', 'arch']) delete old.Tags[`ci-runner:${k}`];
   const { handler, sent } = setup({ instances: [old] });
   await handler(delivery(job({ action: 'in_progress', runner: RUNNER })));
-  assert.deepEqual(sent[0].labels, ['self-hosted', 'ci-spot']);
+  assert.deepEqual([sent[0].labels, sent[0].vcpus, sent[0].arch], [['self-hosted', 'ci-spot'], 4, 'x64']);
 });
 
 test('in_progress from outside the fence is refused before any lookup', async () => {

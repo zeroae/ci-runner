@@ -18,6 +18,7 @@ RUN apt-get update \
  && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
  && apt-get install -y --no-install-recommends \
       gh jq make git curl zstd unzip python3 python3-venv python3-pip nodejs \
+      build-essential pkg-config \
  && rm -rf /var/lib/apt/lists/*
 
 # docker compose plugin, next to the base image's buildx.
