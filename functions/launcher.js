@@ -11,7 +11,7 @@ const API = 'https://api.github.com';
 // A size label's vCPUs -> the instance size, at 4 GB per vCPU, per family.
 const SIZES = { 2: 'large', 4: 'xlarge', 8: '2xlarge', 16: '4xlarge' };
 // An architecture -> its families, offered at every size in the stack's AZs.
-const FAMILIES = { x64: ['m7i', 'm6i', 'm6a', 'm7a'], arm64: ['m7g', 'm6g', 'm8g'] };
+const FAMILIES = { x64: ['m8i', 'm8a', 'm7i', 'm6i', 'm6a', 'm7a'], arm64: ['m7g', 'm6g', 'm8g'] };
 const CAPACITY = { 'ci-spot': 'spot', 'ci-ondemand': 'on-demand', 'ci-fargate-spot': 'fargate-spot', 'ci-fargate': 'fargate' };
 // A Fargate capacity's capacity provider.
 const PROVIDER = { 'ci-fargate-spot': 'FARGATE_SPOT', 'ci-fargate': 'FARGATE' };

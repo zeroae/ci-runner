@@ -91,7 +91,7 @@ deleted on termination, IMDSv2 required with hop limit 1, shutdown behaviour
 **no instance profile, no instance type and no user-data**.
 
 A launch is an EC2 Fleet of type `instant` for one instance, from the job's
-architecture's launch template: overrides for `m7i`/`m6i`/`m6a`/`m7a` (x64) or
+architecture's launch template: overrides for `m8i`/`m8a`/`m7i`/`m6i`/`m6a`/`m7a` (x64) or
 `m7g`/`m6g`/`m8g` (arm64) at the job's size (`.large`, `.xlarge`, `.2xlarge` or
 `.4xlarge` for 2, 4, 8 or 16 vCPUs) in each of the three subnets, Spot
 `capacity-optimized` for `ci-spot`. Every family is offered at every size in

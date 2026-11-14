@@ -170,8 +170,8 @@ test('a queued job launches one Spot instance from the launch template, tagged w
   assert.deepEqual(fleet.SpotOptions, { AllocationStrategy: 'capacity-optimized' });
   const cfg = fleet.LaunchTemplateConfigs[0];
   assert.deepEqual(cfg.LaunchTemplateSpecification, { LaunchTemplateId: 'lt-0abc', Version: '9' });
-  assert.equal(cfg.Overrides.length, 12);
-  assert.deepEqual(new Set(cfg.Overrides.map((o) => o.InstanceType)), new Set(['m7i.xlarge', 'm6i.xlarge', 'm6a.xlarge', 'm7a.xlarge']));
+  assert.equal(cfg.Overrides.length, 18);
+  assert.deepEqual(new Set(cfg.Overrides.map((o) => o.InstanceType)), new Set(['m8i.xlarge', 'm8a.xlarge', 'm7i.xlarge', 'm6i.xlarge', 'm6a.xlarge', 'm7a.xlarge']));
   assert.deepEqual(new Set(cfg.Overrides.map((o) => o.SubnetId)), new Set(['subnet-a', 'subnet-b', 'subnet-c']));
   assert.deepEqual(tags(fleet), {
     'ci-runner:runner': 'ci-runner-20261112120000-555', 'ci-runner:runner-id': '77', 'ci-runner:label': 'ci-spot', 'ci-runner:repo': 'zeroae/app',
@@ -192,7 +192,7 @@ test('each size launches its instance size across the four x64 families in the t
     await handler(sqsEvent({ ...MSG, vcpus: Number(vcpus), labels: ['self-hosted', 'ci-spot', `ci-cpu-${vcpus}`, 'x64'] }));
     const fleet = ec2.calls.find((c) => c[0] === 'createFleet')[1];
     const overrides = fleet.LaunchTemplateConfigs[0].Overrides;
-    const want = ['m7i', 'm6i', 'm6a', 'm7a'].flatMap((f) => ['subnet-a', 'subnet-b', 'subnet-c'].map((s) => `${f}.${size} ${s}`));
+    const want = ['m8i', 'm8a', 'm7i', 'm6i', 'm6a', 'm7a'].flatMap((f) => ['subnet-a', 'subnet-b', 'subnet-c'].map((s) => `${f}.${size} ${s}`));
     assert.deepEqual(overrides.map((o) => `${o.InstanceType} ${o.SubnetId}`).sort(), want.sort(), `ci-cpu-${vcpus}`);
     assert.deepEqual(
       [tags(fleet)['ci-runner:capacity'], tags(fleet)['ci-runner:vcpus'], tags(fleet)['ci-runner:arch']],
@@ -240,7 +240,7 @@ test('a message from before the size labels (no vcpus, no arch) launches a 4-vCP
   const { handler, ec2 } = setup();
   assert.deepEqual(await handler(sqsEvent(old)), { batchItemFailures: [] });
   const fleet = ec2.calls.find((c) => c[0] === 'createFleet')[1];
-  assert.deepEqual(new Set(fleet.LaunchTemplateConfigs[0].Overrides.map((o) => o.InstanceType)), new Set(['m7i.xlarge', 'm6i.xlarge', 'm6a.xlarge', 'm7a.xlarge']));
+  assert.deepEqual(new Set(fleet.LaunchTemplateConfigs[0].Overrides.map((o) => o.InstanceType)), new Set(['m8i.xlarge', 'm8a.xlarge', 'm7i.xlarge', 'm6i.xlarge', 'm6a.xlarge', 'm7a.xlarge']));
   assert.equal(tags(fleet)['ci-runner:vcpus'], '4');
   assert.equal(tags(fleet)['ci-runner:arch'], 'x64');
 });
