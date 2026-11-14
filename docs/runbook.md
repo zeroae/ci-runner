@@ -47,7 +47,7 @@ make outputs     # SetupUrl, WebhookUrl, AppSecretArn, LaunchTemplateId, Arm64La
 
 The first run creates the stack `ci-runner`, and later runs update it. A run
 with no changes does nothing. `make deploy` never passes parameters, so a new
-stack takes the defaults (`SpotCap` 6, `OnDemandCap` 2, `AppName`
+stack takes the defaults (`SpotVcpuCap` 24, `OnDemandVcpuCap` 8, `AppName`
 `zeroae-ci-runner`, `RunnerGroup` `ci-runner`, `LogRetentionDays` 30), and an
 existing stack keeps whatever values it already has.
 
@@ -58,18 +58,22 @@ make build
 $AWS cloudformation deploy --stack-name ci-runner \
   --template-file build/template.yaml --s3-bucket "$B" --s3-prefix ci-runner \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
-  --parameter-overrides SpotCap=6 OnDemandCap=2
+  --parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8
 ```
 
+`SpotVcpuCap` draws on the EC2 Spot vCPU quota (`L-34B43A08`) and
+`OnDemandVcpuCap` on the EC2 On-Demand one (`L-1216C47A`); each covers x64 and
+arm64 runners together.
+
 An override **sticks**: every later `make deploy` keeps it. After lowering a
-cap for a test, restore it explicitly, as above. To see the current values:
+budget for a test, restore it explicitly, as above. To see the current values:
 
 ```bash
 $AWS cloudformation describe-stacks --stack-name ci-runner \
   --query 'Stacks[0].Parameters' --output table
 ```
 
-Before raising a cap, check the EC2 quota still covers it (see "Measured
+Before raising a budget, check its quota still covers it (see "Measured
 numbers").
 
 The built template must stay under 1 MB, the S3 deploy's limit (`make build`
@@ -223,7 +227,7 @@ of:
 | Field | Meaning |
 |---|---|
 | `"launched": "i-..."`, `"runner"`, `"label"` | an instance is up for the job |
-| `"deferred": "6 of 6 spot"` | at the cap; the job is back on the queue in 60 s |
+| `"deferred": "20+8 of 24 spot vCPUs"` | the job's 8 vCPUs would take the capacity's 20 over its budget of 24; the job is back on the queue in 60 s |
 | `"dropped": "completed"` (or another status) | the job no longer waits (cancelled, or taken by another runner); nothing launched |
 | `"dropped": "job not found"` | GitHub answered 404 for the job |
 | `"dropped": "malformed message"` | a message it can't read, consumed |
@@ -337,9 +341,8 @@ types.
   For the other three peaks, use `Service` `EC2` and `Class`
   `Standard/OnDemand` as fits.
 
-  Until the vCPU budgets land, the caps still count runners (6 Spot, 2
-  On-Demand), so at `ci-cpu-16` (a `.4xlarge`) they can hold 96 Spot and 32
-  On-Demand vCPUs; at the default `ci-cpu-4`, 24 and 8.
+  The Fargate budgets aren't in the stack yet; their rows are for when the
+  Fargate capacities land.
 
 - **Template size:** 50,301 bytes, 5% of the S3 deploy's 1 MB limit. It's
   already over the 51,200 bytes a template can be sent inline, so it deploys
@@ -353,10 +356,10 @@ types.
 | `permission denied` on `/var/run/docker.sock` | the host's `docker` group isn't gid 123 |
 | `setup-python` fails, or picks up a broken Python | `AGENT_TOOLSDIRECTORY` isn't `/opt/hostedtoolcache` |
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
-| A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), at most one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
+| A job sits "Waiting for a runner" | its capacity's vCPU budget is full, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), at most one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
 | An `arm64` runner's instance comes up and terminates without taking its job, and its console shows `no matching manifest for linux/arm64` | `ghcr.io/zeroae/ci-runner:latest` has no arm64 entry yet: the image workflow hasn't pushed a multi-arch `:latest` since it began building arm64. Run the image workflow on `main`, then re-run the job |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
-| A cap lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotCap=6 OnDemandCap=2` |
+| A budget lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8`. `SpotVcpuCap` draws on the EC2 Spot vCPU quota (`L-34B43A08`), `OnDemandVcpuCap` on the EC2 On-Demand one (`L-1216C47A`) |
 | The launcher logs `no instance launched`, with an authorization error from `CreateFleet` | `CreateFleet`'s check on the instance, volumes and network interfaces it creates carries no `ec2:LaunchTemplate` key, so a policy that adds that condition to them denies the launch. Grant those to `CreateFleet` without the condition; `RunInstances` keeps it |
 | The wizard stops with `runner group not created` | Enter at its **y/N** prompt means no. Re-run it, and type `y` at that prompt |
 | Offline runners pile up in the `ci-runner` group | a runner stopped by the 15-minute idle exit stays registered, offline. The sweeper removes it on its next run, once it's 10 minutes past the stamp in its name (`make sweep` to run it now). If they stay, the sweeper's log says why |

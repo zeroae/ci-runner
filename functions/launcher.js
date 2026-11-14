@@ -72,9 +72,10 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     }
   }
 
-  // Live instances of this stack by capacity. On-Demand ones have no
-  // InstanceLifecycle, so anything without the Spot marker counts as On-Demand.
-  async function count(type) {
+  // vCPUs of this stack's live instances on one capacity, from the shape tags.
+  // An instance launched before them has no tags: it is 4 vCPUs, and its
+  // capacity is Spot only with the Spot marker (On-Demand has no InstanceLifecycle).
+  async function vcpusIn(type) {
     let n = 0;
     let NextToken;
     do {
@@ -85,7 +86,13 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
         ],
         NextToken,
       });
-      for (const res of r.Reservations || []) for (const i of res.Instances || []) n += (i.InstanceLifecycle === 'spot') === (type === 'spot');
+      for (const res of r.Reservations || []) {
+        for (const i of res.Instances || []) {
+          const t = Object.fromEntries((i.Tags || []).map((x) => [x.Key, x.Value]));
+          const capacity = CAPACITY[t['ci-runner:capacity']] || (i.InstanceLifecycle === 'spot' ? 'spot' : 'on-demand');
+          if (capacity === type) n += Number(t['ci-runner:vcpus']) || 4;
+        }
+      }
       NextToken = r.NextToken;
     } while (NextToken);
     return n;
@@ -141,15 +148,16 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     if (!j) return log(JSON.stringify({ ...job, dropped: 'job not found' }));
     if (j.status !== 'queued') return log(JSON.stringify({ ...job, dropped: j.status }));
 
-    // A soft cap: two launches at once may overshoot it by one. At the cap the
-    // job goes back on the queue as a new message, so retries don't pile up
-    // towards the dead-letter queue.
+    // A soft budget: launches checked at the same moment may overshoot it. A
+    // job that would go over it goes back on the queue as a new message, so
+    // retries don't pile up towards the dead-letter queue.
     const type = CAPACITY[m.label];
-    const cap = Number(type === 'spot' ? env.SPOT_CAP : env.ONDEMAND_CAP);
-    const running = await count(type);
-    if (running >= cap) {
+    const budget = Number(type === 'spot' ? env.SPOT_VCPU_CAP : env.ONDEMAND_VCPU_CAP);
+    const held = await vcpusIn(type);
+    const { vcpus } = shapeOf(m);
+    if (held + vcpus > budget) {
       await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
-      return log(JSON.stringify({ ...job, deferred: `${running} of ${cap} ${type}` }));
+      return log(JSON.stringify({ ...job, deferred: `${held}+${vcpus} of ${budget} ${type} vCPUs` }));
     }
 
     // The sweeper reads the UTC mint stamp in the name as the registration's

@@ -31,8 +31,9 @@ working. **They will become required**: add `ci-cpu-4` and `x64` (or the size
 you want) to every moved job now, so the change to the required contract
 doesn't strand it.
 
-At most 6 Spot and 2 On-Demand CI runners run at once, across all repos. A
-job over the cap waits in a queue until one finishes. If a Spot reclaim kills
+The CI runners hold at most 24 Spot and 8 On-Demand vCPUs at once, across all
+repos (six and two `ci-cpu-4` runners). A job that would go over that waits in
+a queue until enough finish. If a Spot reclaim kills
 a job, a failed check run named `ci-runner / <job name>` appears on its
 commit. Nothing retries it automatically: a person re-runs it.
 
@@ -80,7 +81,7 @@ ignored, and it waits for a runner that never comes.
 
 **What the job gets:** Ubuntu 24.04, the runner as user `runner` (passwordless
 sudo), Docker through the host's socket, the `docker compose` and `buildx`
-plugins, `gh`, `jq`, `make`, `git`, `curl`, `zstd`, Python 3.12 as `python3`,
+plugins, `gh`, `jq`, `make`, a C and C++ compiler (`build-essential`: `cc`, `c++`), `pkg-config`, `git`, `curl`, `zstd`, Python 3.12 as `python3`,
 Node.js and AWS CLI v2. `actions/setup-*` work, but there is no warm toolcache,
 so each job downloads its runtime again. The job runs in a container that drives
 the host's Docker daemon, so a `docker run -v` source is a path on the host.

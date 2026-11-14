@@ -217,14 +217,18 @@ failures per message), for each job:
    installation. The token is cached until 5 minutes before it expires.
 3. `GET /repos/{repo}/actions/jobs/{job_id}`: anything but `queued` (or a
    `404`) is dropped, and the message is consumed.
-4. **The cap:** counts the stack's instances (`ci-runner:stack` tag) that are
-   `pending`, `running`, `stopping` or `stopped`, split by capacity: an
-   instance with `InstanceLifecycle: spot` is Spot, any other is On-Demand.
-   At the job's cap (`SpotCap`, default 6; `OnDemandCap`, default 2) it
-   sends the message to the queue again with a 60 s delay and consumes the
-   original, so waiting doesn't count towards the dead-letter queue. Nothing
-   is minted. It's a soft cap: messages checked at the same moment can
-   overshoot it. A shutting-down instance no longer counts.
+4. **The vCPU budget:** sums the vCPUs of the stack's instances
+   (`ci-runner:stack` tag) that are `pending`, `running`, `stopping` or
+   `stopped` on the job's capacity, both architectures together, from their
+   shape tags (`ci-runner:capacity`, `ci-runner:vcpus`). An instance launched
+   before those tags counts as 4 vCPUs, Spot if it has
+   `InstanceLifecycle: spot` and On-Demand otherwise. If the job's vCPUs
+   would take the sum over the capacity's budget (`SpotVcpuCap`, default 24;
+   `OnDemandVcpuCap`, default 8), it sends the message to the queue again with
+   a 60 s delay and consumes the original, so waiting doesn't count towards
+   the dead-letter queue. Nothing is minted. A job that brings the sum exactly
+   to the budget launches. It's a soft budget: messages checked at the same
+   moment can overshoot it. A shutting-down instance no longer counts.
 5. Looks up the `RunnerGroup` parameter's group id by name (cached), and
    mints a JIT config with the job's labels. The runner is named
    `${stack}-<UTC YYYYmmddHHMMSS>-<job id>`, as the sweeper requires.
@@ -245,11 +249,11 @@ There is no de-duplication on job id. A duplicate delivery launches a second
 runner at worst, and the idle exit and the sweeper remove it.
 
 `cloudformation deploy` keeps a parameter's previous value unless it's
-overridden, so after lowering a cap for a test, restore it explicitly
-(`--parameter-overrides SpotCap=6 OnDemandCap=2`).
+overridden, so after lowering a budget for a test, restore it explicitly
+(`--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8`).
 
 The launcher's role allows `GetSecretValue`, the queue's receive, delete and
-send, `ec2:DescribeInstances` (for the cap),
+send, `ec2:DescribeInstances` (for the budgets),
 `Create`/`DeleteLaunchTemplateVersions` on the two launch templates, and
 `CreateFleet`/`RunInstances` pinned to the two launch templates, the three subnets
 and the security group. It also allows `CreateTags` only while creating
