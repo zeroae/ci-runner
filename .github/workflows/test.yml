@@ -16,7 +16,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # aws/aws-emulator, for the tests that need real ECS shapes
+      # (test/launcher-ecs.test.js). The package is signed by AWS; check the
+      # signing key's fingerprint and the signature before installing it.
+      - name: Install aws-emulator
+        run: |
+          base=https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest
+          curl -fsSLO "$base/aws-emulator_amd64.deb"
+          curl -fsSLO "$base/aws-emulator_amd64.deb.sig"
+          curl -fsSLo aws-publishing.asc https://downloads.aws.com/keys/gpg/current.asc
+          gpg --import aws-publishing.asc
+          gpg --fingerprint --with-colons ssm-publishing@amazon.com | grep -q '^fpr:::::::::98BCF336A3BE53B734E967C52E5BF49BD940F624:$'
+          gpg --verify aws-emulator_amd64.deb.sig aws-emulator_amd64.deb
+          sudo apt-get install -y ./aws-emulator_amd64.deb
+          aws-emulator -v
       # The unit tests and the repo conventions, then the template build,
-      # which fails at or over the 51,200-byte inline limit.
+      # which fails at or over the S3 deploy's 1 MB limit.
       - run: make test
+        env:
+          REQUIRE_AWS_EMULATOR: "1"
       - run: make build

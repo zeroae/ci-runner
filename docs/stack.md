@@ -37,6 +37,10 @@ scripts/build-template.js   template.yaml -> build/template.yaml (git-ignored)
    - its own role `PowerUserPB-${AWS::StackName}-<name>`, with
      `PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess` and an
      inline policy of the same name granting only what that function needs.
+     The one exception: a role that passes a role (`iam:PassRole`) takes the
+     account's `ZAEPowerUserBoundary` instead, since `PowerUserAccess`
+     allows no `iam:PassRole` (see the launcher's boundary in "Launching for
+     queued jobs"). `test/conventions.test.js` checks both.
 4. A Function URL with `AuthType: NONE` needs two permissions:
    `lambda:InvokeFunctionUrl` (`FunctionUrlAuthType: NONE`) and
    `lambda:InvokeFunction` (`InvokedViaFunctionUrl: true`).
@@ -45,17 +49,22 @@ scripts/build-template.js   template.yaml -> build/template.yaml (git-ignored)
 
 - `make test`: `node --test test/*.test.js`.
 - `make build`: writes `build/template.yaml` and prints its size against the
-  **51,200-byte** limit (the largest template `aws cloudformation deploy` sends
-  without an S3 bucket). The build fails at or over it, and
-  `test/build.test.js` checks it too. To save room, the build drops whole-line
-  `//` comments from the inlined code and whole-line `#` comments from the
-  template (outside block scalars), so comment the source freely. If it fills
-  up again, the next step is deploying through an S3 bucket (`--s3-bucket`,
-  1 MB limit).
+  **1 MB** (1,048,576-byte) limit, the largest template CloudFormation accepts
+  from S3. The build fails at or over it, and `test/build.test.js` checks it
+  too. The build drops whole-line `//` comments from the inlined code and
+  whole-line `#` comments from the template (outside block scalars), so
+  comment the source freely.
 - `make deploy`: test, build, then `cloudformation deploy` with
-  `CAPABILITY_NAMED_IAM`, then print the outputs. It creates the stack the
-  first time and updates it after. Override `STACK`, `PROFILE`, `REGION` on the
-  command line if needed.
+  `CAPABILITY_NAMED_IAM` and `--s3-bucket $(BUCKET) --s3-prefix $(STACK)`, then
+  print the outputs. It uploads the template to the deploy bucket and deploys
+  from there, since a template sent inline must be under 51,200 bytes. It
+  creates the stack the first time and updates it after. The bucket is made
+  outside the stack, once per account (see "Deploy and update the stack" in
+  the runbook); `BUCKET` defaults to `$(STACK)-deploy-<account id>`, looked up
+  with `sts get-caller-identity`. Override `STACK`, `PROFILE`, `REGION`,
+  `BUCKET` on the command line if needed.
+- `make validate`: build, upload the template to the deploy bucket as
+  `$(STACK)/validate.yaml`, and validate it from there.
 
 ## The setup function
 
@@ -77,18 +86,27 @@ region's first three AZs (`MapPublicIpOnLaunch`), one route table with a
 default route to an internet gateway, no NAT, no flow logs, no endpoints. The
 security group `RunnerSecurityGroup` has no inbound rules.
 
-`RunnerLaunchTemplate` holds everything a CI runner instance shares: the AL2023
-image through `resolve:ssm:` (resolved at each launch), 50 GB encrypted gp3
+`RunnerLaunchTemplate` (x64) and `Arm64RunnerLaunchTemplate` (arm64) hold
+everything a CI runner instance shares, and differ only in the image: the AL2023
+image for the architecture through `resolve:ssm:` (resolved at each launch:
+`al2023-ami-kernel-default-x86_64` or `al2023-ami-kernel-default-arm64`), 50 GB encrypted gp3
 deleted on termination, IMDSv2 required with hop limit 1, shutdown behaviour
 `terminate`, the tag `ci-runner:stack=<stack>` on instance and volume. It has
 **no instance profile, no instance type and no user-data**.
 
-A launch is an EC2 Fleet of type `instant` for one instance: overrides for
-`m7i`/`m6i`/`m6a`/`m7a` `.xlarge` in each of the three subnets, Spot
-`capacity-optimized` for `ci-spot`. `CreateFleet` can't override user-data, so
+A launch is an EC2 Fleet of type `instant` for one instance, from the job's
+architecture's launch template: overrides for `m8i`/`m8a`/`m7i`/`m6i`/`m6a`/`m7a` (x64) or
+`m7g`/`m6g`/`m8g` (arm64) at the job's size (`.large`, `.xlarge`, `.2xlarge` or
+`.4xlarge` for 2, 4, 8 or 16 vCPUs) in each of the three subnets, Spot
+`capacity-optimized` for `ci-spot`. Every family is offered at every size in
+all three of the stack's AZs (`use1-az1`, `use1-az2`, `use1-az4`; checked
+2026-11-13 with `aws ec2 describe-instance-type-offerings --location-type
+availability-zone`), so no family/AZ pair is left out. Check again before
+adding a family or moving the subnets. `CreateFleet` can't override user-data, so
 each launch first adds a launch template version (source `$Default`, only
 `UserData`), launches from it, and deletes that version again. The outputs
-`LaunchTemplateId`, `SubnetIds` and `SecurityGroupId` are what a launch needs.
+`LaunchTemplateId`, `Arm64LaunchTemplateId`, `SubnetIds` and `SecurityGroupId`
+are what a launch needs.
 
 ## The instance's user-data
 
@@ -118,9 +136,16 @@ sweeper (or GitHub, for ephemeral runners) removes it.
 ## Launching one by hand
 
 `make hand-launch` (`scripts/hand-launch.sh`) mints an org JIT config for the
-`ci-runner` group with labels `self-hosted`, `ci-spot` through the owner's
-`gh`, which needs `admin:org`. It then renders the user-data and launches one
-instance as above. It prints the instance id. `IDLE_SECONDS=120` shortens the
+`ci-runner` group with labels `self-hosted`, `CAPACITY`, `SIZE` and `ARCH`
+(all required; none has a default) through the owner's `gh`, which needs
+`admin:org`. It then renders the user-data and launches one instance of that
+shape as above, with the launcher's fleet options: Spot `capacity-optimized`
+for `CAPACITY=ci-spot`, On-Demand `lowest-price` for `ci-ondemand`. It is
+tagged with its shape (`make hand-launch CAPACITY=ci-spot SIZE=ci-cpu-8
+ARCH=x64` launches an x64 Spot `.2xlarge`; `ARCH=arm64` a Graviton from the
+arm64 launch template). It refuses `ci-fargate-spot` and `ci-fargate`, which
+run a task, not an instance: the runbook's "Run a task by hand" does that.
+It prints the instance id. `IDLE_SECONDS=120` shortens the
 idle exit for a test. `make runners` lists the stack's instances that are not
 terminated.
 
@@ -134,23 +159,31 @@ terminated.
 2. Describes the instances tagged `ci-runner:stack=<stack>`, and terminates
    those `pending`, `running`, `stopping` or `stopped` and launched over
    **2 hours** ago.
-3. Removes each runner in the group that is `offline`, not busy, and has no
-   instance (see below). A GitHub failure doesn't stop step 2, but fails the
-   run.
+3. Lists the cluster's tasks whose desired status is `RUNNING` (not yet told
+   to stop), with their tags, and stops (`StopTask`) those created over
+   **2 hours** ago. Every task in the stack's cluster counts, a hand-run one
+   too.
+4. Removes each runner in the group that is `offline`, not busy, and has no
+   instance or task (see below). A GitHub failure doesn't stop steps 2 and 3,
+   but fails the run; an ECS failure fails it after step 2, before any
+   registration is removed.
 
-Runners are listed before instances are described, so a runner whose
-instance launches between the two is still seen with its instance.
+Runners are listed before instances and tasks are, so a runner whose
+machine launches in between is still seen with it. The run returns
+`{terminated, stopped, removed}`.
 
 Its role allows `GetSecretValue` on the secret, `ec2:DescribeInstances`, and
 `ec2:TerminateInstances` only on instances whose `aws:ResourceTag/ci-runner:stack`
 is the stack's name. A `TerminateInstances` naming an untagged instance, or
-another stack's, is denied.
+another stack's, is denied. On ECS it allows `ecs:ListTasks` with the
+condition `ecs:cluster` = the cluster, and `ecs:DescribeTasks`/`ecs:StopTask`
+only on the cluster's tasks (`task/<cluster>/*`).
 
 ### How a runner finds its instance
 
 Whatever launches a runner (`scripts/hand-launch.sh`, the launcher) must:
 
-- tag the instance `ci-runner:runner=<runner name>`, the name it gave
+- tag the instance or task `ci-runner:runner=<runner name>`, the name it gave
   `generate-jitconfig`. It may also tag `ci-runner:runner-id=<runner id>`;
   either tag matching keeps the registration.
 - put a UTC `YYYYmmddHHMMSS` timestamp of the mint in the name as its own
@@ -160,7 +193,10 @@ Whatever launches a runner (`scripts/hand-launch.sh`, the launcher) must:
   grace.
 
 Every instance not yet `terminated` counts, so a runner whose instance is
-shutting down is removed on a later run.
+shutting down is removed on a later run. A task counts until it is told to
+stop: the sweeper lists only tasks whose desired status is `RUNNING`, so a
+runner whose task the sweeper stops is removed on the next run. (ECS itself
+keeps a stopped task's tags readable through `DescribeTasks`.)
 
 ## Launching for queued jobs: webhook, queue, launcher
 
@@ -172,15 +208,57 @@ App's webhook points at), for each delivery:
 2. Ignores (`200`) any event but `workflow_job`.
 3. **Fence 3:** refuses (`403`, logged) unless `repository.visibility` is
    `private` and the owner is `GITHUB_ORG`.
-4. Ignores (`200`) actions other than `queued`, and jobs outside the label
-   contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, and
-   otherwise only `linux`/`x64` (case-insensitive).
-5. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, labels,
-   installation_id}` (`label` is the capacity label, lower case) and answers
-   `202`.
+4. On `in_progress`, repairs a swap (below) and answers.
+5. Ignores (`200`) actions other than `queued`, and jobs outside the label
+   contract (case-insensitive): `self-hosted`, exactly one of
+   `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`, `-4`, `-8`,
+   `-16`), exactly one of `x64`/`arm64`, and optionally `linux`. None has a
+   default: a missing size or architecture label, an unknown `ci-cpu-*`, or
+   both `x64` and `arm64`, are outside it.
+6. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
+   labels, installation_id}` (`label` is the capacity label, lower case;
+   `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
 
-Its role allows only `GetSecretValue` on the secret and `SendMessage` on the
-queue.
+**Swap repair** (ADR-0003). GitHub gives a queued job to any idle runner whose
+labels cover it, so a runner launched for job Y may take job X. Left alone,
+X's own message is later dropped as not queued, and Y never gets a runner.
+On `workflow_job` `in_progress` the webhook reads `runner_name`:
+
+- a name that isn't `${stack}-<14-digit stamp>-<job id>` (a hand launch, a
+  GitHub-hosted runner, another stack), or whose job id is the event's, is
+  ignored (`200`) with no AWS call;
+- otherwise it describes the stack's `pending`/`running` instance tagged
+  `ci-runner:runner=<name>`, and if there is none, the cluster's task tagged
+  so among those whose desired status is `RUNNING` (`ListTasks`, then
+  `DescribeTasks` with their tags). No instance or task, or a
+  `ci-runner:job-id` tag already equal to the event's job (a repeated
+  delivery), is ignored too;
+- otherwise it **re-queues** the machine's job, rebuilt from its tags
+  (`repo`, `job-id`, `run-id`, `head-sha`, `job-name`, `label`, `vcpus`,
+  `arch`, `labels`; the event's installation id), so the launcher's "still
+  queued?" check launches it a runner or drops it. A task's `labels` are
+  split on spaces, an instance's on commas. A task's `job-name` is the
+  sanitized one (see "The Fargate capacities"); only tags read it, and the
+  notifier fetches the real name. An instance launched before those tags
+  existed re-queues as `ci-cpu-4`/`x64` with `self-hosted` and its capacity
+  label;
+- then **re-tags** the instance (`CreateTags`) or task (`TagResource`) with
+  the event's job (`ci-runner:repo`, `job-id`, `run-id`, `head-sha`,
+  `job-name`), so the notifier reports a reclaim on the commit of the job it
+  really ran. A task's values are sanitized as the launcher's are. It logs
+  `{"swap": <runner>, "instance" or "task", "took": {repo, job_id},
+  "requeued": {repo, job_id}}`, answering `202`.
+
+It queues before it tags: if the tag fails, a redelivery still sees the old
+tags and repairs again. Re-queueing a job that another runner already took is
+harmless: the launcher drops it.
+
+Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue,
+`ec2:DescribeInstances`, and `ec2:CreateTags` only on instances tagged
+`ci-runner:stack=<stack>` and only for the five job tag keys. On ECS:
+`ecs:ListTasks` with the condition `ecs:cluster` = the cluster, and
+`ecs:DescribeTasks` and `ecs:TagResource` only on the cluster's tasks, the
+latter only for the five job tag keys (`aws:TagKeys`).
 
 **The queue** `${stack}-jobs` has a 120 s visibility timeout. A message that
 fails 5 receives goes to `${stack}-jobs-dlq` (kept 14 days). The outputs are
@@ -189,72 +267,283 @@ fails 5 receives goes to `${stack}-jobs-dlq` (kept 14 days). The outputs are
 **launcher** (`functions/launcher.js`, fed one message at a time, reporting
 failures per message), for each job:
 
-1. Drops a malformed message, or one whose repo isn't in `GITHUB_ORG`.
+1. Drops a malformed message, or one whose repo isn't in `GITHUB_ORG`, or
+   whose `vcpus` or `arch` isn't served. A message with neither (enqueued
+   before the size labels) gets 4 vCPUs and `x64`.
 2. Signs an App JWT and gets an installation token for the job's
    installation. The token is cached until 5 minutes before it expires.
 3. `GET /repos/{repo}/actions/jobs/{job_id}`: anything but `queued` (or a
    `404`) is dropped, and the message is consumed.
-4. **The cap:** counts the stack's instances (`ci-runner:stack` tag) that are
-   `pending`, `running`, `stopping` or `stopped`, split by capacity: an
-   instance with `InstanceLifecycle: spot` is Spot, any other is On-Demand.
-   At the job's cap (`SpotCap`, default 6; `OnDemandCap`, default 2) it
-   sends the message to the queue again with a 60 s delay and consumes the
-   original, so waiting doesn't count towards the dead-letter queue. Nothing
-   is minted. It's a soft cap: messages checked at the same moment can
-   overshoot it. A shutting-down instance no longer counts.
+4. **The vCPU budget:** sums the vCPUs of the stack's instances
+   (`ci-runner:stack` tag) that are `pending`, `running`, `stopping` or
+   `stopped` on the job's capacity, both architectures together, from their
+   shape tags (`ci-runner:capacity`, `ci-runner:vcpus`). An instance launched
+   before those tags counts as 4 vCPUs, Spot if it has
+   `InstanceLifecycle: spot` and On-Demand otherwise. If the job's vCPUs
+   would take the sum over the capacity's budget (`SpotVcpuCap`, default 24;
+   `OnDemandVcpuCap`, default 8), it sends the message to the queue again with
+   a 60 s delay and consumes the original, so waiting doesn't count towards
+   the dead-letter queue. Nothing is minted. A job that brings the sum exactly
+   to the budget launches. It's a soft budget: messages checked at the same
+   moment can overshoot it. A shutting-down instance no longer counts.
+   A Fargate job counts the cluster's tasks instead (see "The Fargate
+   capacities").
 5. Looks up the `RunnerGroup` parameter's group id by name (cached), and
    mints a JIT config with the job's labels. The runner is named
    `${stack}-<UTC YYYYmmddHHMMSS>-<job id>`, as the sweeper requires.
-6. Renders the `#cloud-config` and launches one instance as in "Launching one
+6. For a Fargate job, runs one task (see "The Fargate capacities"). Otherwise
+   renders the `#cloud-config` and launches one instance as in "Launching one
    by hand": Spot `capacity-optimized` for `ci-spot`, On-Demand `lowest-price`
-   for `ci-ondemand`. Tags: `ci-runner:runner`, `ci-runner:runner-id`,
-   `ci-runner:label`, `ci-runner:repo`, `ci-runner:job-id`, `ci-runner:run-id`,
-   `ci-runner:head-sha` and `ci-runner:job-name`, plus the launch template's
-   `ci-runner:stack`.
-7. If no instance launches, it removes the registration it just minted and
-   fails the message, which comes back 120 s later.
+   for `ci-ondemand`, at the job's size, from the launch template and the
+   families of the job's architecture. Tags: `ci-runner:runner`,
+   `ci-runner:runner-id`, `ci-runner:label`, `ci-runner:repo`,
+   `ci-runner:job-id`, `ci-runner:run-id`, `ci-runner:head-sha`,
+   `ci-runner:job-name`, `ci-runner:labels` (the job's labels, comma-joined,
+   for the swap repair), and the shape: `ci-runner:capacity` (the capacity
+   label), `ci-runner:vcpus` and `ci-runner:arch`; plus the launch template's
+   `ci-runner:stack`. The `launched` log line carries `label`, `vcpus` and
+   `arch`.
+7. If no instance or task launches, it removes the registration it just
+   minted and fails the message, which comes back 120 s later.
 
 There is no de-duplication on job id. A duplicate delivery launches a second
 runner at worst, and the idle exit and the sweeper remove it.
 
 `cloudformation deploy` keeps a parameter's previous value unless it's
-overridden, so after lowering a cap for a test, restore it explicitly
-(`--parameter-overrides SpotCap=6 OnDemandCap=2`).
+overridden, so after lowering a budget for a test, restore it explicitly
+(`--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8`).
 
 The launcher's role allows `GetSecretValue`, the queue's receive, delete and
-send, `ec2:DescribeInstances` (for the cap),
-`Create`/`DeleteLaunchTemplateVersions` on the launch template, and
-`CreateFleet`/`RunInstances` pinned to the launch template, the three subnets
+send, `ec2:DescribeInstances` (for the budgets),
+`Create`/`DeleteLaunchTemplateVersions` on the two launch templates, and
+`CreateFleet`/`RunInstances` pinned to the two launch templates, the three subnets
 and the security group. It also allows `CreateTags` only while creating
 (`ec2:CreateAction`), and `ssm:GetParameters` on the public AL2023 parameters,
-which the launch template's `resolve:ssm:` image needs. It has no
-`iam:PassRole`. `CreateFleet`'s check on the instances, volumes and network
+which the launch template's `resolve:ssm:` image needs. For Fargate it
+allows `ecs:RunTask` on the two task definitions in the stack's cluster
+(`ecs:cluster`), `iam:PassRole` on the execution role only and only to
+`ecs-tasks.amazonaws.com`, `ecs:TagResource` only while creating
+(`ecs:CreateAction: RunTask`), and `ecs:ListTasks`/`ecs:DescribeTasks` on the
+cluster (for the budgets). It has no other `iam:PassRole`. All four conditions
+hold live (checked 2026-11-14 with one job on each Fargate capacity).
+
+Its permissions boundary is the account's `ZAEPowerUserBoundary`, not
+`PowerUserAccess` like every other role: `RunTask` passes the task
+definition's execution role, and `PowerUserAccess` allows no `iam:PassRole`
+at all. `ZAEPowerUserBoundary` is `PowerUserAccess` plus `iam:PassRole` on
+`PowerUserPB*` roles; the policy above narrows that to the execution role.
+`test/conventions.test.js` requires that boundary on a role that passes one,
+and `PowerUserAccess` on every other. `CreateFleet`'s check on the instances, volumes and network
 interfaces it creates carries no launch-template key, so those resources
 are granted to `CreateFleet` without one. `RunInstances` keeps the condition.
 
+## The Fargate capacities
+
+`ci-fargate-spot` (Fargate Spot) and `ci-fargate` (Fargate On-Demand) run a
+job in a Fargate task: no instance to boot, no host to clean up, and **no
+Docker daemon** (ADR-0001). The template's Fargate resources:
+
+- **`RunnerCluster`**, named after the stack, with the `FARGATE` and
+  `FARGATE_SPOT` capacity providers and no default strategy.
+- **`RunnerTaskDefinition`** (x64, family `${stack}-runner`) and
+  **`Arm64RunnerTaskDefinition`** (arm64, `${stack}-runner-arm64`): two,
+  because `RunTask` can't override the platform. They differ only in
+  `CpuArchitecture`: `awsvpc`, 4 vCPU / 16 GB (each launch overrides both),
+  50 GB of ephemeral storage, one essential container `runner` from
+  `${ImageRepositoryUri}:latest` (ECR, lazy-loaded through its SOCI index),
+  entrypoint `/usr/local/bin/ci-runner-idle-exit`, `InitProcessEnabled`, and
+  `awslogs` to `RunnerTaskLogGroup` with the stream prefix `runner`. They have
+  **no task role**, so a job finds no AWS credentials: no
+  `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, and the instance metadata service
+  isn't reachable from Fargate. The task metadata endpoint
+  (`ECS_CONTAINER_METADATA_URI_V4`) is there, and holds no credentials.
+- **`RunnerExecutionRole`**, `PowerUserPB-${stack}-runner-exec`, which ECS
+  uses to start a task and the job never sees: `ecr:GetAuthorizationToken`,
+  the pull calls on `ImageRepository` only, and writing to the log group.
+- **`RunnerTaskLogGroup`**, `/ecs/${stack}-runner`, kept 7 days: the runner's
+  output (`Listening for Jobs`, `Running job`), one stream per task
+  (`runner/runner/<task id>`).
+
+The outputs `ClusterName`, `TaskDefinitionArn` and `Arm64TaskDefinitionArn`
+are what a hand-run task needs.
+
+**The launch.** For a Fargate job the launcher calls `RunTask` with:
+
+- the capacity provider (`FARGATE_SPOT` or `FARGATE`), weight 1, and the
+  task definition of the job's architecture;
+- task-level `cpu` and `memory` for the size (`ci-cpu-8`: `8192` and
+  `32768`, so 4 GB per vCPU as on EC2);
+- a container override: the command `./run.sh --jitconfig <config>`, and the
+  environment below. The JIT config is readable to `ecs:DescribeTasks`, the
+  same exposure as an instance's user-data;
+- `assignPublicIp: ENABLED` in the stack's subnets and security group. arm64
+  leaves out any subnet in `use1-az3`, where Fargate has no arm64 (the
+  template passes each subnet's AZ id as `SUBNET_AZ_IDS`; the stack's subnets
+  are in `use1-az1`, `-az2` and `-az4` today, so nothing is left out);
+- the instances' `ci-runner:*` tags, plus `ci-runner:stack`. ECS allows only
+  letters, digits, spaces and `_ . : / = + - @` in a tag, so on a task
+  `ci-runner:labels` is joined by spaces, not commas, and any other character
+  (a job name's brackets or commas) becomes `_`. The webhook's re-tag
+  sanitizes the same way, with a copy of the launcher's `ECS_TAG_CHARS` and
+  `ecsTag` (bundling one costs more bytes than the copy);
+  `test/conventions.test.js` fails if the copies differ.
+
+The launch is logged as `launched: <task ARN>`. A `RunTask` that returns no
+task fails the message with `no task launched: <reason>: <detail>`.
+
+**The environment.** Inside a task, `nproc` can report the host's CPUs (8
+on a 4-vCPU task in 3 of the spike's 4 tasks) and there is no cgroup
+`cpu.max`, so tools that size their parallelism by it oversubscribe. The
+container override sets `MAKEFLAGS=-j<n>` (which also reaches CMake's Makefile
+generator) and `CI_RUNNER_VCPUS=<n>` to the task's vCPUs; the runner's
+environment reaches every step. From `CI_RUNNER_VCPUS` the image's entrypoint
+writes `/home/runner/.cargo/config.toml` with `[build] jobs = <n>` (an existing
+file is left alone, and logged). Cargo reads `.cargo/config.toml` from every
+ancestor of its working directory, so it applies to every checkout under
+`/home/runner/_work`, whatever `CARGO_HOME` a job sets.
+
+No `CARGO_*` or `CMAKE_*` variable is set, on purpose: `Swatinem/rust-cache`
+hashes every variable starting `CARGO`, `CC`, `CFLAGS`, `CXX`, `CMAKE` or
+`RUST` into its cache key
+([`src/config.ts`](https://github.com/Swatinem/rust-cache/blob/c8037a86dde8214a8310e9f54a8fc61ab362aa31/src/config.ts#L111)),
+so a `CARGO_BUILD_JOBS` (as the first version set) gave Fargate jobs their own
+key, and they never hit the cache an EC2 job saved. Its hash of
+`.cargo/config.toml` files looks only inside the workspace, so the home one
+doesn't change the key. `IDLE_SECONDS` is passed on too, when the launcher has
+it (a test).
+
+**The idle exit.** `image/ci-runner-idle-exit` runs its arguments in their own
+session, copying their output to a file, and stops them if that output has no
+`Running job` line after `IDLE_SECONDS` (default 900). A stop is a TERM to every
+process in the session (`pkill -s`), then a KILL after `IDLE_GRACE_SECONDS`
+(default 30, as `docker stop -t 30` gives an EC2 runner). The session matters:
+`run-helper.sh` and `Runner.Listener` run in their own process group, so a TERM
+to `run.sh`'s group alone misses them and the task never stops (seen live).
+With the whole session signalled, the runner exits at once, status 143. It passes a TERM or INT on (a `StopTask`), and exits with the
+runner's status, so the essential container exits and the task stops. The
+image sets no `ENTRYPOINT`, so EC2's host script, which runs `./run.sh` with
+its own idle exit, is unchanged; only the task definitions use the wrapper.
+`image/smoke.sh` checks it with fake runners and a 2 s timeout. For a test,
+`IDLE_SECONDS` can be set per task in a container override, as in the
+runbook's "Run a task by hand".
+
+**The budgets.** `FargateSpotVcpuCap` (default 48) and `FargateVcpuCap`
+(default 8) budget the two capacities, both architectures together, as the
+EC2 budgets do. Fargate Spot's default is 48, double the others: at 24, one
+consumer's 9-job matrix at `ci-cpu-8` ran in waves and spent most of its
+queued time on budget waits, and the Fargate Spot quota (140) has room. The launcher lists the cluster's tasks not yet `STOPPED`:
+those whose desired status is `RUNNING` (provisioning, pending or running),
+and those told to stop (desired `STOPPED`) whose last status isn't `STOPPED`
+yet, since a deprovisioning task still holds its vCPUs. It sums their
+`ci-runner:vcpus` on the job's capacity (`ci-runner:capacity`). A task with no
+vCPU tag counts as 4. EC2 instances and tasks never count towards each
+other's budgets.
+
+**A task's lifecycle** is an instance's: the sweeper stops it 2 hours after
+launch and keeps its runner's registration while it lives, the swap repair
+re-tags it, and the notifier reports a Fargate Spot reclaim (below).
+
 ## Reporting a Spot reclaim: the notifier
 
-`functions/notifier.js` runs on every **EC2 Spot Instance Interruption
-Warning** in the region (the rule `${stack}-notifier`; an event pattern can't
-match on tags). For each warning it:
+`functions/notifier.js` runs on two rules:
 
-1. Describes the instance, and ignores it (logged) unless it carries
+- `${stack}-notifier`: every **EC2 Spot Instance Interruption Warning** in
+  the region (an event pattern can't match on tags);
+- `${stack}-notifier-tasks`: every **ECS Task State Change** of the stack's
+  cluster with `stopCode: SpotInterruption`. A reclaimed task's changes all
+  carry it, from the warning (desired `STOPPED`, still `RUNNING`, about 2
+  minutes before the stop) to `STOPPED`. The notifier reads the tags with
+  `DescribeTasks`, which still returns them after the stop: measured live on
+  2026-11-14, a task's tags stayed readable from `StopTask` through
+  `STOPPED` and minutes after, while `ListTagsForResource` refused the task
+  (`The specified task is stopped`) from the moment it was told to stop.
+  So every change can be read, and the check-run lookup keeps it to one
+  report per job (aws-emulator, unlike AWS, drops the tags at the stop).
+
+For each event it:
+
+1. Describes the instance, or the task (`DescribeTasks` with its tags; the
+   event carries none), and ignores it (logged) unless it carries
    `ci-runner:stack=<stack>`, `ci-runner:head-sha`, `ci-runner:job-id` and a
    `ci-runner:repo` in `GITHUB_ORG`: the launcher's tags. An instance from
-   `make hand-launch` has no job tags and is ignored.
+   `make hand-launch` or a task run by hand has no job tags and is ignored,
+   as is a task whose tags are gone.
 2. Signs an App JWT, finds the repo's installation
    (`GET /repos/{repo}/installation`) and gets its token.
-3. Creates a check run on the head sha: name `ci-runner / <job name>` (or
+3. For a task, reads the job's real name from
+   `GET /repos/{repo}/actions/jobs/{job_id}` (the tag has `_` for brackets and
+   commas), falling back to the tag.
+4. Skips the job if the commit already has its reclaim check run (same name,
+   `external_id` the job id, the title below), so a task's later changes and a
+   repeated event report nothing more.
+5. Creates a check run on the head sha: name `ci-runner / <job name>` (or
    `job <id>` with no name), `completed`, conclusion `failure`, title
    `Spot capacity reclaimed: re-run this job`, a summary naming the job and
-   the instance and linking the run, and `details_url` the job's page.
+   the instance or task and linking the run, and `details_url` the job's page.
+   An EC2 reclaim and a Fargate one give the same check run, but for the
+   summary's machine.
 
 A GitHub failure fails the invocation, and EventBridge's async invoke retries
-it. A duplicate event creates a second, identical check run.
+it. Two events handled at the same moment can still report twice.
 
 The launcher, the notifier and the sweeper each carry their own copy of
 `appJwt()` and `gh()`, because bundling a shared module costs more template
 bytes than the copies. `test/conventions.test.js` fails if the copies differ,
 so change all three at once.
 
-Its role allows `GetSecretValue` on the secret and `ec2:DescribeInstances`.
+Its role allows `GetSecretValue` on the secret, `ec2:DescribeInstances`, and
+`ecs:DescribeTasks` only on the cluster's tasks.
+
+## The runner image in ECR
+
+Fargate lazy-loads an image only from private ECR, through a SOCI index
+(ADR-0002), so `image.yml` pushes the image to the stack's own ECR repo as
+well as to GHCR. EC2 runners keep pulling `ghcr.io/zeroae/ci-runner:latest`:
+an instance has no instance profile, so it can't pull from private ECR.
+
+- **`ImageRepository`**, named after the stack (`ci-runner`). Its lifecycle
+  rule keeps the last 4 **tagged** images. Each build tags one image index,
+  under `:latest` and `:<date>-<sha>`, so that's the last 4 builds. The
+  index's children (each architecture's image manifest and SOCI index) are
+  untagged, and no rule touches them: an untagged rule could expire the
+  children of an index still in use. `EmptyOnDelete` lets a stack delete
+  remove it, images and all.
+- **`GitHubOidcProvider`**, GitHub's OIDC provider, created only when the
+  `ExistingOidcProviderArn` parameter is empty (the `CreateProvider`
+  condition; the pattern is zeroae/foresight's `github-deploy-zae`). An
+  account holds one provider per URL, so in an account that already has one,
+  pass its ARN instead.
+- **`ImagePushRole`**, `PowerUserPB-${stack}-image-push`, trusted only for
+  `sts:AssumeRoleWithWebIdentity` from that provider with `aud`
+  `sts.amazonaws.com` and `sub` exactly
+  `repo:zeroae@11018406/ci-runner@1455021495:ref:refs/heads/main`. The repo
+  uses GitHub's immutable subject, so the `sub` names the owner and repo by id
+  (`gh api repos/zeroae/ci-runner/actions/oidc/customization/sub` shows the
+  prefix); the name-only form `repo:zeroae/ci-runner:...` never matches. Any other branch, a pull
+  request, a tag or another repo carries a different `sub`, and can't assume
+  it. It allows `ecr:GetAuthorizationToken` (which has no resource-level
+  permissions) and, on the repo only, the layer upload calls, `PutImage`,
+  `BatchGetImage` and `GetDownloadUrlForLayer`.
+
+The outputs `ImageRepositoryUri` and `ImagePushRoleArn` are the repo
+variables `ECR_IMAGE` and `AWS_IMAGE_PUSH_ROLE_ARN` that `image.yml` reads.
+There is nothing to rotate: the push uses a short-lived OIDC token, and no
+AWS key or GitHub token is stored anywhere.
+
+`image.yml`'s `soci` job, on every branch:
+
+1. downloads each architecture's build as an OCI layout and merges both into
+   one OCI image index, each manifest with the platform its config names;
+2. runs `soci convert --standalone --all-platforms` (the `soci` CLI from
+   awslabs/soci-snapshotter, release `SOCI_VERSION`, sha256-checked). It
+   needs no containerd. The result is a SOCI-enabled image (SOCI index
+   manifest v2): an index holding both image manifests and a SOCI index
+   (`artifactType: application/vnd.amazon.soci.index.v2+json`) for each, and
+   the job fails unless both are there;
+3. pushes it with `skopeo copy --all --preserve-digests` to a local
+   `registry:3` service and reads it back, so a branch exercises the push.
+
+On `main`, with both variables set, it then assumes the push role and
+pushes the same index to ECR under `:<date>-<sha>` and `:latest`. Without
+the variables (before the stack has the repo) those two steps are skipped
+and the GHCR publish is unaffected.

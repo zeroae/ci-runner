@@ -1,11 +1,13 @@
 'use strict';
-// sweeper: scheduled. Terminates the stack's CI runner instances older than
-// MAX_AGE, and removes the runner group's registrations that are offline and
-// have no instance. Inlined into the template by scripts/build-template.js;
-// keep it one dependency-free CommonJS file.
+// sweeper: scheduled. Terminates the stack's CI runner instances and stops
+// the cluster's tasks older than MAX_AGE, and removes the runner group's
+// registrations that are offline and have no instance or task. Inlined into
+// the template by scripts/build-template.js; keep it one dependency-free
+// CommonJS file.
 const crypto = require('node:crypto');
 
 const MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const MAX_AGE = `${MAX_AGE_MS / 3600e3} hours`;
 const STACK_TAG = 'ci-runner:stack';
 // The launcher tags each instance with its runner's name (and, when it has
 // it, the runner's id); that is how a registration finds its instance.
@@ -26,8 +28,9 @@ function appJwt(appId, pem, nowMs) {
 }
 
 const tagOf = (inst, key) => ((inst.Tags || []).find((t) => t.Key === key) || {}).Value;
+const taskTag = (task, key) => ((task.tags || []).find((t) => t.key === key) || {}).value;
 
-function createHandler({ ec2, secret, fetch, now, env, log = console.log }) {
+function createHandler({ ec2, ecs, secret, fetch, now, env, log = console.log }) {
   const org = env.GITHUB_ORG;
   // Instances that can still be (or become) a runner: everything not terminated.
   const alive = (i) => i.State.Name !== 'terminated';
@@ -42,6 +45,29 @@ function createHandler({ ec2, secret, fetch, now, env, log = console.log }) {
     if (strays.length) {
       await ec2.terminate(strays);
       log(`sweeper: terminated ${strays.join(' ')}`);
+    }
+    return strays;
+  }
+
+  // The cluster's tasks not yet told to stop, with their tags. A stopping
+  // task no longer counts: its runner is already on its way out.
+  async function listTasks() {
+    const out = [];
+    let nextToken;
+    do {
+      const r = await ecs.listTasks({ cluster: env.CLUSTER, desiredStatus: 'RUNNING', nextToken });
+      if ((r.taskArns || []).length) out.push(...(await ecs.describeTasks({ cluster: env.CLUSTER, tasks: r.taskArns, include: ['TAGS'] })).tasks || []);
+      nextToken = r.nextToken;
+    } while (nextToken);
+    return out;
+  }
+
+  // Every task in the stack's cluster is the stack's, a hand-run one too.
+  async function sweepTasks(tasks) {
+    const strays = tasks.filter((t) => now() - new Date(t.createdAt).getTime() > MAX_AGE_MS).map((t) => t.taskArn);
+    for (const task of strays) {
+      await ecs.stopTask({ cluster: env.CLUSTER, task, reason: `ci-runner sweeper: launched over ${MAX_AGE} ago` });
+      log(`sweeper: stopped ${task}`);
     }
     return strays;
   }
@@ -82,10 +108,10 @@ function createHandler({ ec2, secret, fetch, now, env, log = console.log }) {
     return m ? Date.UTC(m[1], m[2] - 1, m[3], m[4], m[5], m[6]) : undefined;
   }
 
-  async function sweepRunners(token, runners, instances) {
+  async function sweepRunners(token, runners, instances, tasks) {
     const present = instances.filter(alive);
-    const names = new Set(present.map((i) => tagOf(i, RUNNER_TAG)).filter(Boolean));
-    const ids = new Set(present.map((i) => tagOf(i, RUNNER_ID_TAG)).filter(Boolean));
+    const names = new Set([...present.map((i) => tagOf(i, RUNNER_TAG)), ...tasks.map((t) => taskTag(t, RUNNER_TAG))].filter(Boolean));
+    const ids = new Set([...present.map((i) => tagOf(i, RUNNER_ID_TAG)), ...tasks.map((t) => taskTag(t, RUNNER_ID_TAG))].filter(Boolean));
     const young = (r) => { const t = minted(r.name); return t !== undefined && now() - t < GRACE_MS; };
     const orphans = runners.filter((r) => r.status === 'offline' && !r.busy
       && !names.has(r.name) && !ids.has(String(r.id)) && !young(r));
@@ -97,8 +123,8 @@ function createHandler({ ec2, secret, fetch, now, env, log = console.log }) {
   }
 
   return async function handler() {
-    // Registrations are listed before instances are described, so a runner
-    // whose instance launches in between is still seen with its instance.
+    // Registrations are listed before instances and tasks are, so a runner
+    // whose machine launches in between is still seen with it.
     let token, runners, failure;
     try {
       const creds = await secret.get();
@@ -112,9 +138,11 @@ function createHandler({ ec2, secret, fetch, now, env, log = console.log }) {
 
     const instances = (await ec2.describe()).filter((i) => tagOf(i, STACK_TAG) === env.STACK_NAME);
     const terminated = await sweepInstances(instances);
+    const tasks = await listTasks();
+    const stopped = await sweepTasks(tasks);
     if (failure) throw failure;
-    const removed = runners ? await sweepRunners(token, runners, instances) : [];
-    return { terminated, removed };
+    const removed = runners ? await sweepRunners(token, runners, instances, tasks) : [];
+    return { terminated, stopped, removed };
   };
 }
 
@@ -127,8 +155,10 @@ exports.handler = async (event) => {
   if (!live) {
     const sm = require('@aws-sdk/client-secrets-manager');
     const ec2sdk = require('@aws-sdk/client-ec2');
+    const ECS = require('@aws-sdk/client-ecs');
     const smc = new sm.SecretsManagerClient({});
     const ec2c = new ec2sdk.EC2Client({});
+    const ecsc = new ECS.ECSClient({});
     const SecretId = process.env.SECRET_ARN;
     live = createHandler({
       secret: {
@@ -143,6 +173,11 @@ exports.handler = async (event) => {
           return out;
         },
         terminate: async (InstanceIds) => { await ec2c.send(new ec2sdk.TerminateInstancesCommand({ InstanceIds })); },
+      },
+      ecs: {
+        listTasks: (i) => ecsc.send(new ECS.ListTasksCommand(i)),
+        describeTasks: (i) => ecsc.send(new ECS.DescribeTasksCommand(i)),
+        stopTask: (i) => ecsc.send(new ECS.StopTaskCommand(i)),
       },
       fetch: globalThis.fetch,
       now: Date.now,

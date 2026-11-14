@@ -57,7 +57,7 @@ test('whole-line YAML comments are dropped, but not inside a block scalar', () =
     'Description: >-\n  text\n  # kept: block content\nA:\n  B: 1 # trailing stays\n');
 });
 
-test('the real template embeds every function, each runnable alone, under the inline size limit', () => {
+test('the real template embeds every function, each runnable alone, under the S3 deploy\'s 1 MB limit', () => {
   const out = build(path.join(root, 'template.yaml'));
   assert.doesNotMatch(out, /^ *\/\/@inline /m);
   const zips = zipFiles(out);
@@ -69,6 +69,6 @@ test('the real template embeds every function, each runnable alone, under the in
     assert.ok(zip, `${fn} not inlined`);
     assert.equal(typeof load(zip.code).handler, 'function', `${fn} has no handler when inlined`);
   }
-  assert.equal(LIMIT, 51200);
+  assert.equal(LIMIT, 1048576);
   assert.ok(Buffer.byteLength(out) < LIMIT);
 });

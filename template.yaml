@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  ci-runner: single-use EC2 self-hosted GitHub Actions runners for zeroae's
-  private repos. Source template; `make build` inlines functions/*.js.
+  ci-runner: single-use EC2 and Fargate self-hosted GitHub Actions runners
+  for zeroae's private repos. Source template; `make build` inlines
+  functions/*.js.
 
 # Layout rules (see docs/stack.md):
 # - every role and policy is PowerUserPB-${AWS::StackName}-<suffix> with the
@@ -23,14 +24,29 @@ Parameters:
     Type: String
     Default: ci-runner
     Description: The org runner group every CI runner registers into (created after the stack).
-  SpotCap:
+  SpotVcpuCap:
     Type: Number
-    Default: 6
-    Description: Most Spot CI runners at once (soft).
-  OnDemandCap:
+    Default: 24
+    Description: Most vCPUs the Spot CI runners hold at once, both architectures (soft). Draws on the EC2 Spot vCPU quota.
+  OnDemandVcpuCap:
     Type: Number
-    Default: 2
-    Description: Most On-Demand CI runners at once (soft).
+    Default: 8
+    Description: Most vCPUs the On-Demand CI runners hold at once, both architectures (soft). Draws on the EC2 On-Demand vCPU quota.
+  FargateSpotVcpuCap:
+    Type: Number
+    Default: 48
+    Description: Most vCPUs the Fargate Spot CI runners hold at once, both architectures (soft). Draws on the Fargate Spot vCPU quota.
+  FargateVcpuCap:
+    Type: Number
+    Default: 8
+    Description: Most vCPUs the Fargate On-Demand CI runners hold at once, both architectures (soft). Draws on the Fargate On-Demand vCPU quota.
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: Leave empty to create GitHub's OIDC provider. An account holds one provider per URL, so if `aws iam list-open-id-connect-providers` already shows token.actions.githubusercontent.com, give its ARN here.
+
+Conditions:
+  CreateProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
 
 Resources:
   # App id, private key and webhook secret. Created holding only `state_key`
@@ -144,7 +160,7 @@ Resources:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
-  # --- webhook: verify, label contract, fence 3, enqueue ----------------------
+  # --- webhook: verify, label contract, fence 3, enqueue, swap repair ---------
   WebhookLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -176,6 +192,36 @@ Resources:
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt JobQueue.Arn
+              # Swap repair: find a runner's instance, and re-tag it with the
+              # job it really runs. Only the job tags, only the stack's instances.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
+              # The same for a runner's task: only the cluster's tasks, only
+              # the job tags.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
+              - Effect: Allow
+                Action: ecs:TagResource
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
 
   WebhookFunction:
     Type: AWS::Lambda::Function
@@ -194,6 +240,8 @@ Resources:
           SECRET_ARN: !Ref AppSecret
           QUEUE_URL: !Ref JobQueue
           GITHUB_ORG: !Ref GitHubOrg
+          STACK_NAME: !Ref AWS::StackName
+          CLUSTER: !Ref RunnerCluster
       Code:
         ZipFile: |
           //@inline functions/webhook.js
@@ -231,7 +279,11 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "PowerUserPB-${AWS::StackName}-launcher"
-      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      # RunTask passes the execution role, and PowerUserAccess allows no
+      # iam:PassRole. The account's ZAEPowerUserBoundary is PowerUserAccess
+      # plus PassRole on PowerUserPB* roles; the policy below narrows that to
+      # the execution role.
+      PermissionsBoundary: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/ZAEPowerUserBoundary"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -252,21 +304,24 @@ Resources:
               - Effect: Allow
                 Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility, sqs:SendMessage]
                 Resource: !GetAtt JobQueue.Arn
-              # The cap counts instances; no resource-level permissions.
+              # The budgets count instances' vCPUs; no resource-level permissions.
               - Effect: Allow
                 Action: ec2:DescribeInstances
                 Resource: "*"
               # A version per launch carries the user-data.
               - Effect: Allow
                 Action: [ec2:CreateLaunchTemplateVersion, ec2:DeleteLaunchTemplateVersions]
-                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
-              # The fleet, from this launch template, into this stack's subnets
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${Arm64RunnerLaunchTemplate}"
+              # The fleet, from these launch templates, into this stack's subnets
               # and security group only. No iam:PassRole: there is no role.
               - Effect: Allow
                 Action: [ec2:CreateFleet, ec2:RunInstances]
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:fleet/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${Arm64RunnerLaunchTemplate}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet0}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet1}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet2}"
@@ -291,7 +346,9 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
                 Condition:
                   ArnEquals:
-                    ec2:LaunchTemplate: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                    ec2:LaunchTemplate:
+                      - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                      - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${Arm64RunnerLaunchTemplate}"
               - Effect: Allow
                 Action: ec2:CreateTags
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:*/*"
@@ -302,12 +359,42 @@ Resources:
               - Effect: Allow
                 Action: ssm:GetParameters
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/ami-amazon-linux-latest/*"
+              # Fargate: the two task definitions, in the stack's cluster only.
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: [!Ref RunnerTaskDefinition, !Ref Arm64RunnerTaskDefinition]
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              # The only role a task gets: its execution role (no task role).
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt RunnerExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Effect: Allow
+                Action: ecs:TagResource
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
+                Condition:
+                  StringEquals:
+                    ecs:CreateAction: RunTask
+              # The Fargate budgets count the cluster's tasks.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
 
   LauncherFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-launcher"
-      Description: Launches one CI runner instance per still-queued job from the queue.
+      Description: Launches one CI runner instance or task per still-queued job from the queue.
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt LauncherRole.Arn
@@ -322,10 +409,19 @@ Resources:
           RUNNER_GROUP: !Ref RunnerGroup
           STACK_NAME: !Ref AWS::StackName
           LAUNCH_TEMPLATE_ID: !Ref RunnerLaunchTemplate
+          ARM64_LAUNCH_TEMPLATE_ID: !Ref Arm64RunnerLaunchTemplate
           SUBNET_IDS: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
           QUEUE_URL: !Ref JobQueue
-          SPOT_CAP: !Ref SpotCap
-          ONDEMAND_CAP: !Ref OnDemandCap
+          SPOT_VCPU_CAP: !Ref SpotVcpuCap
+          ONDEMAND_VCPU_CAP: !Ref OnDemandVcpuCap
+          FARGATE_SPOT_VCPU_CAP: !Ref FargateSpotVcpuCap
+          FARGATE_VCPU_CAP: !Ref FargateVcpuCap
+          CLUSTER: !Ref RunnerCluster
+          TASK_DEFINITION: !Ref RunnerTaskDefinition
+          ARM64_TASK_DEFINITION: !Ref Arm64RunnerTaskDefinition
+          SECURITY_GROUP_ID: !Ref RunnerSecurityGroup
+          # In SUBNET_IDS' order: arm64 tasks skip a subnet in use1-az3.
+          SUBNET_AZ_IDS: !Join [",", [!GetAtt Subnet0.AvailabilityZoneId, !GetAtt Subnet1.AvailabilityZoneId, !GetAtt Subnet2.AvailabilityZoneId]]
       Code:
         ZipFile: |
           //@inline functions/launcher.js
@@ -379,12 +475,22 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
+              # The cluster's tasks: every one of them is the stack's.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              - Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
 
   SweeperFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-sweeper"
-      Description: Terminates CI runner instances over 2 hours old; removes offline runner registrations with no instance.
+      Description: Terminates CI runner instances and stops tasks over 2 hours old; removes offline runner registrations with neither.
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt SweeperRole.Arn
@@ -398,6 +504,7 @@ Resources:
           STACK_NAME: !Ref AWS::StackName
           GITHUB_ORG: !Ref GitHubOrg
           RUNNER_GROUP: !Ref RunnerGroup
+          CLUSTER: !Ref RunnerCluster
       Code:
         ZipFile: |
           //@inline functions/sweeper.js
@@ -451,12 +558,15 @@ Resources:
               - Effect: Allow
                 Action: ec2:DescribeInstances
                 Resource: "*"
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
 
   NotifierFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-notifier"
-      Description: Reports a Spot reclaim as a failed check run.
+      Description: Reports a Spot reclaim, of an instance or a task, as a failed check run.
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt NotifierRole.Arn
@@ -492,6 +602,32 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt NotifierRule.Arn
+
+  # A Fargate Spot reclaim: every change of the task from the warning on
+  # carries the stop code. ECS keeps a stopping or stopped task's tags in
+  # DescribeTasks (aws-emulator drops them), so every change can be read;
+  # the notifier reports one check run per job.
+  NotifierTaskRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-notifier-tasks"
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [!GetAtt RunnerCluster.Arn]
+          stopCode: [SpotInterruption]
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+
+  NotifierTaskRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NotifierTaskRule.Arn
 
   # --- network: a VPC of its own, public subnets, no NAT --------------------
   Vpc:
@@ -612,6 +748,212 @@ Resources:
             Tags:
               - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
 
+  # The arm64 counterpart, for the Graviton families: only the image differs.
+  Arm64RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-runner-arm64"
+      LaunchTemplateData:
+        # Resolved by EC2 at every launch: always the latest AL2023.
+        ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+        InstanceInitiatedShutdownBehavior: terminate
+        SecurityGroupIds: [!Ref RunnerSecurityGroup]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 50, VolumeType: gp3, DeleteOnTermination: true, Encrypted: true }
+        # IMDSv2 only, one hop: a job's containers can't reach the metadata service.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+              - { Key: Name, Value: !Sub "${AWS::StackName}-runner" }
+          - ResourceType: volume
+            Tags:
+              - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
+  # --- Fargate: the cluster and task definitions of the Fargate capacities --
+  # No Docker daemon (ADR-0001) and no task role: a job finds no AWS
+  # credentials, as on EC2. The launcher runs one task per job.
+  RunnerCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      Tags:
+        - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
+  # The runner's output (Listening for Jobs, Running job), per task.
+  RunnerTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-runner"
+      RetentionInDays: 7
+
+  # Used by ECS to start a task, never by the job: pull the image, write the log.
+  RunnerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-runner-exec"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-runner-exec"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The registry login supports no resource-level permissions.
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt ImageRepository.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt RunnerTaskLogGroup.Arn
+
+  # x64 and arm64 are two task definitions: RunTask can't override the platform.
+  RunnerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-runner"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # The 4-vCPU shape; each RunTask overrides cpu and memory for its size.
+      Cpu: "4096"
+      Memory: "16384"
+      EphemeralStorage: { SizeInGiB: 50 }
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt RunnerExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: runner
+          Image: !Sub "${ImageRepository.RepositoryUri}:latest"
+          Essential: true
+          # The image's idle exit; the launcher's command is ./run.sh --jitconfig.
+          EntryPoint: [/usr/local/bin/ci-runner-idle-exit]
+          Command: [./run.sh]
+          LinuxParameters: { InitProcessEnabled: true }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RunnerTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: runner
+      Tags:
+        - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
+  # The arm64 counterpart: only the architecture differs.
+  Arm64RunnerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-runner-arm64"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # The 4-vCPU shape; each RunTask overrides cpu and memory for its size.
+      Cpu: "4096"
+      Memory: "16384"
+      EphemeralStorage: { SizeInGiB: 50 }
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: ARM64 }
+      ExecutionRoleArn: !GetAtt RunnerExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: runner
+          Image: !Sub "${ImageRepository.RepositoryUri}:latest"
+          Essential: true
+          # The image's idle exit; the launcher's command is ./run.sh --jitconfig.
+          EntryPoint: [/usr/local/bin/ci-runner-idle-exit]
+          Command: [./run.sh]
+          LinuxParameters: { InitProcessEnabled: true }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RunnerTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: runner
+      Tags:
+        - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
+  # --- image: the runner image in ECR, pushed by image.yml on main ----------
+  # Fargate lazy-loads only from private ECR (ADR-0002). image.yml assumes
+  # the push role through GitHub OIDC: no stored key or token anywhere.
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  ImagePushRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-image-push"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Only image.yml on this repo's main (a push, the schedule or a
+          # dispatch there). Any other branch, a pull request, a tag or
+          # another repo has a different sub.
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            # zeroae/ci-runner uses GitHub's immutable subject, so its token's
+            # sub names the owner and repo by id (owner 11018406, repo
+            # 1455021495), not by name. A rename or a re-created repo with the
+            # same name doesn't match. Read it with
+            # `gh api repos/zeroae/ci-runner/actions/oidc/customization/sub`.
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:zeroae@11018406/ci-runner@1455021495:ref:refs/heads/main
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-image-push"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The registry login supports no resource-level permissions.
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              # Push, and read back what it pushed, on this repo only.
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt ImageRepository.Arn
+
+  # Each build tags one image index (:latest and :<date>-<sha>), and the
+  # rule keeps the last 4 of those. It counts only tagged images: the index's
+  # children (each architecture's manifest and SOCI index) are untagged, and
+  # an untagged rule could expire the children of an index still in use.
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AWS::StackName
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [{"rulePriority": 1, "description": "keep the last 4 builds",
+            "selection": {"tagStatus": "tagged", "tagPatternList": ["*"], "countType": "imageCountMoreThan", "countNumber": 4},
+            "action": {"type": "expire"}}]}
+
 Outputs:
   SetupUrl:
     Description: Open in a browser to create the GitHub App (refuses everything once done).
@@ -622,6 +964,8 @@ Outputs:
     Value: !Ref AppSecret
   LaunchTemplateId:
     Value: !Ref RunnerLaunchTemplate
+  Arm64LaunchTemplateId:
+    Value: !Ref Arm64RunnerLaunchTemplate
   SubnetIds:
     Value: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
   SecurityGroupId:
@@ -630,3 +974,15 @@ Outputs:
     Value: !Ref JobQueue
   JobDeadLetterQueueUrl:
     Value: !Ref JobDeadLetterQueue
+  ImageRepositoryUri:
+    Description: The repo variable ECR_IMAGE, which image.yml pushes to on main.
+    Value: !GetAtt ImageRepository.RepositoryUri
+  ImagePushRoleArn:
+    Description: The repo variable AWS_IMAGE_PUSH_ROLE_ARN, which image.yml assumes on main.
+    Value: !GetAtt ImagePushRole.Arn
+  ClusterName:
+    Value: !Ref RunnerCluster
+  TaskDefinitionArn:
+    Value: !Ref RunnerTaskDefinition
+  Arm64TaskDefinitionArn:
+    Value: !Ref Arm64RunnerTaskDefinition

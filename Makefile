@@ -1,8 +1,10 @@
 STACK   ?= ci-runner
-PROFILE ?= zeroae-code/AWSPowerUserAccess
+PROFILE ?= zeroae-code/ZAEPowerUserAccess
 REGION  ?= us-east-1
 ORG     ?= zeroae
 AWS      = aws --profile $(PROFILE) --region $(REGION)
+# The deploy bucket, made outside the stack (docs/runbook.md). Looked up only when used.
+BUCKET  ?= $(STACK)-deploy-$(shell $(AWS) sts get-caller-identity --query Account --output text)
 
 .PHONY: help test build validate deploy outputs hand-launch runners sweep canary-runs
 .DEFAULT_GOAL := help
@@ -17,12 +19,14 @@ test: ## Run the unit tests (node --test, no npm deps)
 build: ## Inline functions/*.js into build/template.yaml and report its size
 	node scripts/build-template.js
 
-validate: build ## Ask CloudFormation to validate the built template
-	$(AWS) cloudformation validate-template --template-body file://build/template.yaml >/dev/null && echo valid
+validate: build ## Ask CloudFormation to validate the built template (through the deploy bucket)
+	$(AWS) s3 cp --only-show-errors build/template.yaml s3://$(BUCKET)/$(STACK)/validate.yaml
+	$(AWS) cloudformation validate-template \
+	  --template-url https://$(BUCKET).s3.$(REGION).amazonaws.com/$(STACK)/validate.yaml >/dev/null && echo valid
 
-deploy: test build ## Create or update the stack ($(STACK)) from one command
+deploy: test build ## Create or update the stack ($(STACK)) through the deploy bucket
 	$(AWS) cloudformation deploy --stack-name $(STACK) \
-	  --template-file build/template.yaml \
+	  --template-file build/template.yaml --s3-bucket $(BUCKET) --s3-prefix $(STACK) \
 	  --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
 	@$(MAKE) --no-print-directory outputs
 
@@ -30,8 +34,8 @@ outputs: ## Print the stack's outputs (setup URL, webhook URL, secret ARN)
 	@$(AWS) cloudformation describe-stacks --stack-name $(STACK) \
 	  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text
 
-hand-launch: ## Launch one CI runner by hand for one ci-spot job (needs gh with admin:org)
-	STACK=$(STACK) PROFILE=$(PROFILE) REGION=$(REGION) scripts/hand-launch.sh
+hand-launch: ## Launch one EC2 CI runner by hand of shape CAPACITY (ci-spot or ci-ondemand), SIZE and ARCH, all required, e.g. CAPACITY=ci-spot SIZE=ci-cpu-4 ARCH=x64 (needs gh with admin:org)
+	STACK=$(STACK) PROFILE=$(PROFILE) REGION=$(REGION) CAPACITY=$(CAPACITY) SIZE=$(SIZE) ARCH=$(ARCH) scripts/hand-launch.sh
 
 runners: ## List the stack's CI runner instances that are not terminated
 	@$(AWS) ec2 describe-instances \
@@ -39,7 +43,7 @@ runners: ## List the stack's CI runner instances that are not terminated
 	    Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
 	  --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,LaunchTime]' --output text
 
-sweep: ## Run the sweeper now, and print what it terminated and removed
+sweep: ## Run the sweeper now, and print what it terminated, stopped and removed
 	@$(AWS) lambda invoke --function-name $(STACK)-sweeper /dev/stdout --query FunctionError --output text
 
 canary-runs: ## List the canary repo's recent workflow runs (CI_RUNNER_CANARY_REPO, from .env)
