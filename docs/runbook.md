@@ -5,10 +5,14 @@ Lambdas are in [stack.md](stack.md), and the design is in
 [the spec](superpowers/specs/2026-11-12-ci-runner-design.md).
 
 Everything runs in `zeroae-code` / `us-east-1`, under the SSO profile
-`zeroae-code/AWSPowerUserAccess`. The commands below use:
+`zeroae-code/ZAEPowerUserAccess` (`make deploy`'s default `PROFILE`). Unlike
+`AWSPowerUserAccess`, it allows `iam:UpdateAssumeRolePolicy`, which a change
+to a role's trust needs. Its roles must be named `PowerUserPB*`, with the
+boundary `arn:aws:iam::aws:policy/PowerUserAccess` (the stack's) or
+`ZAEPowerUserBoundary`. The commands below use:
 
 ```bash
-AWS="aws --profile zeroae-code/AWSPowerUserAccess --region us-east-1"
+AWS="aws --profile zeroae-code/ZAEPowerUserAccess --region us-east-1"
 ```
 
 You need `aws`, `gh`, `jq`, `curl` and `node`. For anything that touches the
@@ -48,8 +52,12 @@ make outputs     # SetupUrl, WebhookUrl, AppSecretArn, LaunchTemplateId, SubnetI
 The first run creates the stack `ci-runner`, and later runs update it. A run
 with no changes does nothing. `make deploy` never passes parameters, so a new
 stack takes the defaults (`SpotVcpuCap` 24, `OnDemandVcpuCap` 8, `AppName`
-`zeroae-ci-runner`, `RunnerGroup` `ci-runner`, `LogRetentionDays` 30), and an
-existing stack keeps whatever values it already has.
+`zeroae-ci-runner`, `RunnerGroup` `ci-runner`, `LogRetentionDays` 30,
+`ExistingOidcProviderArn` empty), and an existing stack keeps whatever values
+it already has. In `zeroae-code` GitHub's OIDC provider already exists, so
+the first deploy that adds the image push must pass its ARN (see "Push the
+image to ECR"); an empty value would try to create a second provider for the
+same URL, and fail.
 
 To change a parameter, build, then deploy with an override:
 
@@ -78,6 +86,56 @@ numbers").
 
 The built template must stay under 1 MB, the S3 deploy's limit (`make build`
 prints its size and fails at the limit).
+
+## Push the image to ECR
+
+`image.yml` pushes the runner image, with a SOCI v2 index, to the stack's
+ECR repo on every `main` build (see "The runner image in ECR" in
+[stack.md](stack.md)). There is nothing to rotate: the push assumes
+`PowerUserPB-ci-runner-image-push` through GitHub OIDC, and no AWS key or
+GitHub token is stored anywhere. Set it up once:
+
+1. Deploy with the account's existing GitHub provider. In `zeroae-code` it
+   is owned by another stack (see the traps table):
+
+   ```bash
+   OIDC=$($AWS iam list-open-id-connect-providers --output text \
+     --query "OpenIDConnectProviderList[?ends_with(Arn, '/token.actions.githubusercontent.com')].Arn")
+   echo "$OIDC"     # arn:aws:iam::<account id>:oidc-provider/token.actions.githubusercontent.com
+   make build
+   $AWS cloudformation deploy --stack-name ci-runner \
+     --template-file build/template.yaml --s3-bucket "$B" --s3-prefix ci-runner \
+     --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
+     --parameter-overrides ExistingOidcProviderArn="$OIDC"
+   ```
+
+   The override sticks, so later `make deploy`s keep it. In an account with
+   no provider, leave it empty and the stack creates one.
+2. Give `image.yml` the stack's outputs as repo variables:
+
+   ```bash
+   out() { $AWS cloudformation describe-stacks --stack-name ci-runner \
+     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+   gh variable set ECR_IMAGE --repo zeroae/ci-runner --body "$(out ImageRepositoryUri)"
+   gh variable set AWS_IMAGE_PUSH_ROLE_ARN --repo zeroae/ci-runner --body "$(out ImagePushRoleArn)"
+   ```
+
+   Until both are set, a `main` build skips the ECR push and publishes only
+   to GHCR.
+3. Run a `main` build (`gh workflow run image.yml --repo zeroae/ci-runner --ref main`),
+   then check that `:latest` is an index with both architectures and a SOCI
+   index for each:
+
+   ```bash
+   $AWS ecr batch-get-image --repository-name ci-runner --image-ids imageTag=latest \
+     --accepted-media-types application/vnd.oci.image.index.v1+json \
+     --query 'images[0].imageManifest' --output text \
+     | jq '[.manifests[] | {artifactType, arch: .platform.architecture}]'
+   ```
+
+   It should list `amd64` and `arm64` twice each: once with no
+   `artifactType` (the image) and once with
+   `application/vnd.amazon.soci.index.v2+json`.
 
 ## Create the App and the runner group (the wizard)
 
@@ -344,7 +402,7 @@ types.
   The Fargate budgets aren't in the stack yet; their rows are for when the
   Fargate capacities land.
 
-- **Template size:** 50,301 bytes, 5% of the S3 deploy's 1 MB limit. It's
+- **Template size:** 54,208 bytes, 5% of the S3 deploy's 1 MB limit. It's
   already over the 51,200 bytes a template can be sent inline, so it deploys
   only through the deploy bucket.
 
@@ -371,3 +429,8 @@ types.
 | After re-registering, every delivery gets 401, or the launcher still can't get a token | a warm webhook or launcher still holds the old App's secret or key; restart both (step 5 of "Re-register the App") |
 | After an update, the App's key is gone from the secret | the template's `GenerateSecretString` changed, so CloudFormation generated a new value. Never edit it; re-register the App |
 | A deploy job moved to our runners can't assume its AWS role | the role's trust policy pins `runner_environment: github-hosted`; drop that condition |
+| A deploy fails creating `GitHubOidcProvider`: the provider already exists | the account already has GitHub's OIDC provider, and an account holds one per URL. Deploy with `ExistingOidcProviderArn=<its ARN>` (see "Push the image to ECR") |
+| `image.yml`'s ECR push fails `Not authorized to perform sts:AssumeRoleWithWebIdentity`, after it worked before | in `zeroae-code`, GitHub's OIDC provider is the resource `GitHubOIDCProvider` of the stack **`zael-github-e2e`**, not ours. If that stack was deleted, the provider went with it. Create the provider again once with `zeroae-code/ZAEFederation` (outside any stack; `ZAEPowerUserAccess` can't), then deploy with its ARN as `ExistingOidcProviderArn`. Asking that stack to retain the provider (`DeletionPolicy: Retain`) avoids this |
+| `image.yml`'s ECR push fails `Not authorized to perform sts:AssumeRoleWithWebIdentity` on a branch, tag or pull request | by design: the push role trusts only `repo:zeroae/ci-runner:ref:refs/heads/main`. Branch runs push only to the job's local registry |
+| `image.yml` on `main` publishes to GHCR but skips both ECR steps | the repo variables `AWS_IMAGE_PUSH_ROLE_ARN` and `ECR_IMAGE` aren't set; set them from the stack's outputs (see "Push the image to ECR") |
+| A deploy fails updating `ImagePushRole`'s trust with an access-denied `iam:UpdateAssumeRolePolicy` | it was deployed under `AWSPowerUserAccess`, which lacks that action; deploy under `zeroae-code/ZAEPowerUserAccess`, the default `PROFILE` |
