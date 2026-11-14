@@ -424,8 +424,9 @@ test('a ci-fargate-spot job runs one Fargate Spot task with the runner as its co
   const [c] = input.overrides.containerOverrides;
   assert.equal(c.name, 'runner');
   assert.deepEqual(c.command, ['./run.sh', '--jitconfig', JIT]);
-  // nproc over-reports on Fargate: the job's tools get the task's vCPUs.
-  assert.deepEqual(envOf(input), { CARGO_BUILD_JOBS: '4', CMAKE_BUILD_PARALLEL_LEVEL: '4', MAKEFLAGS: '-j4' });
+  // nproc over-reports on Fargate: the job's tools get the task's vCPUs, but
+  // in no CARGO*/CMAKE* variable, which Swatinem/rust-cache hashes into its key.
+  assert.deepEqual(envOf(input), { CI_RUNNER_VCPUS: '4', MAKEFLAGS: '-j4' });
   assert.deepEqual(taskTags(input), {
     'ci-runner:stack': 'ci-runner',
     'ci-runner:runner': 'ci-runner-20261112120000-555', 'ci-runner:runner-id': '77', 'ci-runner:label': 'ci-fargate-spot',
@@ -452,7 +453,7 @@ test('each Fargate capacity, size and architecture: its capacity provider, task 
         assert.deepEqual(input.capacityProviderStrategy, [{ capacityProvider: provider, weight: 1 }], what);
         assert.equal(input.taskDefinition, td, what);
         assert.deepEqual([input.overrides.cpu, input.overrides.memory], [String(vcpus * 1024), mem[vcpus]], what);
-        assert.deepEqual(envOf(input), { CARGO_BUILD_JOBS: `${vcpus}`, CMAKE_BUILD_PARALLEL_LEVEL: `${vcpus}`, MAKEFLAGS: `-j${vcpus}` }, what);
+        assert.deepEqual(envOf(input), { CI_RUNNER_VCPUS: `${vcpus}`, MAKEFLAGS: `-j${vcpus}` }, what);
         const t = taskTags(input);
         assert.deepEqual([t['ci-runner:capacity'], t['ci-runner:vcpus'], t['ci-runner:arch']], [label, String(vcpus), arch], what);
       }

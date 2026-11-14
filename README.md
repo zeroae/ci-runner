@@ -128,10 +128,10 @@ each built and smoke-tested on its own native runner.
   Fargate wins for short jobs, and is even at about 4 minutes; for builds
   much longer than that, EC2 is faster (the runbook's "Measured numbers").
 - **`nproc` over-reports.** Inside a task, `nproc` can show twice the task's
-  vCPUs. The job's environment caps the usual knobs at the task's vCPUs:
-  `CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and `MAKEFLAGS=-j<n>`. A
-  tool that sizes itself by `nproc` some other way should be given `-j` from
-  one of them.
+  vCPUs. The runner caps cargo's jobs at the task's vCPUs (in
+  `~/.cargo/config.toml`, so `Swatinem/rust-cache` shares its cache with EC2)
+  and sets `MAKEFLAGS=-j<n>` and `CI_RUNNER_VCPUS=<n>`. A tool that sizes
+  itself by `nproc` some other way should be given `-j$CI_RUNNER_VCPUS`.
 
 `/tmp`, `$HOME` and `_work` are the container's own paths on its 50 GB disk.
 

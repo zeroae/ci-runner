@@ -394,9 +394,23 @@ task fails the message with `no task launched: <reason>: <detail>`.
 **The environment.** Inside a task, `nproc` can report the host's CPUs (8
 on a 4-vCPU task in 3 of the spike's 4 tasks) and there is no cgroup
 `cpu.max`, so tools that size their parallelism by it oversubscribe. The
-container override sets `CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and
-`MAKEFLAGS=-j<n>` to the task's vCPUs; the runner's environment reaches every
-step. `IDLE_SECONDS` is passed on too, when the launcher has it (a test).
+container override sets `MAKEFLAGS=-j<n>` (which also reaches CMake's Makefile
+generator) and `CI_RUNNER_VCPUS=<n>` to the task's vCPUs; the runner's
+environment reaches every step. From `CI_RUNNER_VCPUS` the image's entrypoint
+writes `/home/runner/.cargo/config.toml` with `[build] jobs = <n>` (an existing
+file is left alone, and logged). Cargo reads `.cargo/config.toml` from every
+ancestor of its working directory, so it applies to every checkout under
+`/home/runner/_work`, whatever `CARGO_HOME` a job sets.
+
+No `CARGO_*` or `CMAKE_*` variable is set, on purpose: `Swatinem/rust-cache`
+hashes every variable starting `CARGO`, `CC`, `CFLAGS`, `CXX`, `CMAKE` or
+`RUST` into its cache key
+([`src/config.ts`](https://github.com/Swatinem/rust-cache/blob/c8037a86dde8214a8310e9f54a8fc61ab362aa31/src/config.ts#L111)),
+so a `CARGO_BUILD_JOBS` (as the first version set) gave Fargate jobs their own
+key, and they never hit the cache an EC2 job saved. Its hash of
+`.cargo/config.toml` files looks only inside the workspace, so the home one
+doesn't change the key. `IDLE_SECONDS` is passed on too, when the launcher has
+it (a test).
 
 **The idle exit.** `image/ci-runner-idle-exit` runs its arguments in their own
 session, copying their output to a file, and stops them if that output has no

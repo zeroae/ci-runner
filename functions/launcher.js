@@ -132,8 +132,11 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     const azs = env.SUBNET_AZ_IDS.split(',');
     // Inside a task nproc can report the host's CPUs, not the task's, so
     // tools that size their parallelism from it get the task's vCPUs here.
-    // The runner's environment reaches every step.
-    const environment = [['CARGO_BUILD_JOBS', vcpus], ['CMAKE_BUILD_PARALLEL_LEVEL', vcpus], ['MAKEFLAGS', `-j${vcpus}`],
+    // The runner's environment reaches every step. No CARGO* or CMAKE*
+    // variable: Swatinem/rust-cache hashes them into its key, and a Fargate
+    // job would miss the cache an EC2 job saved. The image's entrypoint turns
+    // CI_RUNNER_VCPUS into cargo's jobs in ~/.cargo/config.toml instead.
+    const environment = [['CI_RUNNER_VCPUS', vcpus], ['MAKEFLAGS', `-j${vcpus}`],
       ...(env.IDLE_SECONDS ? [['IDLE_SECONDS', env.IDLE_SECONDS]] : [])].map(([n, v]) => ({ name: n, value: String(v) }));
     const r = await ecs.runTask({
       cluster: env.CLUSTER, count: 1,
