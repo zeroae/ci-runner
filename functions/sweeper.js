@@ -1,11 +1,13 @@
 'use strict';
 // sweeper: scheduled. Terminates the stack's CI runner instances and stops
 // the cluster's tasks older than MAX_AGE, and removes the runner group's
-// registrations that are offline and have no instance or task. Inlined into the template by scripts/build-template.js;
-// keep it one dependency-free CommonJS file.
+// registrations that are offline and have no instance or task. Inlined into
+// the template by scripts/build-template.js; keep it one dependency-free
+// CommonJS file.
 const crypto = require('node:crypto');
 
 const MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const MAX_AGE = `${MAX_AGE_MS / 3600e3} hours`;
 const STACK_TAG = 'ci-runner:stack';
 // The launcher tags each instance with its runner's name (and, when it has
 // it, the runner's id); that is how a registration finds its instance.
@@ -64,7 +66,7 @@ function createHandler({ ec2, ecs, secret, fetch, now, env, log = console.log })
   async function sweepTasks(tasks) {
     const strays = tasks.filter((t) => now() - new Date(t.createdAt).getTime() > MAX_AGE_MS).map((t) => t.taskArn);
     for (const task of strays) {
-      await ecs.stopTask({ cluster: env.CLUSTER, task, reason: 'ci-runner sweeper: launched over 2 hours ago' });
+      await ecs.stopTask({ cluster: env.CLUSTER, task, reason: `ci-runner sweeper: launched over ${MAX_AGE} ago` });
       log(`sweeper: stopped ${task}`);
     }
     return strays;
