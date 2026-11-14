@@ -9,7 +9,8 @@ const { renderCloudConfig } = require('./cloud-config.js');
 const API = 'https://api.github.com';
 // A size label's vCPUs -> the instance size, at 4 GB per vCPU, per family.
 const SIZES = { 2: 'large', 4: 'xlarge', 8: '2xlarge', 16: '4xlarge' };
-const FAMILIES = { x64: ['m7i', 'm6i', 'm6a', 'm7a'] };
+// An architecture -> its families, offered at every size in the stack's AZs.
+const FAMILIES = { x64: ['m7i', 'm6i', 'm6a', 'm7a'], arm64: ['m7g', 'm6g', 'm8g'] };
 const CAPACITY = { 'ci-spot': 'spot', 'ci-ondemand': 'on-demand' };
 
 const b64u = (s) => Buffer.from(s).toString('base64url');
@@ -98,7 +99,9 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
   }
 
   async function launchInstance(m, name, runnerId, jitConfig) {
-    const lt = env.LAUNCH_TEMPLATE_ID;
+    const { vcpus, arch } = shapeOf(m);
+    // Each architecture has its own launch template, for its own AL2023 image.
+    const lt = arch === 'arm64' ? env.ARM64_LAUNCH_TEMPLATE_ID : env.LAUNCH_TEMPLATE_ID;
     const userData = renderCloudConfig({ jitConfig, ...(env.IDLE_SECONDS ? { idleSeconds: Number(env.IDLE_SECONDS) } : {}) });
     // CreateFleet can't override user-data: a version per launch carries it.
     const v = await ec2.createLaunchTemplateVersion({
@@ -107,7 +110,6 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     });
     const version = String(v.LaunchTemplateVersion.VersionNumber);
     const type = CAPACITY[m.label];
-    const { vcpus, arch } = shapeOf(m);
     const tag = (Key, Value) => ({ Key, Value: String(Value).slice(0, 256) });
     try {
       const fleet = await ec2.createFleet({

@@ -82,19 +82,27 @@ region's first three AZs (`MapPublicIpOnLaunch`), one route table with a
 default route to an internet gateway, no NAT, no flow logs, no endpoints. The
 security group `RunnerSecurityGroup` has no inbound rules.
 
-`RunnerLaunchTemplate` holds everything a CI runner instance shares: the AL2023
-image through `resolve:ssm:` (resolved at each launch), 50 GB encrypted gp3
+`RunnerLaunchTemplate` (x64) and `Arm64RunnerLaunchTemplate` (arm64) hold
+everything a CI runner instance shares, and differ only in the image: the AL2023
+image for the architecture through `resolve:ssm:` (resolved at each launch:
+`al2023-ami-kernel-default-x86_64` or `al2023-ami-kernel-default-arm64`), 50 GB encrypted gp3
 deleted on termination, IMDSv2 required with hop limit 1, shutdown behaviour
 `terminate`, the tag `ci-runner:stack=<stack>` on instance and volume. It has
 **no instance profile, no instance type and no user-data**.
 
-A launch is an EC2 Fleet of type `instant` for one instance: overrides for
-`m7i`/`m6i`/`m6a`/`m7a` at the job's size (`.large`, `.xlarge`, `.2xlarge` or
+A launch is an EC2 Fleet of type `instant` for one instance, from the job's
+architecture's launch template: overrides for `m7i`/`m6i`/`m6a`/`m7a` (x64) or
+`m7g`/`m6g`/`m8g` (arm64) at the job's size (`.large`, `.xlarge`, `.2xlarge` or
 `.4xlarge` for 2, 4, 8 or 16 vCPUs) in each of the three subnets, Spot
-`capacity-optimized` for `ci-spot`. `CreateFleet` can't override user-data, so
+`capacity-optimized` for `ci-spot`. Every family is offered at every size in
+all three of the stack's AZs (`use1-az1`, `use1-az2`, `use1-az4`; checked
+2026-11-13 with `aws ec2 describe-instance-type-offerings --location-type
+availability-zone`), so no family/AZ pair is left out. Check again before
+adding a family or moving the subnets. `CreateFleet` can't override user-data, so
 each launch first adds a launch template version (source `$Default`, only
 `UserData`), launches from it, and deletes that version again. The outputs
-`LaunchTemplateId`, `SubnetIds` and `SecurityGroupId` are what a launch needs.
+`LaunchTemplateId`, `Arm64LaunchTemplateId`, `SubnetIds` and `SecurityGroupId`
+are what a launch needs.
 
 ## The instance's user-data
 
@@ -127,8 +135,9 @@ sweeper (or GitHub, for ephemeral runners) removes it.
 `ci-runner` group with labels `self-hosted`, `ci-spot`, `SIZE` (default
 `ci-cpu-4`) and `ARCH` (default `x64`) through the owner's `gh`, which needs
 `admin:org`. It then renders the user-data and launches one Spot instance of
-that size as above, tagged with its shape (`make hand-launch SIZE=ci-cpu-8`
-launches a `.2xlarge`). It prints the instance id. `IDLE_SECONDS=120` shortens the
+that size and architecture as above, tagged with its shape (`make hand-launch
+SIZE=ci-cpu-8` launches a `.2xlarge`; `ARCH=arm64` a Graviton from the arm64
+launch template). It prints the instance id. `IDLE_SECONDS=120` shortens the
 idle exit for a test. `make runners` lists the stack's instances that are not
 terminated.
 
@@ -183,13 +192,13 @@ App's webhook points at), for each delivery:
 4. Ignores (`200`) actions other than `queued`, and jobs outside the label
    contract (case-insensitive): `self-hosted`, exactly one of
    `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`, `-4`, `-8`,
-   `-16`), at most one `x64`, and optionally `linux`. `arm64` and an unknown
-   `ci-cpu-*` are outside it. A missing size or architecture label defaults to
+   `-16`), at most one of `x64`/`arm64`, and optionally `linux`. An unknown
+   `ci-cpu-*`, or both `x64` and `arm64`, are outside it. A missing size or architecture label defaults to
    `ci-cpu-4` and `x64`: this is the expand step, and the defaults go once
    every repo names its shape.
 5. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
    labels, installation_id}` (`label` is the capacity label, lower case;
-   `vcpus` is 2, 4, 8 or 16; `arch` is `x64`) and answers `202`.
+   `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
 
 Its role allows only `GetSecretValue` on the secret and `SendMessage` on the
 queue.
@@ -225,7 +234,8 @@ failures per message), for each job:
    `${stack}-<UTC YYYYmmddHHMMSS>-<job id>`, as the sweeper requires.
 6. Renders the `#cloud-config` and launches one instance as in "Launching one
    by hand": Spot `capacity-optimized` for `ci-spot`, On-Demand `lowest-price`
-   for `ci-ondemand`, at the job's size. Tags: `ci-runner:runner`,
+   for `ci-ondemand`, at the job's size, from the launch template and the
+   families of the job's architecture. Tags: `ci-runner:runner`,
    `ci-runner:runner-id`, `ci-runner:label`, `ci-runner:repo`,
    `ci-runner:job-id`, `ci-runner:run-id`, `ci-runner:head-sha`,
    `ci-runner:job-name`, and the shape: `ci-runner:capacity` (the capacity
@@ -244,8 +254,8 @@ overridden, so after lowering a budget for a test, restore it explicitly
 
 The launcher's role allows `GetSecretValue`, the queue's receive, delete and
 send, `ec2:DescribeInstances` (for the budgets),
-`Create`/`DeleteLaunchTemplateVersions` on the launch template, and
-`CreateFleet`/`RunInstances` pinned to the launch template, the three subnets
+`Create`/`DeleteLaunchTemplateVersions` on the two launch templates, and
+`CreateFleet`/`RunInstances` pinned to the two launch templates, the three subnets
 and the security group. It also allows `CreateTags` only while creating
 (`ec2:CreateAction`), and `ssm:GetParameters` on the public AL2023 parameters,
 which the launch template's `resolve:ssm:` image needs. It has no

@@ -7,8 +7,7 @@ const crypto = require('node:crypto');
 
 const CAPACITY = ['ci-spot', 'ci-ondemand'];
 const SIZE = { 'ci-cpu-2': 2, 'ci-cpu-4': 4, 'ci-cpu-8': 8, 'ci-cpu-16': 16 };
-// arm64 is not served yet; it comes with the arm64 launch template.
-const ARCH = ['x64'];
+const ARCH = ['x64', 'arm64'];
 
 function reply(statusCode, text) {
   return { statusCode, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: text + '\n' };
