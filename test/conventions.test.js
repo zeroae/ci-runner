@@ -17,7 +17,8 @@ const resources = template.split(/^Resources:$/m)[1].split(/^\w/m)[0]
   .map((b) => ({ name: b.match(/^ {2}(\w+):/)[1], type: b.match(/Type: (\S+)/)[1], body: b }));
 
 test('every IAM role and policy is PowerUserPB-${AWS::StackName}-*, and every role has the boundary', () => {
-  const iam = resources.filter((r) => r.type.startsWith('AWS::IAM::'));
+  // GitHub's OIDC provider is named by its URL, and has no policy.
+  const iam = resources.filter((r) => r.type.startsWith('AWS::IAM::') && r.type !== 'AWS::IAM::OIDCProvider');
   assert.ok(iam.length > 0);
   for (const r of iam) {
     assert.match(r.type, /^AWS::IAM::(Role|ManagedPolicy)$/, `${r.name}: inline the policy in its role instead`);

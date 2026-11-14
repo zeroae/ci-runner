@@ -289,3 +289,54 @@ bytes than the copies. `test/conventions.test.js` fails if the copies differ,
 so change all three at once.
 
 Its role allows `GetSecretValue` on the secret and `ec2:DescribeInstances`.
+
+## The runner image in ECR
+
+Fargate lazy-loads an image only from private ECR, through a SOCI index
+(ADR-0002), so `image.yml` pushes the image to the stack's own ECR repo as
+well as to GHCR. EC2 runners keep pulling `ghcr.io/zeroae/ci-runner:latest`:
+an instance has no instance profile, so it can't pull from private ECR.
+
+- **`ImageRepository`**, named after the stack (`ci-runner`). Its lifecycle
+  rule keeps the last 4 **tagged** images. Each build tags one image index,
+  under `:latest` and `:<date>-<sha>`, so that's the last 4 builds. The
+  index's children (each architecture's image manifest and SOCI index) are
+  untagged, and no rule touches them: an untagged rule could expire the
+  children of an index still in use. `EmptyOnDelete` lets a stack delete
+  remove it, images and all.
+- **`GitHubOidcProvider`**, GitHub's OIDC provider, created only when the
+  `ExistingOidcProviderArn` parameter is empty (the `CreateProvider`
+  condition; the pattern is zeroae/foresight's `github-deploy-zae`). An
+  account holds one provider per URL, so in an account that already has one,
+  pass its ARN instead.
+- **`ImagePushRole`**, `PowerUserPB-${stack}-image-push`, trusted only for
+  `sts:AssumeRoleWithWebIdentity` from that provider with `aud`
+  `sts.amazonaws.com` and `sub` exactly
+  `repo:zeroae/ci-runner:ref:refs/heads/main`. Any other branch, a pull
+  request, a tag or another repo carries a different `sub`, and can't assume
+  it. It allows `ecr:GetAuthorizationToken` (which has no resource-level
+  permissions) and, on the repo only, the layer upload calls, `PutImage`,
+  `BatchGetImage` and `GetDownloadUrlForLayer`.
+
+The outputs `ImageRepositoryUri` and `ImagePushRoleArn` are the repo
+variables `ECR_IMAGE` and `AWS_IMAGE_PUSH_ROLE_ARN` that `image.yml` reads.
+There is nothing to rotate: the push uses a short-lived OIDC token, and no
+AWS key or GitHub token is stored anywhere.
+
+`image.yml`'s `soci` job, on every branch:
+
+1. downloads each architecture's build as an OCI layout and merges both into
+   one OCI image index, each manifest with the platform its config names;
+2. runs `soci convert --standalone --all-platforms` (the `soci` CLI from
+   awslabs/soci-snapshotter, release `SOCI_VERSION`, sha256-checked). It
+   needs no containerd. The result is a SOCI-enabled image (SOCI index
+   manifest v2): an index holding both image manifests and a SOCI index
+   (`artifactType: application/vnd.amazon.soci.index.v2+json`) for each, and
+   the job fails unless both are there;
+3. pushes it with `skopeo copy --all --preserve-digests` to a local
+   `registry:3` service and reads it back, so a branch exercises the push.
+
+On `main`, with both variables set, it then assumes the push role and
+pushes the same index to ECR under `:<date>-<sha>` and `:latest`. Without
+the variables (before the stack has the repo) those two steps are skipped
+and the GHCR publish is unaffected.
