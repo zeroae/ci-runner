@@ -8,10 +8,12 @@ const SECRET = 'whsec-test';
 
 // instances: what DescribeInstances knows, as { InstanceId, Tags: { key: value } }.
 // The fake applies the tag filters the way EC2 does.
-function setup({ secretValue = { webhook_secret: SECRET }, instances = [] } = {}) {
+// tasks: the cluster's tasks, as { taskArn, desiredStatus, tags: { key: value } }.
+function setup({ secretValue = { webhook_secret: SECRET }, instances = [], tasks = [] } = {}) {
   const sent = [];
   const described = [];
   const tagged = [];
+  const taskTagged = [];
   const logs = [];
   let reads = 0;
   const handler = createHandler({
@@ -29,10 +31,27 @@ function setup({ secretValue = { webhook_secret: SECRET }, instances = [] } = {}
       },
       createTags: async (input) => { tagged.push(input); },
     },
-    env: { GITHUB_ORG: 'zeroae', STACK_NAME: 'ci-runner' },
+    ecs: {
+      listTasks: async (input) => {
+        described.push(input);
+        assert.equal(input.cluster, 'ci-runner');
+        return { taskArns: tasks.filter((t) => t.desiredStatus === (input.desiredStatus || 'RUNNING')).map((t) => t.taskArn) };
+      },
+      describeTasks: async (input) => {
+        assert.deepEqual([input.cluster, input.include], ['ci-runner', ['TAGS']]);
+        return {
+          tasks: tasks.filter((t) => input.tasks.includes(t.taskArn)).map((t) => ({
+            taskArn: t.taskArn, desiredStatus: t.desiredStatus, lastStatus: 'RUNNING',
+            tags: Object.entries(t.tags).map(([key, value]) => ({ key, value })),
+          })),
+        };
+      },
+      tagResource: async (input) => { taskTagged.push(input); return {}; },
+    },
+    env: { GITHUB_ORG: 'zeroae', STACK_NAME: 'ci-runner', CLUSTER: 'ci-runner' },
     log: (line) => logs.push(JSON.parse(line)),
   });
-  return { handler, sent, described, tagged, logs, reads: () => reads };
+  return { handler, sent, described, tagged, taskTagged, logs, reads: () => reads };
 }
 
 // A workflow_job payload as GitHub sends it (only the fields that matter).
@@ -333,4 +352,64 @@ test('a Fargate job follows the same contract: no default size or architecture, 
     assert.equal((await handler(delivery(job({ labels })))).statusCode, 200, labels.join(','));
     assert.equal(sent.length, 0);
   }
+});
+
+// A runner the launcher started on Fargate Spot for job 999, and its task. ECS
+// refuses commas and brackets in a tag: the labels are space-joined and the
+// job name's brackets and commas are `_`.
+const TASK_ARN = 'arn:aws:ecs:us-east-1:123456789012:task/ci-runner/0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+const fargateTask = (tags = {}, desiredStatus = 'RUNNING') => ({
+  taskArn: TASK_ARN, desiredStatus,
+  tags: {
+    ...instance().Tags, 'ci-runner:label': 'ci-fargate-spot', 'ci-runner:capacity': 'ci-fargate-spot',
+    'ci-runner:labels': 'self-hosted ci-fargate-spot ci-cpu-8 arm64 linux', 'ci-runner:job-name': 'build _x64_ a_',
+    ...tags,
+  },
+});
+const fargateJob = () => {
+  const p = job({ action: 'in_progress', runner: RUNNER, labels: ['self-hosted', 'ci-fargate-spot', 'ci-cpu-8', 'arm64', 'linux'] });
+  p.workflow_job.name = 'test (arm64, b)';
+  return p;
+};
+
+test('a swap on a task: the runner\'s own job is re-queued from the task\'s tags, and the task is re-tagged with the job it runs', async () => {
+  const { handler, sent, tagged, taskTagged, logs } = setup({ tasks: [fargateTask()] });
+  const res = await handler(delivery(fargateJob()));
+  assert.equal(res.statusCode, 202);
+  assert.deepEqual(sent, [{
+    repo: 'zeroae/lib', job_id: 999, run_id: 888, head_sha: 'fff000', job_name: 'build _x64_ a_',
+    label: 'ci-fargate-spot', vcpus: 8, arch: 'arm64', labels: ['self-hosted', 'ci-fargate-spot', 'ci-cpu-8', 'arm64', 'linux'], installation_id: 181,
+  }]);
+  assert.deepEqual(tagged, []);
+  assert.deepEqual(taskTagged, [{
+    resourceArn: TASK_ARN,
+    tags: [
+      { key: 'ci-runner:repo', value: 'zeroae/app' }, { key: 'ci-runner:job-id', value: '555' },
+      { key: 'ci-runner:run-id', value: '444' }, { key: 'ci-runner:head-sha', value: 'abc123' },
+      { key: 'ci-runner:job-name', value: 'test _arm64_ b_' },
+    ],
+  }]);
+  assert.deepEqual(logs, [{
+    swap: RUNNER, task: TASK_ARN, took: { repo: 'zeroae/app', job_id: 555 }, requeued: { repo: 'zeroae/lib', job_id: 999 },
+  }]);
+});
+
+test('a repeated in_progress after a task\'s re-tag does nothing more', async () => {
+  const { handler, sent, taskTagged } = setup({ tasks: [fargateTask({ 'ci-runner:job-id': '555' })] });
+  assert.equal((await handler(delivery(fargateJob()))).statusCode, 200);
+  assert.deepEqual([sent, taskTagged], [[], []]);
+});
+
+test('a task told to stop, or another runner\'s task, is no swap to repair', async () => {
+  for (const t of [fargateTask({}, 'STOPPED'), fargateTask({ 'ci-runner:runner': 'ci-runner-20261113120000-998' })]) {
+    const { handler, sent, taskTagged } = setup({ tasks: [t] });
+    assert.equal((await handler(delivery(fargateJob()))).statusCode, 200);
+    assert.deepEqual([sent, taskTagged], [[], []]);
+  }
+});
+
+test('a swap on an instance looks up no task', async () => {
+  const { handler, described } = setup({ instances: [instance()], tasks: [fargateTask()] });
+  assert.equal((await handler(delivery(job({ action: 'in_progress', runner: RUNNER })))).statusCode, 202);
+  assert.ok(described.every((d) => d.Filters), 'only DescribeInstances');
 });

@@ -205,6 +205,23 @@ Resources:
                     aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
                   ForAllValues:StringEquals:
                     aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
+              # The same for a runner's task: only the cluster's tasks, only
+              # the job tags.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
+              - Effect: Allow
+                Action: ecs:TagResource
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
 
   WebhookFunction:
     Type: AWS::Lambda::Function
@@ -224,6 +241,7 @@ Resources:
           QUEUE_URL: !Ref JobQueue
           GITHUB_ORG: !Ref GitHubOrg
           STACK_NAME: !Ref AWS::StackName
+          CLUSTER: !Ref RunnerCluster
       Code:
         ZipFile: |
           //@inline functions/webhook.js

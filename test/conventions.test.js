@@ -64,3 +64,13 @@ test('the launcher, notifier and sweeper carry identical copies of the GitHub he
     for (const o of rest) assert.equal(o.code, first.code, `${o.f}'s ${name} differs from ${first.f}'s`);
   }
 });
+
+test('the launcher and the webhook sanitize an ECS tag the same way', () => {
+  // The webhook re-tags a task the launcher tagged; bundling one rule would
+  // cost more template bytes than the two-line copy.
+  for (const re of [/^const ECS_TAG_CHARS = .*$/m, /^const ecsTag = .*$/m]) {
+    const [launcher, webhook] = ['launcher', 'webhook'].map((f) => (read(`functions/${f}.js`).match(re) || [])[0]);
+    assert.ok(launcher, `the launcher has no ${re}`);
+    assert.equal(webhook, launcher, `the webhook's ${re} differs from the launcher's`);
+  }
+});
