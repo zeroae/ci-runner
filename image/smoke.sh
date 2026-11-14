@@ -41,6 +41,8 @@ check pkg-config     pkg-config --version
 check git            git --version
 check curl           curl --version
 check zstd           zstd --version
+check zip            zip --version
+check unzip          unzip -v
 check python3        python3 --version
 check node           node --version
 check npm            npm --version
