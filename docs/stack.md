@@ -132,12 +132,12 @@ sweeper (or GitHub, for ephemeral runners) removes it.
 ## Launching one by hand
 
 `make hand-launch` (`scripts/hand-launch.sh`) mints an org JIT config for the
-`ci-runner` group with labels `self-hosted`, `ci-spot`, `SIZE` (default
-`ci-cpu-4`) and `ARCH` (default `x64`) through the owner's `gh`, which needs
+`ci-runner` group with labels `self-hosted`, `ci-spot`, `SIZE` and `ARCH`
+(both required; neither has a default) through the owner's `gh`, which needs
 `admin:org`. It then renders the user-data and launches one Spot instance of
 that size and architecture as above, tagged with its shape (`make hand-launch
-SIZE=ci-cpu-8` launches a `.2xlarge`; `ARCH=arm64` a Graviton from the arm64
-launch template). It prints the instance id. `IDLE_SECONDS=120` shortens the
+SIZE=ci-cpu-8 ARCH=x64` launches an x64 `.2xlarge`; `ARCH=arm64` a Graviton
+from the arm64 launch template). It prints the instance id. `IDLE_SECONDS=120` shortens the
 idle exit for a test. `make runners` lists the stack's instances that are not
 terminated.
 
@@ -191,11 +191,10 @@ App's webhook points at), for each delivery:
    `private` and the owner is `GITHUB_ORG`.
 4. Ignores (`200`) actions other than `queued`, and jobs outside the label
    contract (case-insensitive): `self-hosted`, exactly one of
-   `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`, `-4`, `-8`,
-   `-16`), at most one of `x64`/`arm64`, and optionally `linux`. An unknown
-   `ci-cpu-*`, or both `x64` and `arm64`, are outside it. A missing size or architecture label defaults to
-   `ci-cpu-4` and `x64`: this is the expand step, and the defaults go once
-   every repo names its shape.
+   `ci-spot`/`ci-ondemand`, exactly one size label (`ci-cpu-2`, `-4`, `-8`,
+   `-16`), exactly one of `x64`/`arm64`, and optionally `linux`. None has a
+   default: a missing size or architecture label, an unknown `ci-cpu-*`, or
+   both `x64` and `arm64`, are outside it.
 5. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
    labels, installation_id}` (`label` is the capacity label, lower case;
    `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
