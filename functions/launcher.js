@@ -17,8 +17,10 @@ const CAPACITY = { 'ci-spot': 'spot', 'ci-ondemand': 'on-demand', 'ci-fargate-sp
 const PROVIDER = { 'ci-fargate-spot': 'FARGATE_SPOT', 'ci-fargate': 'FARGATE' };
 // Fargate offers no arm64 in this AZ, so arm64 tasks skip a subnet there.
 const NO_ARM64_AZ = 'use1-az3';
-// ECS allows only these characters in a tag (EC2 allows any).
+// ECS allows only these characters in a tag (EC2 allows any). The webhook's
+// re-tag carries a copy.
 const ECS_TAG_CHARS = /[^\p{L}\p{Z}\p{N}_.:/=+\-@]/gu;
+const ecsTag = ([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_').slice(0, 256) });
 
 const b64u = (s) => Buffer.from(s).toString('base64url');
 
@@ -141,8 +143,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
         containerOverrides: [{ name: 'runner', command: ['./run.sh', '--jitconfig', jitConfig], environment }],
       },
       // Labels joined by spaces: ECS refuses a comma in a tag.
-      tags: [['ci-runner:stack', env.STACK_NAME], ...jobTags(m, name, runnerId, ' ')]
-        .map(([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_').slice(0, 256) })),
+      tags: [['ci-runner:stack', env.STACK_NAME], ...jobTags(m, name, runnerId, ' ')].map(ecsTag),
     });
     const arn = r.tasks && r.tasks[0] && r.tasks[0].taskArn;
     if (!arn) {

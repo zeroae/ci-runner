@@ -205,6 +205,23 @@ Resources:
                     aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
                   ForAllValues:StringEquals:
                     aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
+              # The same for a runner's task: only the cluster's tasks, only
+              # the job tags.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
+              - Effect: Allow
+                Action: ecs:TagResource
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
 
   WebhookFunction:
     Type: AWS::Lambda::Function
@@ -224,6 +241,7 @@ Resources:
           QUEUE_URL: !Ref JobQueue
           GITHUB_ORG: !Ref GitHubOrg
           STACK_NAME: !Ref AWS::StackName
+          CLUSTER: !Ref RunnerCluster
       Code:
         ZipFile: |
           //@inline functions/webhook.js
@@ -453,12 +471,22 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
+              # The cluster's tasks: every one of them is the stack's.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              - Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
 
   SweeperFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-sweeper"
-      Description: Terminates CI runner instances over 2 hours old; removes offline runner registrations with no instance.
+      Description: Terminates CI runner instances and stops tasks over 2 hours old; removes offline runner registrations with neither.
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt SweeperRole.Arn
@@ -472,6 +500,7 @@ Resources:
           STACK_NAME: !Ref AWS::StackName
           GITHUB_ORG: !Ref GitHubOrg
           RUNNER_GROUP: !Ref RunnerGroup
+          CLUSTER: !Ref RunnerCluster
       Code:
         ZipFile: |
           //@inline functions/sweeper.js
@@ -525,12 +554,15 @@ Resources:
               - Effect: Allow
                 Action: ec2:DescribeInstances
                 Resource: "*"
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
 
   NotifierFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-notifier"
-      Description: Reports a Spot reclaim as a failed check run.
+      Description: Reports a Spot reclaim, of an instance or a task, as a failed check run.
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt NotifierRole.Arn
@@ -566,6 +598,32 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt NotifierRule.Arn
+
+  # A Fargate Spot reclaim: every change of the task from the warning on
+  # carries the stop code. ECS drops a task's tags once it is told to stop
+  # (aws-emulator does), so the first change may be the only one the notifier
+  # can read; it reports one check run per job.
+  NotifierTaskRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-notifier-tasks"
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [!GetAtt RunnerCluster.Arn]
+          stopCode: [SpotInterruption]
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+
+  NotifierTaskRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NotifierTaskRule.Arn
 
   # --- network: a VPC of its own, public subnets, no NAT --------------------
   Vpc:

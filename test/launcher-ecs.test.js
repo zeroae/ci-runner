@@ -1,69 +1,20 @@
 'use strict';
 // The launcher's RunTask against real ECS shapes, from aws/aws-emulator
-// (https://github.com/aws/aws-emulator): the emulator validates the request
-// as ECS does (Fargate cpu/memory pairs, capacity providers on the cluster,
-// subnets that exist, the characters a tag may carry) and answers with a
-// real Task. Skipped when `aws-emulator` isn't installed, unless
-// REQUIRE_AWS_EMULATOR is set (CI sets it).
+// (./aws-emulator.js): the emulator validates the request as ECS does
+// (Fargate cpu/memory pairs, capacity providers on the cluster, subnets that
+// exist, the characters a tag may carry) and answers with a real Task.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const { spawn, spawnSync } = require('node:child_process');
-const fs = require('node:fs');
-const https = require('node:https');
-const readline = require('node:readline');
+const { skip, startEmulator, network, taskDefinition } = require('./aws-emulator.js');
 const { createHandler } = require('../functions/launcher.js');
 
-const installed = spawnSync('aws-emulator', ['-v']).status === 0;
-if (!installed && process.env.REQUIRE_AWS_EMULATOR) throw new Error('aws-emulator is not installed');
-const skip = !installed && 'aws-emulator is not installed';
-
-let emulator;
-let endpoint;
-let ca;
-
-// One request to the emulator; `headers` pick the protocol.
-function call(body, headers) {
-  const url = new URL(endpoint);
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      host: url.hostname, port: url.port, path: '/', method: 'POST', ca,
-      headers: { ...headers, 'content-length': Buffer.byteLength(body) },
-    }, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString() }));
-    });
-    req.on('error', reject);
-    req.end(body);
-  });
-}
-
-// ECS speaks JSON 1.1, as @aws-sdk/client-ecs sends it.
-async function ecsCall(op, input) {
-  const r = await call(JSON.stringify(input), {
-    'content-type': 'application/x-amz-json-1.1', 'x-amz-target': `AmazonEC2ContainerServiceV20141113.${op}`,
-    authorization: 'AWS4-HMAC-SHA256 Credential=test/20261112/us-east-1/ecs/aws4_request, SignedHeaders=host, Signature=0',
-  });
-  const json = JSON.parse(r.text || '{}');
-  if (r.status >= 300) throw Object.assign(new Error(`${json.__type}: ${json.message || json.Message}`), { name: json.__type });
-  return json;
-}
+let aws;
+const ecsCall = (op, input) => aws.ecs(op, input);
 const ecs = {
   runTask: (i) => ecsCall('RunTask', i),
   listTasks: (i) => ecsCall('ListTasks', i),
   describeTasks: (i) => ecsCall('DescribeTasks', i),
 };
-
-// EC2 speaks the query protocol; only ids are read back.
-async function ec2Call(params) {
-  const r = await call(new URLSearchParams({ Version: '2016-11-15', ...params }).toString(), {
-    'content-type': 'application/x-www-form-urlencoded',
-    authorization: 'AWS4-HMAC-SHA256 Credential=test/20261112/us-east-1/ec2/aws4_request, SignedHeaders=host, Signature=0',
-  });
-  assert.ok(r.status < 300, r.text);
-  return r.text;
-}
-const idIn = (xml, tag) => xml.match(new RegExp(`<${tag}>([^<]+)</${tag}>`))[1];
 
 // The stack's shape, as template.yaml makes it: three subnets (one in
 // use1-az3, to see arm64 leave it out), a security group, the cluster with
@@ -77,40 +28,18 @@ const subnetAz = {};
 
 before(async () => {
   if (skip) return;
-  emulator = spawn('aws-emulator', ['-p', '0', '-a', 'off', '-t', 'off', '--idle-timeout', '300'], { stdio: ['ignore', 'pipe', 'inherit'] });
-  // The startup line names the endpoint and its CA.
-  for await (const line of readline.createInterface({ input: emulator.stdout })) {
-    const m = line.startsWith('{') && JSON.parse(line).fields;
-    if (m && m.endpoint_url) { endpoint = m.endpoint_url; ca = fs.readFileSync(m.ca_file); break; }
-  }
-  emulator.stdout.resume();
-
-  const vpc = idIn(await ec2Call({ Action: 'CreateVpc', CidrBlock: '10.77.0.0/16' }), 'vpcId');
-  const subnets = [];
-  for (const [i, az] of env.SUBNET_AZ_IDS.split(',').entries()) {
-    const id = idIn(await ec2Call({ Action: 'CreateSubnet', VpcId: vpc, CidrBlock: `10.77.${i}.0/24`, AvailabilityZoneId: az }), 'subnetId');
-    subnets.push(id);
-    subnetAz[id] = az;
-  }
-  env.SUBNET_IDS = subnets.join(',');
-  env.SECURITY_GROUP_ID = idIn(await ec2Call({ Action: 'CreateSecurityGroup', VpcId: vpc, GroupName: 'ci-runner', GroupDescription: 'ci-runner' }), 'groupId');
-
+  aws = await startEmulator();
+  const azs = env.SUBNET_AZ_IDS.split(',');
+  const net = await network(aws, azs);
+  net.subnets.forEach((id, i) => { subnetAz[id] = azs[i]; });
+  env.SUBNET_IDS = net.subnets.join(',');
+  env.SECURITY_GROUP_ID = net.sg;
   await ecsCall('CreateCluster', { clusterName: 'ci-runner', capacityProviders: ['FARGATE', 'FARGATE_SPOT'] });
-  for (const [k, cpuArchitecture, family] of [['TASK_DEFINITION', 'X86_64', 'ci-runner-runner'], ['ARM64_TASK_DEFINITION', 'ARM64', 'ci-runner-runner-arm64']]) {
-    const r = await ecsCall('RegisterTaskDefinition', {
-      family, networkMode: 'awsvpc', requiresCompatibilities: ['FARGATE'], cpu: '4096', memory: '16384',
-      ephemeralStorage: { sizeInGiB: 50 }, runtimePlatform: { operatingSystemFamily: 'LINUX', cpuArchitecture },
-      executionRoleArn: 'arn:aws:iam::000000000000:role/PowerUserPB-ci-runner-runner-exec',
-      containerDefinitions: [{
-        name: 'runner', image: '000000000000.dkr.ecr.us-east-1.amazonaws.com/ci-runner:latest', essential: true,
-        entryPoint: ['/usr/local/bin/ci-runner-idle-exit'], command: ['./run.sh'], linuxParameters: { initProcessEnabled: true },
-      }],
-    });
-    env[k] = r.taskDefinition.taskDefinitionArn;
-  }
+  env.TASK_DEFINITION = await taskDefinition(aws, 'ci-runner-runner', 'X86_64');
+  env.ARM64_TASK_DEFINITION = await taskDefinition(aws, 'ci-runner-runner-arm64', 'ARM64');
 });
 
-after(() => { if (emulator) emulator.kill('SIGTERM'); });
+after(() => { if (aws) aws.stop(); });
 
 // GitHub, faked: the job is queued, the group exists, the JIT config mints.
 function fakeFetch() {

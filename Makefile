@@ -43,7 +43,7 @@ runners: ## List the stack's CI runner instances that are not terminated
 	    Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
 	  --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,LaunchTime]' --output text
 
-sweep: ## Run the sweeper now, and print what it terminated and removed
+sweep: ## Run the sweeper now, and print what it terminated, stopped and removed
 	@$(AWS) lambda invoke --function-name $(STACK)-sweeper /dev/stdout --query FunctionError --output text
 
 canary-runs: ## List the canary repo's recent workflow runs (CI_RUNNER_CANARY_REPO, from .env)
