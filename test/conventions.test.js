@@ -39,10 +39,10 @@ test('every env var a function reads is set on that function in the template', (
   assert.equal(fns.length, 5);
   for (const fn of fns) {
     const file = fn.body.match(/\/\/@inline (\S+)/)[1];
-    const set = new Set([...(fn.body.split(/Variables:\n/)[1] || '').matchAll(/^ {10}([A-Z_]+):/gm)].map((m) => m[1]));
+    const set = new Set([...(fn.body.split(/Variables:\n/)[1] || '').matchAll(/^ {10}([A-Z0-9_]+):/gm)].map((m) => m[1]));
     let src = read(file);
     for (const [, dep] of src.matchAll(/require\('\.\/([\w.-]+\.js)'\)/g)) src += read(path.join(path.dirname(file), dep));
-    const used = new Set([...src.matchAll(/\benv\.([A-Z_]+)/g)].map((m) => m[1]));
+    const used = new Set([...src.matchAll(/\benv\.([A-Z0-9_]+)/g)].map((m) => m[1]));
     for (const v of used) if (!OPTIONAL_ENV.has(v)) assert.ok(set.has(v), `${file} reads ${v}, which ${fn.name} doesn't set`);
     for (const v of set) assert.ok(used.has(v), `${fn.name} sets ${v}, which ${file} never reads`);
   }

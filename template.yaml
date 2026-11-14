@@ -259,14 +259,17 @@ Resources:
               # A version per launch carries the user-data.
               - Effect: Allow
                 Action: [ec2:CreateLaunchTemplateVersion, ec2:DeleteLaunchTemplateVersions]
-                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
-              # The fleet, from this launch template, into this stack's subnets
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${Arm64RunnerLaunchTemplate}"
+              # The fleet, from these launch templates, into this stack's subnets
               # and security group only. No iam:PassRole: there is no role.
               - Effect: Allow
                 Action: [ec2:CreateFleet, ec2:RunInstances]
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:fleet/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${Arm64RunnerLaunchTemplate}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet0}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet1}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${Subnet2}"
@@ -291,7 +294,9 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
                 Condition:
                   ArnEquals:
-                    ec2:LaunchTemplate: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                    ec2:LaunchTemplate:
+                      - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}"
+                      - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${Arm64RunnerLaunchTemplate}"
               - Effect: Allow
                 Action: ec2:CreateTags
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:*/*"
@@ -322,6 +327,7 @@ Resources:
           RUNNER_GROUP: !Ref RunnerGroup
           STACK_NAME: !Ref AWS::StackName
           LAUNCH_TEMPLATE_ID: !Ref RunnerLaunchTemplate
+          ARM64_LAUNCH_TEMPLATE_ID: !Ref Arm64RunnerLaunchTemplate
           SUBNET_IDS: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
           QUEUE_URL: !Ref JobQueue
           SPOT_CAP: !Ref SpotCap
@@ -612,6 +618,33 @@ Resources:
             Tags:
               - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
 
+  # The arm64 counterpart, for the Graviton families: only the image differs.
+  Arm64RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-runner-arm64"
+      LaunchTemplateData:
+        # Resolved by EC2 at every launch: always the latest AL2023.
+        ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+        InstanceInitiatedShutdownBehavior: terminate
+        SecurityGroupIds: [!Ref RunnerSecurityGroup]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 50, VolumeType: gp3, DeleteOnTermination: true, Encrypted: true }
+        # IMDSv2 only, one hop: a job's containers can't reach the metadata service.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+              - { Key: Name, Value: !Sub "${AWS::StackName}-runner" }
+          - ResourceType: volume
+            Tags:
+              - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
 Outputs:
   SetupUrl:
     Description: Open in a browser to create the GitHub App (refuses everything once done).
@@ -622,6 +655,8 @@ Outputs:
     Value: !Ref AppSecret
   LaunchTemplateId:
     Value: !Ref RunnerLaunchTemplate
+  Arm64LaunchTemplateId:
+    Value: !Ref Arm64RunnerLaunchTemplate
   SubnetIds:
     Value: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
   SecurityGroupId:
