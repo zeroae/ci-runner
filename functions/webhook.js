@@ -1,8 +1,8 @@
 'use strict';
 // webhook: GitHub workflow_job receiver behind a Function URL. Verifies the
 // delivery, applies the label contract and fence 3, and enqueues the job for
-// the launcher. It launches nothing itself, but repairs swaps (ADR-0003). Inlined into the template; keep it
-// one dependency-free CommonJS file.
+// the launcher. It launches nothing itself, but repairs swaps (ADR-0003).
+// Inlined into the template; keep it one dependency-free CommonJS file.
 const crypto = require('node:crypto');
 
 const CAPACITY = ['ci-spot', 'ci-ondemand'];
