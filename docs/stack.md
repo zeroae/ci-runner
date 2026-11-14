@@ -315,7 +315,16 @@ allows `ecs:RunTask` on the two task definitions in the stack's cluster
 (`ecs:cluster`), `iam:PassRole` on the execution role only and only to
 `ecs-tasks.amazonaws.com`, `ecs:TagResource` only while creating
 (`ecs:CreateAction: RunTask`), and `ecs:ListTasks`/`ecs:DescribeTasks` on the
-cluster (for the budgets). It has no other `iam:PassRole`. `CreateFleet`'s check on the instances, volumes and network
+cluster (for the budgets). It has no other `iam:PassRole`. All four conditions
+hold live (checked 2026-11-14 with one job on each Fargate capacity).
+
+Its permissions boundary is the account's `ZAEPowerUserBoundary`, not
+`PowerUserAccess` like every other role: `RunTask` passes the task
+definition's execution role, and `PowerUserAccess` allows no `iam:PassRole`
+at all. `ZAEPowerUserBoundary` is `PowerUserAccess` plus `iam:PassRole` on
+`PowerUserPB*` roles; the policy above narrows that to the execution role.
+`test/conventions.test.js` requires that boundary on a role that passes one,
+and `PowerUserAccess` on every other. `CreateFleet`'s check on the instances, volumes and network
 interfaces it creates carries no launch-template key, so those resources
 are granted to `CreateFleet` without one. `RunInstances` keeps the condition.
 
@@ -381,9 +390,13 @@ container override sets `CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and
 step. `IDLE_SECONDS` is passed on too, when the launcher has it (a test).
 
 **The idle exit.** `image/ci-runner-idle-exit` runs its arguments in their own
-session, copying their output to a file, and stops them (TERM to the whole
-session) if that output has no `Running job` line after `IDLE_SECONDS`
-(default 900). It passes a TERM or INT on (a `StopTask`), and exits with the
+session, copying their output to a file, and stops them if that output has no
+`Running job` line after `IDLE_SECONDS` (default 900). A stop is a TERM to every
+process in the session (`pkill -s`), then a KILL after `IDLE_GRACE_SECONDS`
+(default 30, as `docker stop -t 30` gives an EC2 runner). The session matters:
+`run-helper.sh` and `Runner.Listener` run in their own process group, so a TERM
+to `run.sh`'s group alone misses them and the task never stops (seen live).
+With the whole session signalled, the runner exits at once, status 143. It passes a TERM or INT on (a `StopTask`), and exits with the
 runner's status, so the essential container exits and the task stops. The
 image sets no `ENTRYPOINT`, so EC2's host script, which runs `./run.sh` with
 its own idle exit, is unchanged; only the task definitions use the wrapper.
