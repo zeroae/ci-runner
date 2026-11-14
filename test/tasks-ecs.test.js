@@ -218,7 +218,7 @@ test('a Fargate Spot reclaim: template.yaml\'s rule matches each change of the s
   // The task's runner is running job 999 (the notifier reports only a running job).
   const gh = fakeGitHub([], { status: 'in_progress', runner_name: runner });
   const logs = [];
-  const h = notifier.createHandler({ secret, fetch: gh.fetch, sleep: async () => {}, ec2: { describe: assert.fail }, ecs, now: Date.now, env, log: (l) => logs.push(l) });
+  const h = notifier.createHandler({ secret, fetch: gh.fetch, ec2: { describe: assert.fail }, ecs, now: Date.now, env, log: (l) => logs.push(l) });
   await h(warning);
   const check = gh.calls.find((c) => c.key === 'POST /repos/zeroae/lib/check-runs');
   assert.ok(check, logs.join('\n'));

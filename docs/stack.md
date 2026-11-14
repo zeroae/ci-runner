@@ -209,15 +209,27 @@ App's webhook points at), for each delivery:
 3. **Fence 3:** refuses (`403`, logged) unless `repository.visibility` is
    `private` and the owner is `GITHUB_ORG`.
 4. On `in_progress`, repairs a swap (below) and answers.
-5. Ignores (`200`) actions other than `queued`, and jobs outside the label
+5. On `completed`, tells the notifier when the job succeeded on a runner of
+   this stack (below) and answers.
+6. Ignores (`200`) actions other than `queued`, and jobs outside the label
    contract (case-insensitive): `self-hosted`, exactly one of
    `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`, `-4`, `-8`,
    `-16`), exactly one of `x64`/`arm64`, and optionally `linux`. None has a
    default: a missing size or architecture label, an unknown `ci-cpu-*`, or
    both `x64` and `arm64`, are outside it.
-6. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
+7. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
    labels, installation_id}` (`label` is the capacity label, lower case;
    `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
+
+**Telling the notifier a job succeeded.** On `workflow_job` `completed` with
+conclusion `success`, and a `runner_name` that is `${stack}-<14-digit
+stamp>-<job id>` (a job on a GitHub-hosted runner, another stack's, or none is
+ignored, `200`), the webhook invokes the notifier asynchronously
+(`lambda:InvokeFunction` on it, env `NOTIFIER_FUNCTION`) with `{jobSucceeded:
+{repo, job_id, run_id, head_sha, job_name, installation_id}}` and answers
+`202`. The App's `workflow_job` subscription already delivers every action
+(about 3 deliveries per job: `queued`, `in_progress`, `completed`), so nothing
+about the App changes. The webhook does no GitHub call itself.
 
 **Swap repair** (ADR-0003). GitHub gives a queued job to any idle runner whose
 labels cover it, so a runner launched for job Y may take job X. Left alone,
@@ -492,17 +504,23 @@ For each event it:
    the instance or task and linking the run, and `details_url` the job's page.
    An EC2 reclaim and a Fargate one give the same check run, but for the
    summary's machine.
-7. **Watches the job** for 150 s (15 looks, 10 s apart; the Lambda's timeout is
-   200 s): AWS warns 2 minutes before it takes the machine, and the job can
-   finish inside that. A job that completes with `success` was not lost, so the
-   notifier changes the check run to `neutral`, titled `The job finished
-   despite the Spot reclaim warning`, and logs `survived <id>: <repo> job <id>`.
-   A job that completes with any other conclusion, or is still running when the
-   watch ends, keeps the `failure`. A task's later changes find the check run
-   (either title) and stop at step 5, so only the first change watches. A
-   standing `failure` whose job has since finished with `success` (the watch
-   ended or failed, and a retry or a later change found it) is also changed to
-   `neutral` at step 5.
+7. Reads the job once more after posting: a job that finished with `success`
+   while this ran is cleared as in step 8.
+8. **Clears a report the job survived.** AWS warns 2 minutes before it takes
+   the machine, and a job can finish inside that. A job that finishes with
+   `success` was not lost, so its reclaim check run changes to `neutral`,
+   titled `The job finished despite the Spot reclaim warning`, and the notifier
+   logs `survived: <repo> <job name>`. Three things get a report there:
+   - **the webhook's word** (above): the notifier gets the token (the event
+     carries the installation id), finds the job's reclaim check run, and
+     clears it. A job with no reclaim report logs `nothing to clear` and
+     changes nothing. The check run's name uses the event's job name;
+   - **a retry or a later change** of a reclaim event that finds its own
+     standing `failure` (step 5) for a job that has since finished with
+     `success`;
+   - **step 7**, for the word that came before the report existed.
+
+   A job that ends with any other conclusion keeps the `failure`.
 
 A GitHub failure fails the invocation, and EventBridge's async invoke retries
 it. Two events handled at the same moment can still report twice.
@@ -513,7 +531,7 @@ bytes than the copies. `test/conventions.test.js` fails if the copies differ,
 so change all three at once.
 
 Its role allows `GetSecretValue` on the secret, `ec2:DescribeInstances`, and
-`ecs:DescribeTasks` only on the cluster's tasks. The watch needs no more.
+`ecs:DescribeTasks` only on the cluster's tasks.
 
 ## The runner image in ECR
 

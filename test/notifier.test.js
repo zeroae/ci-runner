@@ -80,7 +80,6 @@ function fakeGitHub({ checkStatus = 201, jobStatus = 200, existing = [], jobs = 
 function setup({ inst = instance(TAGS), raw = { Reservations: inst ? [{ Instances: [inst] }] : [] }, tasks = [], gh = fakeGitHub(), creds = { app_id: 42, private_key: PEM } } = {}) {
   const described = [];
   const logs = [];
-  const slept = [];
   const handler = createHandler({
     secret: { get: async () => creds },
     fetch: gh.fetch,
@@ -91,12 +90,11 @@ function setup({ inst = instance(TAGS), raw = { Reservations: inst ? [{ Instance
         return { tasks: tasks.filter((t) => i.tasks.includes(t.taskArn)), failures: [] };
       },
     },
-    sleep: async (ms) => { slept.push(ms); },
     now: () => T0,
     env: ENV,
     log: (l) => logs.push(l),
   });
-  return { handler, gh, described, logs, slept };
+  return { handler, gh, described, logs };
 }
 
 test('an interruption of one of our instances creates a failed check run on the job\'s commit', async () => {
@@ -106,7 +104,7 @@ test('an interruption of one of our instances creates a failed check run on the 
   assert.deepEqual(gh.keys(), [
     'GET /repos/zeroae/app/installation', 'POST /app/installations/181/access_tokens',
     'GET /repos/zeroae/app/actions/jobs/555', 'GET /repos/zeroae/app/commits/abc123/check-runs', 'POST /repos/zeroae/app/check-runs',
-    // The watch: the job failed too, so the check run stays.
+    // The re-read after posting: the job failed too, so the check run stays.
     'GET /repos/zeroae/app/actions/jobs/555',
   ]);
   const { body } = gh.calls[4];
@@ -154,37 +152,27 @@ test('a swapped CI runner is reported for the job it took, not the one it was la
   assert.equal(body.name, 'ci-runner / tests');
 });
 
-// AWS gives a 2-minute warning, and a job can finish inside it. The check run
-// is posted at the warning, then the notifier watches the job.
-
-test('a job that finishes with success after the warning turns its check run neutral', async () => {
-  const gh = fakeGitHub({ jobs: [RUNNING, RUNNING, DONE('success')] });
-  const { handler, slept, logs } = setup({ gh });
+// AWS gives a 2-minute warning, and a job can finish inside it. The webhook
+// tells the notifier when a job succeeds. If that word came before the report
+// existed, the notifier's own re-read of the job, right after posting, clears it.
+test('a job that has finished with success by the time the report is posted turns its check run neutral', async () => {
+  const gh = fakeGitHub({ jobs: [RUNNING, DONE('success')] });
+  const { handler, logs } = setup({ gh });
   await handler(EVENT);
   const { body } = patchOf(gh);
   assert.equal(body.conclusion, 'neutral');
   assert.equal(body.output.title, SURVIVED);
   assert.match(body.output.summary, /`tests`/);
-  assert.deepEqual(slept, [10000, 10000]);
-  assert.match(logs.join('\n'), /survived i-0123: zeroae\/app job 555/);
+  assert.match(logs.join('\n'), /survived: zeroae\/app tests/);
 });
 
-for (const conclusion of ['failure', 'cancelled']) {
-  test(`a job that completes with ${conclusion} after the warning keeps its failure`, async () => {
-    const gh = fakeGitHub({ jobs: [RUNNING, DONE(conclusion)] });
+for (const [why, job] of [['still runs', RUNNING], ['failed', DONE('failure')], ['was cancelled', DONE('cancelled')]]) {
+  test(`a job that ${why} after the report is posted keeps its failure`, async () => {
+    const gh = fakeGitHub({ jobs: [RUNNING, job] });
     await setup({ gh }).handler(EVENT);
     assert.equal(patchOf(gh), undefined);
   });
 }
-
-test('a job still running when the watch ends keeps its failure', async () => {
-  const gh = fakeGitHub({ jobs: [RUNNING] });
-  const { handler, slept } = setup({ gh });
-  await handler(EVENT);
-  assert.equal(patchOf(gh), undefined);
-  assert.equal(slept.length, 15);
-  assert.equal(slept.reduce((a, b) => a + b), 150000);
-});
 
 // A report an earlier invocation left standing (its watch ended, or a GitHub
 // call failed mid-watch and EventBridge retried).
@@ -196,7 +184,7 @@ test('a retry or a later event clears a standing report whose job has since fini
   await handler(EVENT);
   assert.equal(patchOf(gh).body.conclusion, 'neutral');
   assert.ok(!gh.keys().includes('POST /repos/zeroae/app/check-runs'));
-  assert.match(logs.join('\n'), /survived i-0123/);
+  assert.match(logs.join('\n'), /survived: zeroae\/app tests/);
 });
 
 for (const [why, job] of [['still runs', RUNNING], ['failed', DONE('failure')]]) {
@@ -373,10 +361,56 @@ test('a swapped Fargate CI runner is reported for the job it took', async () => 
   assert.equal(gh.calls.find((c) => c.key === 'POST /repos/zeroae/app/check-runs').body.external_id, '555');
 });
 
-test('a Fargate job that finishes with success after the warning turns its check run neutral', async () => {
+test('a Fargate job that has finished with success by the time the report is posted turns its check run neutral', async () => {
   const gh = fakeGitHub({ jobs: [RUNNING, { ...RUNNING, status: 'completed', conclusion: 'success' }] });
   await setup({ inst: null, tasks: [task(TASK_TAGS)], gh }).handler(TASK_EVENT);
   const { body } = patchOf(gh);
   assert.equal(body.conclusion, 'neutral');
-  assert.match(body.output.summary, /task \(0f1e2d3c4b5a69788796a5b4c3d2e1f0\)/);
+  assert.match(body.output.summary, /`build \(x64, a\)`/);
+});
+
+// --- the webhook: a job of this stack's runners succeeded -----------------------
+const SUCCEEDED = { jobSucceeded: { repo: 'zeroae/app', job_id: 555, run_id: 444, head_sha: 'abc123', job_name: 'tests', installation_id: 181 } };
+
+test('a job that succeeded clears its standing reclaim report', async () => {
+  const gh = fakeGitHub({ existing: [STANDING] });
+  const { handler, logs } = setup({ gh });
+  await handler(SUCCEEDED);
+  // The webhook's installation id saves the installation lookup.
+  assert.deepEqual(gh.keys(), [
+    'POST /app/installations/181/access_tokens',
+    'GET /repos/zeroae/app/commits/abc123/check-runs',
+    'PATCH /repos/zeroae/app/check-runs/9',
+  ]);
+  const { body } = patchOf(gh);
+  assert.equal(body.conclusion, 'neutral');
+  assert.equal(body.output.title, SURVIVED);
+  assert.ok(body.output.summary.includes('https://github.com/zeroae/app/actions/runs/444'));
+  assert.match(logs.join('\n'), /survived: zeroae\/app tests/);
+});
+
+for (const [why, existing] of [
+  ['a job that never had a reclaim report', []],
+  ['a report that is already neutral', [{ ...STANDING, output: { title: SURVIVED } }]],
+  ['another job\'s report', [{ ...STANDING, external_id: '554' }]],
+  ['a check run of that name that isn\'t ours', [{ ...STANDING, output: { title: 'Lint' } }]],
+]) {
+  test(`a job that succeeded changes nothing for ${why}`, async () => {
+    const gh = fakeGitHub({ existing });
+    const { handler, logs } = setup({ gh });
+    await handler(SUCCEEDED);
+    assert.equal(patchOf(gh), undefined);
+    assert.ok(!gh.keys().includes('POST /repos/zeroae/app/check-runs'));
+    assert.match(logs.join('\n'), /nothing to clear: zeroae\/app job 555/);
+  });
+}
+
+test('a job that succeeded, with no installation id, looks the installation up', async () => {
+  const gh = fakeGitHub({ existing: [STANDING] });
+  await setup({ gh }).handler({ jobSucceeded: { ...SUCCEEDED.jobSucceeded, installation_id: undefined } });
+  assert.equal(gh.keys()[0], 'GET /repos/zeroae/app/installation');
+});
+
+test('before the App exists a job that succeeded fails the invocation', async () => {
+  await assert.rejects(setup({ creds: { state_key: 'x' } }).handler(SUCCEEDED), /not set up/);
 });

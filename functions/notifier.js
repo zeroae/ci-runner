@@ -3,6 +3,8 @@
 // Fargate Spot task's stop (ECS Task State Change, stopCode SpotInterruption).
 // If the instance or task is this stack's and carries a job's launch tags (see
 // launcher.js), it creates a failed check run on the job's commit through the App.
+// The webhook also invokes it when a job of this stack's runners succeeds: a
+// reclaim report for that job turns neutral.
 // The App JWT is a copy of the launcher's: bundling a shared module would cost
 // more template bytes than the copy does.
 const crypto = require('node:crypto');
@@ -20,15 +22,10 @@ function appJwt(appId, pem, nowMs) {
 // keyed without the ci-runner: prefix.
 const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x.key).replace(/^ci-runner:/, ''), x.Value ?? x.value]));
 
-// AWS warns just over 2 minutes before it takes a Spot machine, and the job
-// can finish inside the warning. After posting, the notifier looks at the job
-// WATCH_LOOKS times, WATCH_INTERVAL_MS apart: 150 s.
-const WATCH_INTERVAL_MS = 10000;
-const WATCH_LOOKS = 15;
 const RECLAIMED_TITLE = 'Spot capacity reclaimed: re-run this job';
 const SURVIVED_TITLE = 'The job finished despite the Spot reclaim warning';
 
-function createHandler({ secret, fetch, sleep, ec2, ecs, now, env, log = console.log }) {
+function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log }) {
   async function gh(method, path, token, body) {
     const res = await fetch(API + path, {
       method, body: body && JSON.stringify(body),
@@ -39,7 +36,46 @@ function createHandler({ secret, fetch, sleep, ec2, ecs, now, env, log = console
     return json;
   }
 
+  // An installation token for the repo. The webhook passes the installation id
+  // it already has; an EventBridge event carries none.
+  async function tokenFor(repo, installationId) {
+    const s = await secret.get();
+    if (!s.private_key) throw new Error('the App is not set up');
+    const jwt = appJwt(s.app_id, s.private_key, now());
+    const installation = installationId || (await gh('GET', `/repos/${repo}/installation`, jwt)).id;
+    return (await gh('POST', `/app/installations/${installation}/access_tokens`, jwt)).token;
+  }
+
+  // The commit's reclaim check run for a job, if it has one. A task's reclaim
+  // matches on each of its changes, and EventBridge may repeat or retry an
+  // event: one check run per job is enough.
+  async function reportedFor(repo, token, sha, name, jobId) {
+    const { check_runs: existing } = await gh('GET', `/repos/${repo}/commits/${sha}/check-runs?filter=all&check_name=${encodeURIComponent(name)}`, token);
+    return existing.find((c) => c.external_id === jobId && c.output && [RECLAIMED_TITLE, SURVIVED_TITLE].includes(c.output.title));
+  }
+
+  // A job that finished with success was not lost: its check run no longer
+  // asks for a re-run.
+  async function clear(repo, token, checkId, job, run) {
+    await gh('PATCH', `/repos/${repo}/check-runs/${checkId}`, token, {
+      conclusion: 'neutral',
+      output: { title: SURVIVED_TITLE, summary: `AWS warned that it would reclaim the Spot machine running \`${job}\`, but the job finished with success. No re-run is needed: ${run}` },
+    });
+    log(`survived: ${repo} ${job}`);
+  }
+
+  // The webhook says a job of this stack's runners finished with success. A
+  // job that had a reclaim report (AWS warns 2 minutes before it takes the
+  // machine, and a job can finish inside that) is cleared.
+  async function jobSucceeded(j) {
+    const token = await tokenFor(j.repo, j.installation_id);
+    const reported = await reportedFor(j.repo, token, j.head_sha, `ci-runner / ${j.job_name}`, String(j.job_id));
+    if (!reported || reported.output.title !== RECLAIMED_TITLE) return log(`nothing to clear: ${j.repo} job ${j.job_id}`);
+    return clear(j.repo, token, reported.id, j.job_name, `https://github.com/${j.repo}/actions/runs/${j.run_id}`);
+  }
+
   return async (event) => {
+    if (event.jobSucceeded) return jobSucceeded(event.jobSucceeded);
     const d = event.detail || {};
     let id, machine, t;
     if (d.taskArn) {
@@ -60,12 +96,7 @@ function createHandler({ secret, fetch, sleep, ec2, ecs, now, env, log = console
       return log(`ignored: ${id} is no job ${d.taskArn ? 'task' : 'instance'} of this stack`);
     }
 
-    const s = await secret.get();
-    if (!s.private_key) throw new Error('the App is not set up');
-    const jwt = appJwt(s.app_id, s.private_key, now());
-    const { id: installation } = await gh('GET', `/repos/${repo}/installation`, jwt);
-    const { token } = await gh('POST', `/app/installations/${installation}/access_tokens`, jwt);
-
+    const token = await tokenFor(repo);
     const jobPath = `/repos/${repo}/actions/jobs/${jobId}`;
     const ghJob = await gh('GET', jobPath, token);
     // A task's job-name tag has `_` for what ECS refuses (brackets, commas):
@@ -73,26 +104,13 @@ function createHandler({ secret, fetch, sleep, ec2, ecs, now, env, log = console
     const job = (d.taskArn && ghJob.name) || t['job-name'] || `job ${jobId}`;
     const run = `https://github.com/${repo}/actions/runs/${t['run-id']}`;
     const name = `ci-runner / ${job}`;
-    // The commit's reclaim check run for this job, if it has one: a task's
-    // reclaim matches on each of its changes, and EventBridge may repeat or
-    // retry an event.
-    const { check_runs: existing } = await gh('GET', `/repos/${repo}/commits/${t['head-sha']}/check-runs?filter=all&check_name=${encodeURIComponent(name)}`, token);
-    const reported = existing.find((c) => c.external_id === jobId && c.output && [RECLAIMED_TITLE, SURVIVED_TITLE].includes(c.output.title));
+    const finishedWithSuccess = (j) => j.status === 'completed' && j.conclusion === 'success';
 
-    // A job that finishes with success was not lost: the check run no longer
-    // asks for a re-run.
-    async function clear(checkId) {
-      await gh('PATCH', `/repos/${repo}/check-runs/${checkId}`, token, {
-        conclusion: 'neutral',
-        output: { title: SURVIVED_TITLE, summary: `AWS warned that it would reclaim the Spot ${machine} running \`${job}\`, but the job finished with success. No re-run is needed: ${run}` },
-      });
-      log(`survived ${id}: ${repo} job ${jobId}`);
-    }
-
+    const reported = await reportedFor(repo, token, t['head-sha'], name, jobId);
     if (reported) {
-      // An earlier invocation's report, left standing because its watch ended
-      // or failed: a job that has since finished with success clears it.
-      if (reported.output.title === RECLAIMED_TITLE && ghJob.status === 'completed' && ghJob.conclusion === 'success') return clear(reported.id);
+      // An earlier event's report, left standing: the job finished with
+      // success after the webhook's word, or before the report existed.
+      if (reported.output.title === RECLAIMED_TITLE && finishedWithSuccess(ghJob)) return clear(repo, token, reported.id, job, run);
       return log(`already reported ${id}: ${repo} job ${jobId}`);
     }
     // Only a job this machine's CI runner is running can be lost with it. The
@@ -112,15 +130,9 @@ function createHandler({ secret, fetch, sleep, ec2, ecs, now, env, log = console
       },
     });
     log(`reported ${id}: ${repo} job ${jobId}`);
-
-    // Any other end of the job, or none in time, keeps the failure.
-    for (let i = 0; i < WATCH_LOOKS; i++) {
-      await sleep(WATCH_INTERVAL_MS);
-      const latest = await gh('GET', jobPath, token);
-      if (latest.status !== 'completed') continue;
-      if (latest.conclusion === 'success') await clear(checkId);
-      return;
-    }
+    // The job may have finished while this ran, and the webhook's word then
+    // found no report to clear.
+    if (finishedWithSuccess(await gh('GET', jobPath, token))) await clear(repo, token, checkId, job, run);
   };
 }
 
@@ -138,7 +150,6 @@ module.exports.handler = async (event) => {
     live = createHandler({
       secret: { get: async () => JSON.parse((await smc.send(new sm.GetSecretValueCommand({ SecretId: process.env.SECRET_ARN }))).SecretString) },
       fetch,
-      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       ec2: { describe: (id) => ec2c.send(new EC2.DescribeInstancesCommand({ InstanceIds: [id] })) },
       ecs: { describeTasks: (i) => ecsc.send(new ECS.DescribeTasksCommand(i)) },
       now: Date.now,
