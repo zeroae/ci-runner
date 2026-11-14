@@ -427,9 +427,11 @@ its own idle exit, is unchanged; only the task definitions use the wrapper.
 `IDLE_SECONDS` can be set per task in a container override, as in the
 runbook's "Run a task by hand".
 
-**The budgets.** `FargateSpotVcpuCap` (default 24) and `FargateVcpuCap`
+**The budgets.** `FargateSpotVcpuCap` (default 48) and `FargateVcpuCap`
 (default 8) budget the two capacities, both architectures together, as the
-EC2 budgets do. The launcher lists the cluster's tasks not yet `STOPPED`:
+EC2 budgets do. Fargate Spot's default is 48, double the others: at 24, one
+consumer's 9-job matrix at `ci-cpu-8` ran in waves and spent most of its
+queued time on budget waits, and the Fargate Spot quota (140) has room. The launcher lists the cluster's tasks not yet `STOPPED`:
 those whose desired status is `RUNNING` (provisioning, pending or running),
 and those told to stop (desired `STOPPED`) whose last status isn't `STOPPED`
 yet, since a deprovisioning task still holds its vCPUs. It sums their

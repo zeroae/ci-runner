@@ -52,7 +52,7 @@ make outputs     # SetupUrl, WebhookUrl, AppSecretArn, LaunchTemplateId, Arm64La
 The first run creates the stack `ci-runner`, and later runs update it. A run
 with no changes does nothing. `make deploy` never passes parameters, so a new
 stack takes the defaults (`SpotVcpuCap` 24, `OnDemandVcpuCap` 8,
-`FargateSpotVcpuCap` 24, `FargateVcpuCap` 8, `AppName`
+`FargateSpotVcpuCap` 48, `FargateVcpuCap` 8, `AppName`
 `zeroae-ci-runner`, `RunnerGroup` `ci-runner`, `LogRetentionDays` 30,
 `ExistingOidcProviderArn` empty), and an existing stack keeps whatever values
 it already has. In `zeroae-code` GitHub's OIDC provider already exists, so
@@ -67,7 +67,7 @@ make build
 $AWS cloudformation deploy --stack-name ci-runner \
   --template-file build/template.yaml --s3-bucket "$B" --s3-prefix ci-runner \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
-  --parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8 FargateSpotVcpuCap=24 FargateVcpuCap=8
+  --parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8 FargateSpotVcpuCap=48 FargateVcpuCap=8
 ```
 
 `SpotVcpuCap` draws on the EC2 Spot vCPU quota (`L-34B43A08`),
@@ -520,7 +520,7 @@ types.
 | A job's runner was launched for another job (`$RUNNER_NAME` ends in another job id), and that other job sits "Waiting for a runner" | a swap. The webhook repairs it on the job's `in_progress` (its log says `swap`), and the launcher then launches a runner for the other job. No `swap` line: check the webhook's log for errors (its role needs `ec2:DescribeInstances` and `ec2:CreateTags`, and for a task `ecs:ListTasks`, `ecs:DescribeTasks` and `ecs:TagResource`); cancel and re-run the waiting job |
 | A Fargate Spot job was lost (its task's `stopCode` is `SpotInterruption`) and its commit has no `ci-runner / <job>` check run | the notifier logged `ignored: <task id> is no job task of this stack` for every change of the stop: it found no job tags on the task. ECS keeps a stopped task's tags readable through `DescribeTasks` (measured live), so check the task's tags (`describe-tasks --include TAGS`, within an hour of the stop; `list-tags-for-resource` refuses a stopped task) and the notifier's role. Re-run the job |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
-| A budget lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8 FargateSpotVcpuCap=24 FargateVcpuCap=8`. Each draws on its own vCPU quota (see "Deploy and update the stack") |
+| A budget lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8 FargateSpotVcpuCap=48 FargateVcpuCap=8`. Each draws on its own vCPU quota (see "Deploy and update the stack") |
 | A job on `ci-fargate-spot` or `ci-fargate` fails at a Docker step: `failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running`, or a `services:`/`container:` job or Docker action fails to start | Docker used on Fargate. A Fargate capacity has no Docker daemon, by design (ADR-0001): move the job to `ci-spot` or `ci-ondemand`, or drop its Docker use |
 | The launcher logs `no task launched:` with a reason about a vCPU limit, and the job's message keeps coming back until the dead-letter queue | a Fargate quota at its default (6 vCPUs, `L-36FBB829` Spot, `L-3032A538` On-Demand) or below the capacity's budget. Request an increase (Service Quotas, service `fargate`) or lower `FargateSpotVcpuCap`/`FargateVcpuCap` under the quota; then re-run the job. The quota counts every Fargate task in the account, not only ours |
 | A Fargate job's build is slow, or runs out of memory, with many more compiler processes than the size's vCPUs | `nproc` over-reports inside a task. The job's environment sets `MAKEFLAGS=-j<n>` and `CI_RUNNER_VCPUS=<n>`, and the entrypoint caps cargo with `/home/runner/.cargo/config.toml` (its log says `cargo jobs = <n>`, or why not). A tool that reads `nproc` any other way needs `-j` from `CI_RUNNER_VCPUS` |

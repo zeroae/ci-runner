@@ -39,8 +39,8 @@ one size label and one architecture label: neither has a default, so a job
 without them waits for a runner that never comes. A job that used to name only
 its capacity got 4 vCPUs and `x64`; add `ci-cpu-4` and `x64` to keep that shape.
 
-The CI runners hold at most 24 Spot, 8 On-Demand, 24 Fargate Spot and 8
-Fargate On-Demand vCPUs at once, across all repos (six, two, six and two
+The CI runners hold at most 24 Spot, 8 On-Demand, 48 Fargate Spot and 8
+Fargate On-Demand vCPUs at once, across all repos (six, two, twelve and two
 `ci-cpu-4` runners). A job that would go over that waits in
 a queue until enough finish. If an EC2 Spot reclaim kills
 a job, a failed check run named `ci-runner / <job name>` appears on its

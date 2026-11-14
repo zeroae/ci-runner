@@ -34,7 +34,7 @@ Parameters:
     Description: Most vCPUs the On-Demand CI runners hold at once, both architectures (soft). Draws on the EC2 On-Demand vCPU quota.
   FargateSpotVcpuCap:
     Type: Number
-    Default: 24
+    Default: 48
     Description: Most vCPUs the Fargate Spot CI runners hold at once, both architectures (soft). Draws on the Fargate Spot vCPU quota.
   FargateVcpuCap:
     Type: Number
