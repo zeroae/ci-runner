@@ -402,7 +402,7 @@ types.
   The Fargate budgets aren't in the stack yet; their rows are for when the
   Fargate capacities land.
 
-- **Template size:** 54,208 bytes, 5% of the S3 deploy's 1 MB limit. It's
+- **Template size:** 55,871 bytes, 5% of the S3 deploy's 1 MB limit. It's
   already over the 51,200 bytes a template can be sent inline, so it deploys
   only through the deploy bucket.
 
