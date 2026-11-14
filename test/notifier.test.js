@@ -422,6 +422,14 @@ test('a job that succeeded in a re-run clears the report of its earlier attempt'
   assert.equal(patchOf(gh).body.conclusion, 'neutral');
 });
 
+test('a job that succeeded in a repo outside the org is ignored without a GitHub call', async () => {
+  const gh = fakeGitHub({ existing: [STANDING] });
+  const { handler, logs } = setup({ gh });
+  await handler({ jobSucceeded: { ...SUCCEEDED.jobSucceeded, repo: 'elsewhere/app' } });
+  assert.deepEqual(gh.keys(), []);
+  assert.match(logs.join('\n'), /ignored: elsewhere\/app is outside zeroae/);
+});
+
 test('a job that succeeded, with no installation id, looks the installation up', async () => {
   const gh = fakeGitHub({ existing: [STANDING] });
   await setup({ gh }).handler({ jobSucceeded: { ...SUCCEEDED.jobSucceeded, installation_id: undefined } });

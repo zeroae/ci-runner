@@ -169,6 +169,13 @@ test('a second notifier rule matches every change of a Fargate Spot reclaim in t
   assert.match(perm, /SourceArn: !GetAtt NotifierTaskRule\.Arn\n/);
 });
 
+test('the webhook may invoke only the notifier, and knows its name', () => {
+  const lambda = statements(resource('WebhookRole')).filter((s) => /lambda:/.test(s));
+  assert.equal(lambda.length, 1);
+  assert.match(lambda[0], /^Allow\n {16}Action: lambda:InvokeFunction\n {16}Resource: !GetAtt NotifierFunction\.Arn\n/);
+  assert.match(resource('WebhookFunction'), /\n {10}NOTIFIER_FUNCTION: !Ref NotifierFunction\n/);
+});
+
 test('the notifier may describe only the cluster\'s tasks, and nothing else on ECS', () => {
   const ecs = statements(resource('NotifierRole')).filter((s) => /ecs:/.test(s));
   assert.deepEqual(ecs, [

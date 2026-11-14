@@ -70,6 +70,8 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
   // of an earlier attempt of the job, which a re-run of the run left behind:
   // its details_url is under the same run.
   async function jobSucceeded(j) {
+    // The same fence as a reclaim event's: only the org's repos.
+    if (String(j.repo).split('/')[0] !== env.GITHUB_ORG) return log(`ignored: ${j.repo} is outside ${env.GITHUB_ORG}`);
     const token = await tokenFor(j.repo, j.installation_id);
     const run = `https://github.com/${j.repo}/actions/runs/${j.run_id}`;
     const standing = (await reportsNamed(j.repo, token, j.head_sha, `ci-runner / ${j.job_name}`))
