@@ -70,7 +70,8 @@ the host's Docker daemon, so a `docker run -v` source is a path on the host.
 a bind mount from any of them works as it does on a GitHub-hosted runner,
 `mktemp` files and `~/` config included. Both are on the 50 GB root disk. A mount from anywhere else (`/opt`,
 `/etc`, `/var`) gets an empty host path. Nothing is pinned: every boot pulls
-`:latest`, and the image is rebuilt weekly.
+`:latest`, and the image is rebuilt weekly, for linux/amd64 and linux/arm64,
+each built and smoke-tested on its own native runner.
 
 **Deploy jobs** keep their AWS access as before (typically GitHub OIDC into the
 repo's own role). A trust policy that pins `runner_environment: github-hosted`
