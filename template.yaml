@@ -144,7 +144,7 @@ Resources:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
-  # --- webhook: verify, label contract, fence 3, enqueue ----------------------
+  # --- webhook: verify, label contract, fence 3, enqueue, swap repair ---------
   WebhookLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -176,6 +176,19 @@ Resources:
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt JobQueue.Arn
+              # Swap repair: find a runner's instance, and re-tag it with the
+              # job it really runs. Only the job tags, only the stack's instances.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
 
   WebhookFunction:
     Type: AWS::Lambda::Function
@@ -194,6 +207,7 @@ Resources:
           SECRET_ARN: !Ref AppSecret
           QUEUE_URL: !Ref JobQueue
           GITHUB_ORG: !Ref GitHubOrg
+          STACK_NAME: !Ref AWS::StackName
       Code:
         ZipFile: |
           //@inline functions/webhook.js
