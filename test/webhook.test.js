@@ -18,7 +18,7 @@ function setup({ secretValue = { webhook_secret: SECRET } } = {}) {
 }
 
 // A workflow_job payload as GitHub sends it (only the fields that matter).
-function job({ action = 'queued', labels = ['self-hosted', 'ci-spot'], visibility = 'private', owner = 'zeroae' } = {}) {
+function job({ action = 'queued', labels = ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'], visibility = 'private', owner = 'zeroae' } = {}) {
   return {
     action,
     workflow_job: {
@@ -46,7 +46,7 @@ test('an accepted ci-spot job is enqueued with every field', async () => {
   assert.equal(res.statusCode, 202);
   assert.deepEqual(sent, [{
     repo: 'zeroae/app', job_id: 555, run_id: 444, head_sha: 'abc123', job_name: 'tests',
-    label: 'ci-spot', vcpus: 4, arch: 'x64', labels: ['self-hosted', 'ci-spot'], installation_id: 181,
+    label: 'ci-spot', vcpus: 4, arch: 'x64', labels: ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'], installation_id: 181,
   }]);
 });
 
@@ -64,12 +64,18 @@ test('every size label is enqueued with its vCPUs and the architecture', async (
   }
 });
 
-test('a missing size or architecture label defaults to ci-cpu-4 and x64', async () => {
-  for (const labels of [['self-hosted', 'ci-spot', 'x64'], ['self-hosted', 'ci-spot', 'ci-cpu-4'], ['self-hosted', 'linux', 'ci-ondemand']]) {
+test('a job missing its size label or its architecture label is outside the contract', async () => {
+  for (const labels of [
+    ['self-hosted', 'ci-spot', 'x64'],
+    ['self-hosted', 'ci-ondemand', 'arm64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4'],
+    ['self-hosted', 'linux', 'ci-ondemand', 'ci-cpu-8'],
+    ['self-hosted', 'ci-spot'],
+    ['self-hosted', 'linux', 'ci-ondemand'],
+  ]) {
     const { handler, sent } = setup();
-    await handler(delivery(job({ labels })));
-    assert.equal(sent[0].vcpus, 4, labels.join(','));
-    assert.equal(sent[0].arch, 'x64', labels.join(','));
+    assert.equal((await handler(delivery(job({ labels })))).statusCode, 200, labels.join(','));
+    assert.equal(sent.length, 0, labels.join(','));
   }
 });
 
@@ -121,35 +127,35 @@ test('an arm64 job is enqueued with arch arm64, on either capacity and at every 
     }
   }
   const { handler, sent } = setup();
-  await handler(delivery(job({ labels: ['Self-Hosted', 'CI-Spot', 'ARM64'] })));
+  await handler(delivery(job({ labels: ['Self-Hosted', 'CI-Spot', 'CI-CPU-4', 'ARM64'] })));
   assert.deepEqual([sent[0].vcpus, sent[0].arch], [4, 'arm64']);
 });
 
-test('the label contract: self-hosted, exactly one capacity label, at most one size and one architecture label, and linux', async () => {
+test('the label contract: self-hosted, exactly one capacity, size and architecture label, and linux', async () => {
   const accepted = [
-    ['self-hosted', 'ci-spot'],
-    ['self-hosted', 'ci-ondemand'],
-    ['self-hosted', 'linux', 'x64', 'ci-spot'],
-    ['Self-Hosted', 'CI-Spot'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'],
+    ['self-hosted', 'ci-ondemand', 'ci-cpu-4', 'x64'],
+    ['self-hosted', 'linux', 'x64', 'ci-cpu-2', 'ci-spot'],
+    ['Self-Hosted', 'CI-Spot', 'CI-CPU-4', 'X64'],
     ['self-hosted', 'ci-spot', 'ci-cpu-8', 'x64'],
-    ['self-hosted', 'linux', 'ci-ondemand', 'ci-cpu-2'],
-    ['self-hosted', 'ci-spot', 'arm64'],
+    ['self-hosted', 'linux', 'ci-ondemand', 'ci-cpu-2', 'arm64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-16', 'arm64'],
     ['self-hosted', 'linux', 'ci-spot', 'ci-cpu-8', 'arm64'],
   ];
   const ignored = [
     ['ci-spot'],
     ['self-hosted'],
-    ['self-hosted', 'ci-spot', 'ci-ondemand'],
-    ['self-hosted', 'ci-spot', 'gpu'],
-    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'ci-cpu-8'],
-    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'ci-cpu-8'],
-    ['self-hosted', 'ci-spot', 'ci-cpu-3'],
-    ['self-hosted', 'ci-spot', 'ci-cpu-32'],
-    ['self-hosted', 'ci-spot', 'x64', 'arm64'],
+    ['self-hosted', 'ci-spot', 'ci-ondemand', 'ci-cpu-4', 'x64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64', 'gpu'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'ci-cpu-8', 'x64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'ci-cpu-8', 'x64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-3', 'x64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-32', 'x64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64', 'arm64'],
     ['self-hosted', 'ci-spot', 'ci-cpu-8', 'ARM64', 'x64'],
-    ['self-hosted', 'ci-spot', 'arm64', 'arm64'],
-    ['self-hosted', 'ci-spot', 'aarch64'],
-    ['self-hosted', 'ci-spot', 'x64', 'x64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'arm64', 'arm64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'aarch64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64', 'x64'],
     ['ubuntu-latest'],
     [],
   ];
@@ -167,7 +173,7 @@ test('the label contract: self-hosted, exactly one capacity label, at most one s
 
 test('the capacity label is reported in lower case', async () => {
   const { handler, sent } = setup();
-  await handler(delivery(job({ labels: ['self-hosted', 'CI-OnDemand'] })));
+  await handler(delivery(job({ labels: ['self-hosted', 'CI-OnDemand', 'ci-cpu-4', 'x64'] })));
   assert.equal(sent[0].label, 'ci-ondemand');
 });
 

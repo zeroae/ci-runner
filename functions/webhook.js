@@ -26,20 +26,20 @@ function signatureOk(key, raw, sig) {
   return got.length === want.length && crypto.timingSafeEqual(got, want);
 }
 
-// The label contract: `self-hosted`, exactly one capacity label, at most one
-// size label (default ci-cpu-4), at most one architecture label (default x64),
-// and optionally `linux`. Returns the job's shape, or null outside it.
-// The defaults are the expand step: they go once every repo names its shape.
+// The label contract: `self-hosted`, exactly one capacity label, exactly one
+// size label, exactly one architecture label, and optionally `linux`. None has
+// a default, so a swap only happens between runners of the same shape.
+// Returns the job's shape, or null outside it.
 function shape(labels) {
   const ls = (labels || []).map((l) => String(l).toLowerCase());
   const of = (set) => ls.filter((l) => set.includes(l));
   const caps = of(CAPACITY);
   const sizes = of(Object.keys(SIZE));
   const archs = of(ARCH);
-  if (!ls.includes('self-hosted') || caps.length !== 1 || sizes.length > 1 || archs.length > 1) return null;
+  if (!ls.includes('self-hosted') || caps.length !== 1 || sizes.length !== 1 || archs.length !== 1) return null;
   const known = ['self-hosted', 'linux', ...CAPACITY, ...Object.keys(SIZE), ...ARCH];
   if (!ls.every((l) => known.includes(l))) return null;
-  return { label: caps[0], vcpus: SIZE[sizes[0] || 'ci-cpu-4'], arch: archs[0] || 'x64' };
+  return { label: caps[0], vcpus: SIZE[sizes[0]], arch: archs[0] };
 }
 
 function createHandler({ secret, queue, env }) {
