@@ -8,7 +8,8 @@ const crypto = require('node:crypto');
 const CAPACITY = ['ci-spot', 'ci-ondemand', 'ci-fargate-spot', 'ci-fargate'];
 const SIZE = { 'ci-cpu-2': 2, 'ci-cpu-4': 4, 'ci-cpu-8': 8, 'ci-cpu-16': 16 };
 const ARCH = ['x64', 'arm64'];
-// The shape of an instance launched before the shape tags.
+// The shape of an instance or task launched before the shape tags, which
+// swap repair re-queues with it. The launcher carries a copy.
 const DEFAULT_SHAPE = { vcpus: 4, arch: 'x64' };
 
 function reply(statusCode, text) {
@@ -139,14 +140,15 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
     const shape = shapeOf(job.labels);
     if (!shape) return reply(200, 'ignored: labels');
 
-    // The message's `label` is the capacity label, as queued messages carry it.
-    const wire = { label: shape.capacity, vcpus: shape.vcpus, arch: shape.arch };
+    // The shape as the queue message carries it. The message's `label` is the
+    // capacity label, as queued messages carry it.
+    const queuedShape = { label: shape.capacity, vcpus: shape.vcpus, arch: shape.arch };
     const msg = {
       repo: repo.full_name, job_id: job.id, run_id: job.run_id, head_sha: job.head_sha,
-      job_name: job.name, ...wire, labels: job.labels, installation_id: p.installation && p.installation.id,
+      job_name: job.name, ...queuedShape, labels: job.labels, installation_id: p.installation && p.installation.id,
     };
     await queue.send(msg);
-    log(JSON.stringify({ enqueued: msg.repo, job_id: msg.job_id, ...wire }));
+    log(JSON.stringify({ enqueued: msg.repo, job_id: msg.job_id, ...queuedShape }));
     return reply(202, 'enqueued');
   };
 }
