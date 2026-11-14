@@ -171,7 +171,7 @@ test('a second notifier rule matches every change of a Fargate Spot reclaim in t
 
 test('the notifier\'s timeout outlasts its watch of a job after a Spot warning', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'functions', 'notifier.js'), 'utf8');
-  const watchMs = Number(src.match(/^const WATCH_MS = (\d+);/m)[1]) * Number(src.match(/^const WATCHES = (\d+);/m)[1]);
+  const watchMs = Number(src.match(/^const WATCH_INTERVAL_MS = (\d+);/m)[1]) * Number(src.match(/^const WATCH_LOOKS = (\d+);/m)[1]);
   const timeout = Number(resource('NotifierFunction').match(/\n {6}Timeout: (\d+)\n/)[1]);
   assert.ok(timeout * 1000 >= watchMs + 30000, `${timeout} s is too short for a ${watchMs / 1000} s watch plus the calls around it`);
 });

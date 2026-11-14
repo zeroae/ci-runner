@@ -314,8 +314,8 @@ A job lost **without** that check run wasn't a Spot reclaim. Look in the
 notifier's log for a line `reported <instance or task id>: <repo> job <id>`
 (or `already reported ...`, or `survived ...`). A line
 `ignored <id>: its runner is not running job <id> (...)` means the machine's
-CI runner ran no job when the warning came. An instance from `make hand-launch`, or a task
-run by hand, carries no job tags, so the notifier ignores it and logs
+CI runner ran no job when the warning came. An instance from `make hand-launch`,
+or a task run by hand, carries no job tags, so the notifier ignores it and logs
 `ignored: <instance> is no job instance of this stack` (`... no job task
 ...` for a task). A task's stop code is in `describe-tasks` (below):
 `SpotInterruption` is a reclaim. A job that sits

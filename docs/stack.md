@@ -499,8 +499,10 @@ For each event it:
    despite the Spot reclaim warning`, and logs `survived <id>: <repo> job <id>`.
    A job that completes with any other conclusion, or is still running when the
    watch ends, keeps the `failure`. A task's later changes find the check run
-   (either title) and stop at step 5, or find the job no longer running and stop
-   at step 3, so only the first change watches.
+   (either title) and stop at step 5, so only the first change watches. A
+   standing `failure` whose job has since finished with `success` (the watch
+   ended or failed, and a retry or a later change found it) is also changed to
+   `neutral` at step 5.
 
 A GitHub failure fails the invocation, and EventBridge's async invoke retries
 it. Two events handled at the same moment can still report twice.
