@@ -150,3 +150,29 @@ test('the launcher\'s role runs only the two task definitions in the cluster, an
     assert.match(s, /RunnerCluster|RunnerTaskDefinition/, `${s}: not limited to the cluster`);
   }
 });
+
+// Tasks get the instances' lifecycle (#30).
+test('a second notifier rule matches a Fargate Spot reclaim of the cluster\'s tasks, once per task', () => {
+  const rule = resource('NotifierTaskRule');
+  assert.match(rule, /^ {4}Type: AWS::Events::Rule\n/);
+  assert.match(rule, /Name: !Sub "\$\{AWS::StackName\}-notifier-tasks"\n/);
+  assert.equal(rule.split('EventPattern:\n')[1].split(/\n {6}\w/)[0], [
+    '        source: [aws.ecs]',
+    '        detail-type: [ECS Task State Change]',
+    '        detail:',
+    '          clusterArn: [!GetAtt RunnerCluster.Arn]',
+    '          stopCode: [SpotInterruption]',
+    '          lastStatus: [STOPPED]',
+  ].join('\n'));
+  assert.match(rule, /Arn: !GetAtt NotifierFunction\.Arn\n/);
+  const perm = resource('NotifierTaskRulePermission');
+  assert.match(perm, /Principal: events\.amazonaws\.com\n/);
+  assert.match(perm, /SourceArn: !GetAtt NotifierTaskRule\.Arn\n/);
+});
+
+test('the notifier may describe only the cluster\'s tasks, and nothing else on ECS', () => {
+  const ecs = statements(resource('NotifierRole')).filter((s) => /ecs:/.test(s));
+  assert.deepEqual(ecs, [
+    'Allow\n                Action: ecs:DescribeTasks\n                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"\n',
+  ]);
+});

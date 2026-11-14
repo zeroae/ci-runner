@@ -536,12 +536,15 @@ Resources:
               - Effect: Allow
                 Action: ec2:DescribeInstances
                 Resource: "*"
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
 
   NotifierFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-notifier"
-      Description: Reports a Spot reclaim as a failed check run.
+      Description: Reports a Spot reclaim, of an instance or a task, as a failed check run.
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt NotifierRole.Arn
@@ -577,6 +580,31 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt NotifierRule.Arn
+
+  # A Fargate Spot reclaim: the task's last change, to STOPPED, so one check
+  # run per task (the earlier changes carry the stop code too).
+  NotifierTaskRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-notifier-tasks"
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [!GetAtt RunnerCluster.Arn]
+          stopCode: [SpotInterruption]
+          lastStatus: [STOPPED]
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+
+  NotifierTaskRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NotifierTaskRule.Arn
 
   # --- network: a VPC of its own, public subnets, no NAT --------------------
   Vpc:
