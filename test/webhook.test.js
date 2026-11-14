@@ -291,3 +291,35 @@ test('in_progress from outside the fence is refused before any lookup', async ()
   assert.equal((await handler(delivery(job({ action: 'in_progress', runner: RUNNER, visibility: 'public' })))).statusCode, 403);
   assert.deepEqual([sent, described], [[], []]);
 });
+
+// The Fargate capacities (#29): Docker-free jobs, ADR-0001.
+test('both Fargate capacities are enqueued with every size and architecture', async () => {
+  for (const cap of ['ci-fargate-spot', 'ci-fargate']) {
+    for (const [size, vcpus] of [['ci-cpu-2', 2], ['ci-cpu-4', 4], ['ci-cpu-8', 8], ['ci-cpu-16', 16]]) {
+      for (const arch of ['x64', 'arm64']) {
+        const labels = ['self-hosted', cap, size, arch];
+        const { handler, sent } = setup();
+        assert.equal((await handler(delivery(job({ labels })))).statusCode, 202, labels.join(','));
+        assert.deepEqual(
+          { label: sent[0].label, vcpus: sent[0].vcpus, arch: sent[0].arch, labels: sent[0].labels },
+          { label: cap, vcpus, arch, labels },
+        );
+      }
+    }
+  }
+  const { handler, sent } = setup();
+  await handler(delivery(job({ labels: ['Self-Hosted', 'CI-Fargate-Spot', 'ci-cpu-4', 'ARM64', 'Linux'] })));
+  assert.equal(sent[0].label, 'ci-fargate-spot');
+});
+
+test('a Fargate capacity next to another capacity label is outside the contract', async () => {
+  for (const labels of [
+    ['self-hosted', 'ci-fargate', 'ci-fargate-spot', 'ci-cpu-4', 'x64'],
+    ['self-hosted', 'ci-fargate-spot', 'ci-spot', 'ci-cpu-4', 'x64'],
+    ['self-hosted', 'ci-fargate', 'ci-ondemand', 'ci-cpu-4', 'x64'],
+  ]) {
+    const { handler, sent } = setup();
+    assert.equal((await handler(delivery(job({ labels })))).statusCode, 200, labels.join(','));
+    assert.equal(sent.length, 0);
+  }
+});
