@@ -120,8 +120,8 @@ repo. Whoever deploys a branch owns the stack until they report back.
   ```
 
 - **Image changes need `main`.** A change under `image/` reaches the runners
-  only once `image.yml` publishes it from `main` (see "The runner image in
-  ECR" in [stack.md](stack.md)); a branch deploy can't prove it.
+  only once `image.yml` publishes it from `main` (see "Image changes land on
+  `main` first" in [stack.md](stack.md)); a branch deploy can't prove it.
 - **Clean up** what the proof made: throwaway canary branches, runner
   registrations and tasks made by hand.
 

@@ -547,3 +547,12 @@ On `main`, with both variables set, it then assumes the push role and
 pushes the same index to ECR under `:<date>-<sha>` and `:latest`. Without
 the variables (before the stack has the repo) those two steps are skipped
 and the GHCR publish is unaffected.
+
+### Image changes land on `main` first
+
+`image.yml` publishes, to GHCR and to ECR, only from `main`, and the push
+role trusts only `main`, so a change under `image/` reaches no runner until
+it is on `main`. Make an `image/` change its own commit, and land it on
+`main` before anything that needs it live. An integration branch that
+carries such commits (cherry-picked to `main`, then merged back) lands with
+a merge commit: a rebase would re-resolve every one of those conflicts.
