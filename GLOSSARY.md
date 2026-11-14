@@ -37,7 +37,7 @@ _Avoid_: Fargate pool
 
 **vCPU budget**:
 The most vCPUs that the CI runners of one capacity may hold at once. A job that would go over it waits.
-_Avoid_: cap (that was the old runner count)
+_Avoid_: "cap" in prose (that was the old runner count). The parameters that set the budgets are still named `*VcpuCap` (`SpotVcpuCap`, `OnDemandVcpuCap`, `FargateSpotVcpuCap`, `FargateVcpuCap`).
 
 **Spot reclaim**:
 AWS taking back Spot capacity, EC2 or Fargate, while a job runs. The job is lost and is reported as one on its commit.
