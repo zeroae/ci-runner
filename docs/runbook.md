@@ -106,7 +106,9 @@ repo. Whoever deploys a branch owns the stack until they report back.
 - **Deploy on top of the latest work.** Merge the integration branch's tip
   (or `main`) into your branch first, so your deploy carries everyone's
   changes, not an older stack.
-- **Review first.** Deploy a change set that has had its `/code-review`.
+- **Review twice.** Deploy only code that has had its `/code-review`, and
+  read the CloudFormation change set before executing it: in-place updates
+  only, nothing replaced or deleted.
 - **Keep shared budgets.** Consumer jobs draw on the same budgets, so prove a
   deferral on On-Demand at a low budget, not by lowering Spot. Restore every
   parameter you override from the same script, with a `trap`, so a failure
