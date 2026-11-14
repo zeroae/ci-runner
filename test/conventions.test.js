@@ -26,7 +26,13 @@ test('every IAM role and policy is PowerUserPB-${AWS::StackName}-*, and every ro
     assert.ok(names.length > 0, `${r.name} has no explicit name`);
     for (const n of names) assert.match(n, /^!Sub "PowerUserPB-\$\{AWS::StackName\}-[\w-]+"$/, `${r.name}: ${n}`);
     if (r.type === 'AWS::IAM::Role') {
-      assert.match(r.body, /PermissionsBoundary: arn:aws:iam::aws:policy\/PowerUserAccess\n/, `${r.name} has no boundary`);
+      // PowerUserAccess allows no iam:PassRole, so a role that passes one has
+      // the account's ZAEPowerUserBoundary: PowerUserAccess plus PassRole on
+      // PowerUserPB* roles only.
+      const boundary = /Action: iam:PassRole\n/.test(r.body)
+        ? /PermissionsBoundary: !Sub "arn:\$\{AWS::Partition\}:iam::\$\{AWS::AccountId\}:policy\/ZAEPowerUserBoundary"\n/
+        : /PermissionsBoundary: arn:aws:iam::aws:policy\/PowerUserAccess\n/;
+      assert.match(r.body, boundary, `${r.name} has no boundary, or the wrong one`);
     }
   }
   assert.match(read('Makefile'), /--capabilities CAPABILITY_NAMED_IAM/);

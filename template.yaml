@@ -261,7 +261,11 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "PowerUserPB-${AWS::StackName}-launcher"
-      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      # RunTask passes the execution role, and PowerUserAccess allows no
+      # iam:PassRole. The account's ZAEPowerUserBoundary is PowerUserAccess
+      # plus PassRole on PowerUserPB* roles; the policy below narrows that to
+      # the execution role.
+      PermissionsBoundary: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/ZAEPowerUserBoundary"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
