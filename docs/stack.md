@@ -136,12 +136,16 @@ sweeper (or GitHub, for ephemeral runners) removes it.
 ## Launching one by hand
 
 `make hand-launch` (`scripts/hand-launch.sh`) mints an org JIT config for the
-`ci-runner` group with labels `self-hosted`, `ci-spot`, `SIZE` and `ARCH`
-(both required; neither has a default) through the owner's `gh`, which needs
-`admin:org`. It then renders the user-data and launches one Spot instance of
-that size and architecture as above, tagged with its shape (`make hand-launch
-SIZE=ci-cpu-8 ARCH=x64` launches an x64 `.2xlarge`; `ARCH=arm64` a Graviton
-from the arm64 launch template). It prints the instance id. `IDLE_SECONDS=120` shortens the
+`ci-runner` group with labels `self-hosted`, `CAPACITY`, `SIZE` and `ARCH`
+(all required; none has a default) through the owner's `gh`, which needs
+`admin:org`. It then renders the user-data and launches one instance of that
+shape as above, with the launcher's fleet options: Spot `capacity-optimized`
+for `CAPACITY=ci-spot`, On-Demand `lowest-price` for `ci-ondemand`. It is
+tagged with its shape (`make hand-launch CAPACITY=ci-spot SIZE=ci-cpu-8
+ARCH=x64` launches an x64 Spot `.2xlarge`; `ARCH=arm64` a Graviton from the
+arm64 launch template). It refuses `ci-fargate-spot` and `ci-fargate`, which
+run a task, not an instance: the runbook's "Run a task by hand" does that.
+It prints the instance id. `IDLE_SECONDS=120` shortens the
 idle exit for a test. `make runners` lists the stack's instances that are not
 terminated.
 

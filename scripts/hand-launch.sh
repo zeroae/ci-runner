@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Launches one CI runner by hand: mints an org JIT config for the runner group
 # (with the owner's gh, which needs admin:org), renders its #cloud-config and
-# launches one Spot instance of size SIZE from the stack's launch template for
-# ARCH. The instance takes one job labelled [self-hosted, LABEL, SIZE, ARCH] and
-# terminates; given no job, it terminates after the idle exit (15 minutes;
-# IDLE_SECONDS overrides it). SIZE and ARCH are required, as in the label
-# contract: neither has a default.
+# launches one instance of capacity CAPACITY (ci-spot: Spot; ci-ondemand:
+# On-Demand) and size SIZE from the stack's launch template for ARCH, with the
+# launcher's fleet options. The instance takes one job labelled
+# [self-hosted, CAPACITY, SIZE, ARCH] and terminates; given no job, it
+# terminates after the idle exit (15 minutes; IDLE_SECONDS overrides it).
+# CAPACITY, SIZE and ARCH are required, as in the label contract: none has a
+# default. A Fargate capacity has no instance: see the runbook's "Run a task
+# by hand".
 #
-#   SIZE=ci-cpu-4 ARCH=x64 scripts/hand-launch.sh    # or: make hand-launch SIZE=ci-cpu-4 ARCH=x64
-#   SIZE=ci-cpu-8 ARCH=arm64 scripts/hand-launch.sh  # or: make hand-launch SIZE=ci-cpu-8 ARCH=arm64
+#   CAPACITY=ci-spot SIZE=ci-cpu-4 ARCH=x64 scripts/hand-launch.sh
+#   make hand-launch CAPACITY=ci-ondemand SIZE=ci-cpu-8 ARCH=arm64
 #
-# Prints the instance id. Overrides: STACK PROFILE REGION ORG GROUP LABEL IDLE_SECONDS
+# Prints the instance id. Overrides: STACK PROFILE REGION ORG GROUP IDLE_SECONDS
 set -euo pipefail
 
 STACK=${STACK:-ci-runner}
@@ -18,9 +21,17 @@ PROFILE=${PROFILE:-zeroae-code/ZAEPowerUserAccess}
 REGION=${REGION:-us-east-1}
 ORG=${ORG:-zeroae}
 GROUP=${GROUP:-ci-runner}
-LABEL=${LABEL:-ci-spot}
+CAPACITY=${CAPACITY:?CAPACITY is required: ci-spot or ci-ondemand}
 SIZE=${SIZE:?SIZE is required: one of ci-cpu-2, ci-cpu-4, ci-cpu-8, ci-cpu-16}
 ARCH=${ARCH:?ARCH is required: one of x64, arm64}
+# The capacity's fleet options, as the launcher sets them.
+case $CAPACITY in
+  ci-spot) market=spot; options='"SpotOptions": {"AllocationStrategy": "capacity-optimized"}' ;;
+  ci-ondemand) market=on-demand; options='"OnDemandOptions": {"AllocationStrategy": "lowest-price"}' ;;
+  ci-fargate-spot | ci-fargate)
+    echo "$CAPACITY runs a Fargate task, not an instance: see \"Run a task by hand\" in docs/runbook.md" >&2; exit 1 ;;
+  *) echo "unknown capacity $CAPACITY: ci-spot or ci-ondemand" >&2; exit 1 ;;
+esac
 # The size label's instance size, at 4 GB per vCPU, as the launcher maps it.
 case $SIZE in
   ci-cpu-2) size=large ;; ci-cpu-4) size=xlarge ;; ci-cpu-8) size=2xlarge ;; ci-cpu-16) size=4xlarge ;;
@@ -53,7 +64,7 @@ chmod 700 "$work"
 name="$STACK-hand-$(date -u +%Y%m%d%H%M%S)"
 gh api -X POST "orgs/$ORG/actions/runners/generate-jitconfig" \
   -f name="$name" -F runner_group_id="$group_id" -f work_folder=_work \
-  -f 'labels[]=self-hosted' -f "labels[]=$LABEL" -f "labels[]=$SIZE" -f "labels[]=$ARCH" \
+  -f 'labels[]=self-hosted' -f "labels[]=$CAPACITY" -f "labels[]=$SIZE" -f "labels[]=$ARCH" \
   --jq .encoded_jit_config > "$work/jit"
 node "$here/render-cloud-config.js" < "$work/jit" | base64 -w0 > "$work/user-data"
 
@@ -69,16 +80,16 @@ overrides=$(for t in "${TYPES[@]}"; do for s in "${subnets[@]}"; do
 cat > "$work/fleet.json" <<JSON
 {
   "Type": "instant",
-  "TargetCapacitySpecification": {"TotalTargetCapacity": 1, "DefaultTargetCapacityType": "spot"},
-  "SpotOptions": {"AllocationStrategy": "capacity-optimized"},
+  "TargetCapacitySpecification": {"TotalTargetCapacity": 1, "DefaultTargetCapacityType": "$market"},
+  $options,
   "LaunchTemplateConfigs": [{
     "LaunchTemplateSpecification": {"LaunchTemplateId": "$lt", "Version": "$version"},
     "Overrides": [${overrides%,}]
   }],
   "TagSpecifications": [{"ResourceType": "instance", "Tags": [
     {"Key": "ci-runner:runner", "Value": "$name"},
-    {"Key": "ci-runner:label", "Value": "$LABEL"},
-    {"Key": "ci-runner:capacity", "Value": "$LABEL"},
+    {"Key": "ci-runner:label", "Value": "$CAPACITY"},
+    {"Key": "ci-runner:capacity", "Value": "$CAPACITY"},
     {"Key": "ci-runner:vcpus", "Value": "${SIZE#ci-cpu-}"},
     {"Key": "ci-runner:arch", "Value": "$ARCH"}
   ]}]
@@ -95,5 +106,5 @@ if [[ -z $instance ]]; then
   echo "the JIT runner $name stays registered until removed" >&2
   exit 1
 fi
-echo "$instance  runner $name  labels $LABEL $SIZE $ARCH" >&2
+echo "$instance  runner $name  labels $CAPACITY $SIZE $ARCH" >&2
 echo "$instance"
