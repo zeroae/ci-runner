@@ -22,6 +22,9 @@ const NO_ARM64_AZ = 'use1-az3';
 const ECS_TAG_CHARS = /[^\p{L}\p{Z}\p{N}_.:/=+\-@]/gu;
 const ecsTag = ([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_').slice(0, 256) });
 
+// An EC2 (Key, Value) or ECS (key, value) tag list as an object.
+const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [x.Key ?? x.key, x.Value ?? x.value]));
+
 const b64u = (s) => Buffer.from(s).toString('base64url');
 
 function appJwt(appId, pem, nowMs) {
@@ -100,7 +103,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
       });
       for (const res of r.Reservations || []) {
         for (const i of res.Instances || []) {
-          const t = Object.fromEntries((i.Tags || []).map((x) => [x.Key, x.Value]));
+          const t = tagsOf(i.Tags);
           const capacity = CAPACITY[t['ci-runner:capacity']] || (i.InstanceLifecycle === 'spot' ? 'spot' : 'on-demand');
           if (capacity === type) n += Number(t['ci-runner:vcpus']) || DEFAULT_SHAPE.vcpus;
         }
@@ -167,7 +170,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
         if ((r.taskArns || []).length) {
           const d = await ecs.describeTasks({ cluster: env.CLUSTER, tasks: r.taskArns, include: ['TAGS'] });
           for (const task of d.tasks || []) {
-            const t = Object.fromEntries((task.tags || []).map((x) => [x.key, x.value]));
+            const t = tagsOf(task.tags);
             if (task.lastStatus !== 'STOPPED' && CAPACITY[t['ci-runner:capacity']] === type) n += Number(t['ci-runner:vcpus']) || DEFAULT_SHAPE.vcpus;
           }
         }

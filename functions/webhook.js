@@ -51,6 +51,10 @@ const JOB_TAGS = { repo: 'repo', job_id: 'job-id', run_id: 'run-id', head_sha: '
 const ECS_TAG_CHARS = /[^\p{L}\p{Z}\p{N}_.:/=+\-@]/gu;
 const ecsTag = ([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_').slice(0, 256) });
 
+// An EC2 (Key, Value) or ECS (key, value) tag list as an object,
+// keyed without the ci-runner: prefix.
+const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x.key).replace(/^ci-runner:/, ''), x.Value ?? x.value]));
+
 function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
   // The runner's task in the cluster, not yet told to stop, with its tags.
   async function findTask(name) {
@@ -87,9 +91,7 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
     const i = (r.Reservations || []).flatMap((x) => x.Instances || [])[0];
     const task = !i && (await findTask(name));
     if (!i && !task) return reply(200, 'ignored: no instance or task');
-    const t = Object.fromEntries(i
-      ? (i.Tags || []).map((x) => [x.Key.replace(/^ci-runner:/, ''), x.Value])
-      : (task.tags || []).map((x) => [x.key.replace(/^ci-runner:/, ''), x.value]));
+    const t = tagsOf(i ? i.Tags : task.tags);
     // Already re-tagged for this job: a duplicate delivery.
     if (!t['job-id'] || Number(t['job-id']) === job.id) return reply(200, 'ignored: no swap');
 

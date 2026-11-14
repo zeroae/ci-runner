@@ -16,6 +16,10 @@ function appJwt(appId, pem, nowMs) {
   return `${data}.${crypto.sign('sha256', Buffer.from(data), pem).toString('base64url')}`;
 }
 
+// An EC2 (Key, Value) or ECS (key, value) tag list as an object,
+// keyed without the ci-runner: prefix.
+const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x.key).replace(/^ci-runner:/, ''), x.Value ?? x.value]));
+
 function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log }) {
   async function gh(method, path, token, body) {
     const res = await fetch(API + path, {
@@ -29,19 +33,18 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
 
   return async (event) => {
     const d = event.detail || {};
-    const t = {};
-    let id, machine;
+    let id, machine, t;
     if (d.taskArn) {
       // The event carries no tags; a stopped task is still described for an hour.
       id = d.taskArn.split('/').pop();
       machine = `task (${id})`;
       const task = (await ecs.describeTasks({ cluster: d.clusterArn, tasks: [d.taskArn], include: ['TAGS'] })).tasks?.[0];
-      for (const { key, value } of task?.tags || []) t[key.replace('ci-runner:', '')] = value;
+      t = tagsOf(task?.tags);
     } else {
       id = d['instance-id'];
       machine = `instance (${id})`;
       const inst = id && (await ec2.describe(id)).Reservations?.[0]?.Instances?.[0];
-      for (const { Key, Value } of inst?.Tags || []) t[Key.replace('ci-runner:', '')] = Value;
+      t = tagsOf(inst?.Tags);
     }
     const repo = t.repo || '';
     const jobId = t['job-id'];
