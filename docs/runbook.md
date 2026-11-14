@@ -65,6 +65,13 @@ $AWS cloudformation deploy --stack-name ci-runner \
 `OnDemandVcpuCap` on the EC2 On-Demand one (`L-1216C47A`); each covers x64 and
 arm64 runners together.
 
+A budget is **soft**: a burst can go over it. The launcher handles queue
+messages in parallel, and each one counts only the runners already running, so
+jobs that queue at the same moment all see the same headroom. Seen live on
+2026-11-13: a consumer repo queued 8 Spot jobs at once, and all 8 launched,
+putting 36 of 24 Spot vCPUs in use. The owner chose to keep it soft. Size the
+EC2 quotas for the burst, not the budget.
+
 An override **sticks**: every later `make deploy` keeps it. After lowering a
 budget for a test, restore it explicitly, as above. To see the current values:
 
