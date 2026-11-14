@@ -32,16 +32,16 @@ function signatureOk(key, raw, sig) {
 // size label, exactly one architecture label, and optionally `linux`. None has
 // a default, so a swap only happens between runners of the same shape.
 // Returns the job's shape, or null outside it.
-function shape(labels) {
+function shapeOf(labels) {
   const ls = (labels || []).map((l) => String(l).toLowerCase());
   const of = (set) => ls.filter((l) => set.includes(l));
-  const caps = of(CAPACITY);
+  const capacities = of(CAPACITY);
   const sizes = of(Object.keys(SIZE));
   const archs = of(ARCH);
-  if (!ls.includes('self-hosted') || caps.length !== 1 || sizes.length !== 1 || archs.length !== 1) return null;
+  if (!ls.includes('self-hosted') || capacities.length !== 1 || sizes.length !== 1 || archs.length !== 1) return null;
   const known = ['self-hosted', 'linux', ...CAPACITY, ...Object.keys(SIZE), ...ARCH];
   if (!ls.every((l) => known.includes(l))) return null;
-  return { label: caps[0], vcpus: SIZE[sizes[0]], arch: archs[0] };
+  return { capacity: capacities[0], vcpus: SIZE[sizes[0]], arch: archs[0] };
 }
 
 // The job fields the instance or task carries, as tags.
@@ -103,13 +103,13 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
     // Queue first: if the re-tag then fails, a redelivery still finds the
     // old tags and repairs again, rather than skip a job never re-queued.
     await queue.send(orig);
-    const now = { repo: repo.full_name, job_id: job.id, run_id: job.run_id, head_sha: job.head_sha, job_name: job.name };
-    const tags = Object.entries(JOB_TAGS).map(([f, k]) => [`ci-runner:${k}`, now[f]]);
+    const ran = { repo: repo.full_name, job_id: job.id, run_id: job.run_id, head_sha: job.head_sha, job_name: job.name };
+    const tags = Object.entries(JOB_TAGS).map(([f, k]) => [`ci-runner:${k}`, ran[f]]);
     if (i) await ec2.createTags({ Resources: [i.InstanceId], Tags: tags.map(([Key, v]) => ({ Key, Value: String(v).slice(0, 256) })) });
     else await ecs.tagResource({ resourceArn: task.taskArn, tags: tags.map(ecsTag) });
     log(JSON.stringify({
       swap: name, ...(i ? { instance: i.InstanceId } : { task: task.taskArn }),
-      took: { repo: now.repo, job_id: now.job_id }, requeued: { repo: orig.repo, job_id: orig.job_id },
+      took: { repo: ran.repo, job_id: ran.job_id }, requeued: { repo: orig.repo, job_id: orig.job_id },
     }));
     return reply(202, 'swap repaired');
   }
@@ -134,15 +134,17 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
     }
     if (p.action === 'in_progress') return repairSwap(p, repo, job);
     if (p.action !== 'queued') return reply(200, 'ignored: action');
-    const sh = shape(job.labels);
-    if (!sh) return reply(200, 'ignored: labels');
+    const shape = shapeOf(job.labels);
+    if (!shape) return reply(200, 'ignored: labels');
 
+    // The message's `label` is the capacity label, as queued messages carry it.
+    const wire = { label: shape.capacity, vcpus: shape.vcpus, arch: shape.arch };
     const msg = {
       repo: repo.full_name, job_id: job.id, run_id: job.run_id, head_sha: job.head_sha,
-      job_name: job.name, ...sh, labels: job.labels, installation_id: p.installation && p.installation.id,
+      job_name: job.name, ...wire, labels: job.labels, installation_id: p.installation && p.installation.id,
     };
     await queue.send(msg);
-    log(JSON.stringify({ enqueued: msg.repo, job_id: msg.job_id, ...sh }));
+    log(JSON.stringify({ enqueued: msg.repo, job_id: msg.job_id, ...wire }));
     return reply(202, 'enqueued');
   };
 }

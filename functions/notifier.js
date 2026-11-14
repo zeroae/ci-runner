@@ -57,15 +57,15 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
 
     // A task's job-name tag has `_` for what ECS refuses (brackets, commas):
     // the check run carries the real name, from GitHub.
-    const real = d.taskArn && (await gh('GET', `/repos/${repo}/actions/jobs/${jobId}`, token).catch(() => null));
-    const job = (real && real.name) || t['job-name'] || `job ${jobId}`;
+    const ghJob = d.taskArn && (await gh('GET', `/repos/${repo}/actions/jobs/${jobId}`, token).catch(() => null));
+    const job = (ghJob && ghJob.name) || t['job-name'] || `job ${jobId}`;
     const run = `https://github.com/${repo}/actions/runs/${t['run-id']}`;
     const name = `ci-runner / ${job}`;
     const title = 'Spot capacity reclaimed: re-run this job';
     // A task's reclaim matches on each of its changes, and EventBridge may
     // repeat an event: one check run per job is enough.
-    const { check_runs: done } = await gh('GET', `/repos/${repo}/commits/${t['head-sha']}/check-runs?filter=all&check_name=${encodeURIComponent(name)}`, token);
-    if (done.some((c) => c.external_id === jobId && c.output && c.output.title === title)) return log(`already reported ${id}: ${repo} job ${jobId}`);
+    const { check_runs: existing } = await gh('GET', `/repos/${repo}/commits/${t['head-sha']}/check-runs?filter=all&check_name=${encodeURIComponent(name)}`, token);
+    if (existing.some((c) => c.external_id === jobId && c.output && c.output.title === title)) return log(`already reported ${id}: ${repo} job ${jobId}`);
     await gh('POST', `/repos/${repo}/check-runs`, token, {
       name, head_sha: t['head-sha'], external_id: jobId,
       status: 'completed', conclusion: 'failure', completed_at: new Date(now()).toISOString(),
