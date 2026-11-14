@@ -151,23 +151,31 @@ terminated.
 2. Describes the instances tagged `ci-runner:stack=<stack>`, and terminates
    those `pending`, `running`, `stopping` or `stopped` and launched over
    **2 hours** ago.
-3. Removes each runner in the group that is `offline`, not busy, and has no
-   instance (see below). A GitHub failure doesn't stop step 2, but fails the
-   run.
+3. Lists the cluster's tasks whose desired status is `RUNNING` (not yet told
+   to stop), with their tags, and stops (`StopTask`) those created over
+   **2 hours** ago. Every task in the stack's cluster counts, a hand-run one
+   too.
+4. Removes each runner in the group that is `offline`, not busy, and has no
+   instance or task (see below). A GitHub failure doesn't stop steps 2 and 3,
+   but fails the run; an ECS failure fails it after step 2, before any
+   registration is removed.
 
-Runners are listed before instances are described, so a runner whose
-instance launches between the two is still seen with its instance.
+Runners are listed before instances and tasks are, so a runner whose
+machine launches in between is still seen with it. The run returns
+`{terminated, stopped, removed}`.
 
 Its role allows `GetSecretValue` on the secret, `ec2:DescribeInstances`, and
 `ec2:TerminateInstances` only on instances whose `aws:ResourceTag/ci-runner:stack`
 is the stack's name. A `TerminateInstances` naming an untagged instance, or
-another stack's, is denied.
+another stack's, is denied. On ECS it allows `ecs:ListTasks` with the
+condition `ecs:cluster` = the cluster, and `ecs:DescribeTasks`/`ecs:StopTask`
+only on the cluster's tasks (`task/<cluster>/*`).
 
 ### How a runner finds its instance
 
 Whatever launches a runner (`scripts/hand-launch.sh`, the launcher) must:
 
-- tag the instance `ci-runner:runner=<runner name>`, the name it gave
+- tag the instance or task `ci-runner:runner=<runner name>`, the name it gave
   `generate-jitconfig`. It may also tag `ci-runner:runner-id=<runner id>`;
   either tag matching keeps the registration.
 - put a UTC `YYYYmmddHHMMSS` timestamp of the mint in the name as its own
@@ -177,7 +185,9 @@ Whatever launches a runner (`scripts/hand-launch.sh`, the launcher) must:
   grace.
 
 Every instance not yet `terminated` counts, so a runner whose instance is
-shutting down is removed on a later run.
+shutting down is removed on a later run. A task counts until it is told to
+stop (ECS drops a task's tags then, as aws-emulator shows), so a runner whose
+task the sweeper stops is removed on the next run.
 
 ## Launching for queued jobs: webhook, queue, launcher
 
@@ -209,19 +219,26 @@ On `workflow_job` `in_progress` the webhook reads `runner_name`:
   GitHub-hosted runner, another stack), or whose job id is the event's, is
   ignored (`200`) with no AWS call;
 - otherwise it describes the stack's `pending`/`running` instance tagged
-  `ci-runner:runner=<name>`. No instance, or a `ci-runner:job-id` tag already
-  equal to the event's job (a repeated delivery), is ignored too;
-- otherwise it **re-queues** the instance's job, rebuilt from its tags
+  `ci-runner:runner=<name>`, and if there is none, the cluster's task tagged
+  so among those whose desired status is `RUNNING` (`ListTasks`, then
+  `DescribeTasks` with their tags). No instance or task, or a
+  `ci-runner:job-id` tag already equal to the event's job (a repeated
+  delivery), is ignored too;
+- otherwise it **re-queues** the machine's job, rebuilt from its tags
   (`repo`, `job-id`, `run-id`, `head-sha`, `job-name`, `label`, `vcpus`,
   `arch`, `labels`; the event's installation id), so the launcher's "still
-  queued?" check launches it a runner or drops it. An instance launched
-  before those tags existed re-queues as `ci-cpu-4`/`x64` with `self-hosted`
-  and its capacity label;
-- then **re-tags** the instance with the event's job (`ci-runner:repo`,
-  `job-id`, `run-id`, `head-sha`, `job-name`), so the notifier reports a
-  reclaim on the commit of the job it really ran, and logs
-  `{"swap": <runner>, "instance", "took": {repo, job_id}, "requeued": {repo,
-  job_id}}`, answering `202`.
+  queued?" check launches it a runner or drops it. A task's `labels` are
+  split on spaces, an instance's on commas. A task's `job-name` is the
+  sanitized one (see "The Fargate capacities"); only tags read it, and the
+  notifier fetches the real name. An instance launched before those tags
+  existed re-queues as `ci-cpu-4`/`x64` with `self-hosted` and its capacity
+  label;
+- then **re-tags** the instance (`CreateTags`) or task (`TagResource`) with
+  the event's job (`ci-runner:repo`, `job-id`, `run-id`, `head-sha`,
+  `job-name`), so the notifier reports a reclaim on the commit of the job it
+  really ran. A task's values are sanitized as the launcher's are. It logs
+  `{"swap": <runner>, "instance" or "task", "took": {repo, job_id},
+  "requeued": {repo, job_id}}`, answering `202`.
 
 It queues before it tags: if the tag fails, a redelivery still sees the old
 tags and repairs again. Re-queueing a job that another runner already took is
@@ -229,7 +246,10 @@ harmless: the launcher drops it.
 
 Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue,
 `ec2:DescribeInstances`, and `ec2:CreateTags` only on instances tagged
-`ci-runner:stack=<stack>` and only for the five job tag keys.
+`ci-runner:stack=<stack>` and only for the five job tag keys. On ECS:
+`ecs:ListTasks` with the condition `ecs:cluster` = the cluster, and
+`ecs:DescribeTasks` and `ecs:TagResource` only on the cluster's tasks, the
+latter only for the five job tag keys (`aws:TagKeys`).
 
 **The queue** `${stack}-jobs` has a 120 s visibility timeout. A message that
 fails 5 receives goes to `${stack}-jobs-dlq` (kept 14 days). The outputs are
@@ -345,7 +365,10 @@ are what a hand-run task needs.
 - the instances' `ci-runner:*` tags, plus `ci-runner:stack`. ECS allows only
   letters, digits, spaces and `_ . : / = + - @` in a tag, so on a task
   `ci-runner:labels` is joined by spaces, not commas, and any other character
-  (a job name's brackets or commas) becomes `_`.
+  (a job name's brackets or commas) becomes `_`. The webhook's re-tag
+  sanitizes the same way, with a copy of the launcher's `ECS_TAG_CHARS` and
+  `ecsTag` (bundling one costs more bytes than the copy);
+  `test/conventions.test.js` fails if the copies differ.
 
 The launch is logged as `launched: <task ARN>`. A `RunTask` that returns no
 task fails the message with `no task launched: <reason>: <detail>`.
@@ -377,38 +400,56 @@ stopping no longer counts, like a shutting-down instance) and sums their
 vCPU tag counts as 4. EC2 instances and tasks never count towards each
 other's budgets.
 
-**Not yet for tasks** (#30): the sweeper doesn't stop tasks after 2 hours or
-match a registration to a task, the notifier doesn't report a Fargate Spot
-reclaim, and the swap repair re-tags only instances. Until then a job's
-`timeout-minutes` bounds a task, and an offline Fargate runner is removed by
-the sweeper once it's past its grace period.
+**A task's lifecycle** is an instance's: the sweeper stops it 2 hours after
+launch and keeps its runner's registration while it lives, the swap repair
+re-tags it, and the notifier reports a Fargate Spot reclaim (below).
 
 ## Reporting a Spot reclaim: the notifier
 
-`functions/notifier.js` runs on every **EC2 Spot Instance Interruption
-Warning** in the region (the rule `${stack}-notifier`; an event pattern can't
-match on tags). For each warning it:
+`functions/notifier.js` runs on two rules:
 
-1. Describes the instance, and ignores it (logged) unless it carries
+- `${stack}-notifier`: every **EC2 Spot Instance Interruption Warning** in
+  the region (an event pattern can't match on tags);
+- `${stack}-notifier-tasks`: every **ECS Task State Change** of the stack's
+  cluster with `stopCode: SpotInterruption`. A reclaimed task's changes all
+  carry it, from the warning (desired `STOPPED`, still `RUNNING`, about 2
+  minutes before the stop) to `STOPPED`. ECS drops a task's tags once it is
+  told to stop (aws-emulator does; the live proof checks AWS), so the earliest
+  change is the one to read, and the rule doesn't wait for `STOPPED`.
+
+For each event it:
+
+1. Describes the instance, or the task (`DescribeTasks` with its tags; the
+   event carries none), and ignores it (logged) unless it carries
    `ci-runner:stack=<stack>`, `ci-runner:head-sha`, `ci-runner:job-id` and a
    `ci-runner:repo` in `GITHUB_ORG`: the launcher's tags. An instance from
-   `make hand-launch` has no job tags and is ignored.
+   `make hand-launch` or a task run by hand has no job tags and is ignored,
+   as is a task whose tags are gone.
 2. Signs an App JWT, finds the repo's installation
    (`GET /repos/{repo}/installation`) and gets its token.
-3. Creates a check run on the head sha: name `ci-runner / <job name>` (or
+3. For a task, reads the job's real name from
+   `GET /repos/{repo}/actions/jobs/{job_id}` (the tag has `_` for brackets and
+   commas), falling back to the tag.
+4. Skips the job if the commit already has its reclaim check run (same name,
+   `external_id` the job id, the title below), so a task's later changes and a
+   repeated event report nothing more.
+5. Creates a check run on the head sha: name `ci-runner / <job name>` (or
    `job <id>` with no name), `completed`, conclusion `failure`, title
    `Spot capacity reclaimed: re-run this job`, a summary naming the job and
-   the instance and linking the run, and `details_url` the job's page.
+   the instance or task and linking the run, and `details_url` the job's page.
+   An EC2 reclaim and a Fargate one give the same check run, but for the
+   summary's machine.
 
 A GitHub failure fails the invocation, and EventBridge's async invoke retries
-it. A duplicate event creates a second, identical check run.
+it. Two events handled at the same moment can still report twice.
 
 The launcher, the notifier and the sweeper each carry their own copy of
 `appJwt()` and `gh()`, because bundling a shared module costs more template
 bytes than the copies. `test/conventions.test.js` fails if the copies differ,
 so change all three at once.
 
-Its role allows `GetSecretValue` on the secret and `ec2:DescribeInstances`.
+Its role allows `GetSecretValue` on the secret, `ec2:DescribeInstances`, and
+`ecs:DescribeTasks` only on the cluster's tasks.
 
 ## The runner image in ECR
 

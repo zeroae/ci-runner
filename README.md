@@ -77,7 +77,7 @@ it's in both.
 3. Make the moved job's first step the repo's own toolset check: a script
    that names any missing tool and prints each tool's version.
 4. Give each moved job a `timeout-minutes` under 120 (110 leaves room). The
-   sweeper terminates any instance 2 hours after launch, so a job without one
+   sweeper ends any instance or task 2 hours after launch, so a job without one
    dies with its machine instead of failing on a timeout that names it.
 5. Move one job first, as a canary (usually the test job). Its queued-to-started
    time is the boot time, and that tells you which other jobs are long enough to
