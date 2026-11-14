@@ -453,12 +453,22 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
+              # The cluster's tasks: every one of them is the stack's.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              - Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
 
   SweeperFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-sweeper"
-      Description: Terminates CI runner instances over 2 hours old; removes offline runner registrations with no instance.
+      Description: Terminates CI runner instances and stops tasks over 2 hours old; removes offline runner registrations with neither.
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt SweeperRole.Arn
@@ -472,6 +482,7 @@ Resources:
           STACK_NAME: !Ref AWS::StackName
           GITHUB_ORG: !Ref GitHubOrg
           RUNNER_GROUP: !Ref RunnerGroup
+          CLUSTER: !Ref RunnerCluster
       Code:
         ZipFile: |
           //@inline functions/sweeper.js
