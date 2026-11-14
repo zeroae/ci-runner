@@ -503,6 +503,28 @@ types.
   AZ at launch, plus 50 GB of gp3. An EC2 instance's end is estimated at 15 s
   after its job, since a self-shutdown leaves no timestamp.
 
+- **A Rust test and mutation-test matrix** (a consumer repo, 2026-11-14):
+  one `test` job and eight `cargo mutants` jobs, Docker-free, the same commit
+  on each shape, every run green with identical mutation results. Times are
+  queued to started / the main step, in seconds; the whole run is first job
+  queued to last job done:
+
+  | | Fargate Spot `ci-cpu-8` | EC2 Spot `ci-cpu-8` | Fargate Spot `ci-cpu-2` | EC2 Spot `ci-cpu-4` |
+  |---|---|---|---|---|
+  | Fargate Spot budget | 24 | | 48 | |
+  | Queued to started | 22–495 (mostly budget waits) | ~344 (244 a budget wait, then ~100 boot) | 29–61 | ~100 |
+  | `test` step | 248 (no cache) | 156 | 150 | 164 |
+  | Heaviest mutants step | 267 | 192 | 544 | 240 |
+  | Light mutants steps | 32–38 | 29–34 | 52–76 | 36–40 |
+  | Whole run | 786 | 550 | 606 | **355** |
+
+  Fargate starts a job sooner, but its slower CPUs lose more than that on
+  CPU-bound steps; `ci-cpu-8` didn't speed the mutants up even on EC2 (they
+  are mostly serial). At 24 vCPUs, the Fargate Spot budget ran the 9-job
+  `ci-cpu-8` matrix in waves, which is why it now defaults to 48. The first
+  Fargate run built without a cache because the task set `CARGO_BUILD_JOBS`
+  (see [traps.md](traps.md)); the `ci-cpu-2` run hit EC2's cache.
+
 - **vCPU quotas** in `us-east-1`, read 2026-11-13. Each budget draws on one
   quota, shared with every other workload in the account:
 
@@ -510,7 +532,7 @@ types.
   |---|---|---|---|---|---|
   | EC2 Spot (All Standard Spot Instance Requests) | `L-34B43A08` | 256 | 5 | 24 | 32 |
   | EC2 On-Demand (Running On-Demand Standard instances) | `L-1216C47A` | 384 | 5 | 8 | 4 |
-  | Fargate Spot vCPU resource count | `L-36FBB829` | 140 | 6 | 24 | 0 |
+  | Fargate Spot vCPU resource count | `L-36FBB829` | 140 | 6 | 48 | 0 |
   | Fargate On-Demand vCPU resource count | `L-3032A538` | 140 | 6 | 8 | 0 |
 
   All four cover the default budgets with room to spare, so no increase was
