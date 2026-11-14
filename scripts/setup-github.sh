@@ -205,7 +205,7 @@ finish() {
 ORG=zeroae
 GROUP=ci-runner
 STACK="${STACK:-ci-runner}"
-PROFILE="${PROFILE:-zeroae-code/AWSPowerUserAccess}"
+PROFILE="${PROFILE:-zeroae-code/ZAEPowerUserAccess}"
 REGION="${REGION:-us-east-1}"
 aws_() { aws --profile "$PROFILE" --region "$REGION" "$@"; }
 die() { warn "$1"; exit 1; }
