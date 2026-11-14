@@ -23,14 +23,14 @@ Parameters:
     Type: String
     Default: ci-runner
     Description: The org runner group every CI runner registers into (created after the stack).
-  SpotCap:
+  SpotVcpuCap:
     Type: Number
-    Default: 6
-    Description: Most Spot CI runners at once (soft).
-  OnDemandCap:
+    Default: 24
+    Description: Most vCPUs the Spot CI runners hold at once, both architectures (soft). Draws on the EC2 Spot vCPU quota.
+  OnDemandVcpuCap:
     Type: Number
-    Default: 2
-    Description: Most On-Demand CI runners at once (soft).
+    Default: 8
+    Description: Most vCPUs the On-Demand CI runners hold at once, both architectures (soft). Draws on the EC2 On-Demand vCPU quota.
 
 Resources:
   # App id, private key and webhook secret. Created holding only `state_key`
@@ -252,7 +252,7 @@ Resources:
               - Effect: Allow
                 Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility, sqs:SendMessage]
                 Resource: !GetAtt JobQueue.Arn
-              # The cap counts instances; no resource-level permissions.
+              # The budgets count instances' vCPUs; no resource-level permissions.
               - Effect: Allow
                 Action: ec2:DescribeInstances
                 Resource: "*"
@@ -324,8 +324,8 @@ Resources:
           LAUNCH_TEMPLATE_ID: !Ref RunnerLaunchTemplate
           SUBNET_IDS: !Join [",", [!Ref Subnet0, !Ref Subnet1, !Ref Subnet2]]
           QUEUE_URL: !Ref JobQueue
-          SPOT_CAP: !Ref SpotCap
-          ONDEMAND_CAP: !Ref OnDemandCap
+          SPOT_VCPU_CAP: !Ref SpotVcpuCap
+          ONDEMAND_VCPU_CAP: !Ref OnDemandVcpuCap
       Code:
         ZipFile: |
           //@inline functions/launcher.js
