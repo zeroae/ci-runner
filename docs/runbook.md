@@ -42,7 +42,7 @@ deleted at any time. A stack named other than `ci-runner` uses
 
 ```bash
 make deploy      # make test, make build, cloudformation deploy, then print the outputs
-make outputs     # SetupUrl, WebhookUrl, AppSecretArn, LaunchTemplateId, SubnetIds, ...
+make outputs     # SetupUrl, WebhookUrl, AppSecretArn, LaunchTemplateId, Arm64LaunchTemplateId, SubnetIds, ...
 ```
 
 The first run creates the stack `ci-runner`, and later runs update it. A run
@@ -353,7 +353,8 @@ types.
 | `permission denied` on `/var/run/docker.sock` | the host's `docker` group isn't gid 123 |
 | `setup-python` fails, or picks up a broken Python | `AGENT_TOOLSDIRECTORY` isn't `/opt/hostedtoolcache` |
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
-| A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), and otherwise only `linux`/`x64`; `arm64` isn't served yet. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
+| A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), at most one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
+| An `arm64` runner's instance comes up and terminates without taking its job, and its console shows `no matching manifest for linux/arm64` | `ghcr.io/zeroae/ci-runner:latest` has no arm64 entry yet: the image workflow hasn't pushed a multi-arch `:latest` since it began building arm64. Run the image workflow on `main`, then re-run the job |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
 | A cap lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotCap=6 OnDemandCap=2` |
 | The launcher logs `no instance launched`, with an authorization error from `CreateFleet` | `CreateFleet`'s check on the instance, volumes and network interfaces it creates carries no `ec2:LaunchTemplate` key, so a policy that adds that condition to them denies the launch. Grant those to `CreateFleet` without the condition; `RunInstances` keeps it |

@@ -10,7 +10,7 @@ on it. Short jobs stay on GitHub-hosted runners.
 
 | Label in `runs-on` | Capacity | For |
 |---|---|---|
-| `ci-spot` | EC2 Spot (`m7i`/`m6i`/`m6a`/`m7a`) | long jobs: a job that runs well over 2 minutes, which is about how long a CI runner takes to come up |
+| `ci-spot` | EC2 Spot (`m7i`/`m6i`/`m6a`/`m7a` for `x64`, `m7g`/`m6g`/`m8g` for `arm64`) | long jobs: a job that runs well over 2 minutes, which is about how long a CI runner takes to come up |
 | `ci-ondemand` | EC2 On-Demand (the same families) | critical jobs: a job that, cut off half-way, leaves state a person must repair (`terraform apply`) |
 | (none; `ubuntu-latest`) | GitHub-hosted | everything else |
 
@@ -24,7 +24,8 @@ A **size label** picks the vCPUs, at 4 GB of memory per vCPU, and an
 | `ci-cpu-8` | 8 / 32 GB | `.2xlarge` |
 | `ci-cpu-16` | 16 / 64 GB | `.4xlarge` |
 
-The architecture label is `x64`; `arm64` isn't served yet. For now both are
+The architecture label is `x64` (Intel and AMD) or `arm64` (Graviton). Both
+architectures run the same image, built natively for each. For now both are
 optional and default to `ci-cpu-4` and `x64`, so today's `runs-on` keeps
 working. **They will become required**: add `ci-cpu-4` and `x64` (or the size
 you want) to every moved job now, so the change to the required contract
@@ -72,8 +73,9 @@ it's in both.
 
 **The label contract:** `runs-on` must include `self-hosted` and exactly one of
 `ci-spot` or `ci-ondemand`. It may include at most one size label
-(`ci-cpu-2`, `ci-cpu-4`, `ci-cpu-8`, `ci-cpu-16`), `x64` and `linux`. A job
-with any other label (`arm64`, an unknown `ci-cpu-*`, two size labels) is
+(`ci-cpu-2`, `ci-cpu-4`, `ci-cpu-8`, `ci-cpu-16`), at most one of `x64` or
+`arm64`, and `linux`. A job with any other label (`aarch64`, an unknown
+`ci-cpu-*`, two size labels, both `x64` and `arm64`) is
 ignored, and it waits for a runner that never comes.
 
 **What the job gets:** Ubuntu 24.04, the runner as user `runner` (passwordless
