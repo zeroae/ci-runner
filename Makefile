@@ -11,7 +11,7 @@ BUCKET  ?= $(STACK)-deploy-$(shell $(AWS) sts get-caller-identity --query Accoun
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-12s %s\n", $$1, $$2}'
-	@echo "  Layout and conventions: docs/stack.md; procedures and traps: docs/runbook.md"
+	@echo "  Layout and conventions: docs/stack.md; procedures: docs/runbook.md; traps: docs/traps.md"
 
 test: ## Run the unit tests (node --test, no npm deps)
 	node --test test/*.test.js

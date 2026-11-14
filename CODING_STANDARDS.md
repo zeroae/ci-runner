@@ -31,4 +31,4 @@ adoption variable `ZAE_CI_RUNNER`.
 Grant the least the function does, scoped by the stack's tag
 (`ci-runner:stack`) or its own resources, never `*` on a write action
 without a condition. A new condition is checked live: some EC2 calls don't
-carry the keys their docs suggest (see the traps table in `docs/runbook.md`).
+carry the keys their docs suggest (see `docs/traps.md`).
