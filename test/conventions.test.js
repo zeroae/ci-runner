@@ -80,3 +80,11 @@ test('the launcher and the webhook sanitize an ECS tag the same way', () => {
     assert.equal(webhook, launcher, `the webhook's ${re} differs from the launcher's`);
   }
 });
+
+test('the launcher, webhook and notifier read tags the same way', () => {
+  // Each strips the ci-runner: prefix, so t.capacity means the same everywhere.
+  const re = /^const tagsOf = .*$/m;
+  const [launcher, ...rest] = ['launcher', 'webhook', 'notifier'].map((f) => ({ f, code: (read(`functions/${f}.js`).match(re) || [])[0] }));
+  assert.ok(launcher.code, 'the launcher has no tagsOf');
+  for (const o of rest) assert.equal(o.code, launcher.code, `${o.f}'s tagsOf differs from the launcher's`);
+});
