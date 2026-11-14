@@ -186,8 +186,9 @@ Whatever launches a runner (`scripts/hand-launch.sh`, the launcher) must:
 
 Every instance not yet `terminated` counts, so a runner whose instance is
 shutting down is removed on a later run. A task counts until it is told to
-stop (ECS drops a task's tags then, as aws-emulator shows), so a runner whose
-task the sweeper stops is removed on the next run.
+stop: the sweeper lists only tasks whose desired status is `RUNNING`, so a
+runner whose task the sweeper stops is removed on the next run. (ECS itself
+keeps a stopped task's tags readable through `DescribeTasks`.)
 
 ## Launching for queued jobs: webhook, queue, launcher
 
@@ -426,9 +427,13 @@ re-tags it, and the notifier reports a Fargate Spot reclaim (below).
 - `${stack}-notifier-tasks`: every **ECS Task State Change** of the stack's
   cluster with `stopCode: SpotInterruption`. A reclaimed task's changes all
   carry it, from the warning (desired `STOPPED`, still `RUNNING`, about 2
-  minutes before the stop) to `STOPPED`. ECS drops a task's tags once it is
-  told to stop (aws-emulator does; the live proof checks AWS), so the earliest
-  change is the one to read, and the rule doesn't wait for `STOPPED`.
+  minutes before the stop) to `STOPPED`. The notifier reads the tags with
+  `DescribeTasks`, which still returns them after the stop: measured live on
+  2026-11-14, a task's tags stayed readable from `StopTask` through
+  `STOPPED` and minutes after, while `ListTagsForResource` refused the task
+  (`The specified task is stopped`) from the moment it was told to stop.
+  So every change can be read, and the check-run lookup keeps it to one
+  report per job (aws-emulator, unlike AWS, drops the tags at the stop).
 
 For each event it:
 

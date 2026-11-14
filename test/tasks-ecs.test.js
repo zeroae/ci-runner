@@ -4,8 +4,9 @@
 // on it (TagResource validates the characters, as ECS does), the sweeper
 // stops it, and the notifier reports a reclaim from the ECS Task State Change
 // the emulator publishes to EventBridge, matched by template.yaml's own rule.
-// The emulator drops a task's tags once it is told to stop; the tests rely on
-// that only where they say so.
+// The emulator drops a task's tags once it is told to stop (AWS keeps them
+// readable through DescribeTasks, measured live); the tests rely on that only
+// where they say so.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -225,7 +226,7 @@ test('a Fargate Spot reclaim: template.yaml\'s rule matches each change of the s
   assert.equal(check.body.output.title, 'Spot capacity reclaimed: re-run this job');
   assert.ok(check.body.output.summary.includes(`task (${arn.split('/').pop()})`));
 
-  // The stop's later changes match too. ECS has dropped the task's tags by
+  // The stop's later changes match too. The emulator has dropped the task's tags by
   // then, so the notifier finds no job on it, and reports nothing more.
   await ecs.stopTask({ cluster: 'ci-runner', task: arn, reason: 'test' });
   const stopping = await changesOf(arn, (c) => c.some((e) => e.detail.lastStatus === 'STOPPED'));
