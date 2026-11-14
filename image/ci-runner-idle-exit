@@ -13,6 +13,15 @@
 # IDLE_GRACE_SECONDS (default 30, as docker stop gives an EC2 runner): the
 # runner's helper and listener sit in their own process group, and a TERM
 # alone doesn't end them.
+#
+# With CI_RUNNER_VCPUS (the task's vCPUs, set by the launcher), it first writes
+# /home/runner/.cargo/config.toml with `[build] jobs = <n>`: nproc over-reports
+# in a task, and a CARGO_BUILD_JOBS in the environment would change
+# Swatinem/rust-cache's key (it hashes every CARGO*, CC*, CFLAGS*, CXX*, CMAKE*
+# and RUST* variable), so a Fargate job would miss the cache an EC2 job saved.
+# Cargo reads .cargo/config.toml in every ancestor of its working directory,
+# so the file reaches every checkout under /home/runner/_work, whatever
+# CARGO_HOME a job sets. A file already there is left alone.
 set -u
 
 idle=${IDLE_SECONDS:-900}
@@ -25,6 +34,21 @@ if [[ ! $grace =~ ^[0-9]+$ ]]; then
   echo "ci-runner: IDLE_GRACE_SECONDS must be a whole number, not '$grace'" >&2
   exit 2
 fi
+
+cargo_jobs() {
+  local n=${CI_RUNNER_VCPUS:-} dir=/home/runner/.cargo
+  [[ -n $n ]] || return 0
+  if [[ ! $n =~ ^[1-9][0-9]*$ ]]; then
+    echo "ci-runner: CI_RUNNER_VCPUS must be a positive integer, not '$n'; no cargo jobs set" >&2
+  elif [[ -e $dir/config.toml ]]; then
+    echo "ci-runner: $dir/config.toml exists, leaving it; cargo's jobs not set to $n" >&2
+  elif mkdir -p "$dir" && printf '[build]\njobs = %s\n' "$n" > "$dir/config.toml"; then
+    echo "ci-runner: cargo jobs = $n ($dir/config.toml)"
+  else
+    echo "ci-runner: couldn't write $dir/config.toml; cargo's jobs not set" >&2
+  fi
+}
+cargo_jobs
 
 log=$(mktemp /tmp/ci-runner-idle-exit.XXXXXX)
 # Its own session (its id is $pid), so a stop reaches run.sh, its helper and
