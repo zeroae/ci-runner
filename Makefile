@@ -3,6 +3,8 @@ PROFILE ?= zeroae-code/AWSPowerUserAccess
 REGION  ?= us-east-1
 ORG     ?= zeroae
 AWS      = aws --profile $(PROFILE) --region $(REGION)
+# The deploy bucket, made outside the stack (docs/runbook.md). Looked up only when used.
+BUCKET  ?= $(STACK)-deploy-$(shell $(AWS) sts get-caller-identity --query Account --output text)
 
 .PHONY: help test build validate deploy outputs hand-launch runners sweep canary-runs
 .DEFAULT_GOAL := help
@@ -17,12 +19,14 @@ test: ## Run the unit tests (node --test, no npm deps)
 build: ## Inline functions/*.js into build/template.yaml and report its size
 	node scripts/build-template.js
 
-validate: build ## Ask CloudFormation to validate the built template
-	$(AWS) cloudformation validate-template --template-body file://build/template.yaml >/dev/null && echo valid
+validate: build ## Ask CloudFormation to validate the built template (through the deploy bucket)
+	$(AWS) s3 cp --only-show-errors build/template.yaml s3://$(BUCKET)/$(STACK)/validate.yaml
+	$(AWS) cloudformation validate-template \
+	  --template-url https://$(BUCKET).s3.$(REGION).amazonaws.com/$(STACK)/validate.yaml >/dev/null && echo valid
 
-deploy: test build ## Create or update the stack ($(STACK)) from one command
+deploy: test build ## Create or update the stack ($(STACK)) through the deploy bucket
 	$(AWS) cloudformation deploy --stack-name $(STACK) \
-	  --template-file build/template.yaml \
+	  --template-file build/template.yaml --s3-bucket $(BUCKET) --s3-prefix $(STACK) \
 	  --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
 	@$(MAKE) --no-print-directory outputs
 

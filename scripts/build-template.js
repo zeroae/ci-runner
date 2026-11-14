@@ -9,13 +9,12 @@
 // replaced by x.js itself, wrapped as a module, so one Lambda can share
 // another file (the launcher bundles cloud-config.js), and whole-line `//`
 // comments are dropped, as are the template's own whole-line `#` comments.
-// Fails if the result is
-// not under LIMIT bytes, the largest template `aws cloudformation deploy`
-// sends inline.
+// Fails if the result is not under LIMIT bytes, the largest template
+// CloudFormation accepts from S3 (`make deploy` uploads it to a bucket first).
 const fs = require('node:fs');
 const path = require('node:path');
 
-const LIMIT = 51200;
+const LIMIT = 1048576;
 const LOCAL_REQUIRE = /require\('\.\/([\w.-]+\.js)'\)/;
 
 // Whole-line `//` comments go, except inside a template literal (tracked by

@@ -15,10 +15,30 @@ You need `aws`, `gh`, `jq`, `curl` and `node`. For anything that touches the
 runner group, your `gh` login also needs the `admin:org` scope
 (`gh auth refresh -h github.com -s admin:org`).
 
-The order the first time is: deploy the stack, create the App, create the
-runner group, then turn repos on one at a time.
+The order the first time is: create the deploy bucket, deploy the stack,
+create the App, create the runner group, then turn repos on one at a time.
 
 ## Deploy and update the stack
+
+`make deploy` uploads the template to the **deploy bucket**,
+`ci-runner-deploy-<account id>`, and deploys from there. The bucket isn't part of the stack, so
+it outlives a deleted stack and exists before the first deploy. Make it once
+per account, private and encrypted:
+
+```bash
+B=ci-runner-deploy-$($AWS sts get-caller-identity --query Account --output text)
+$AWS s3api create-bucket --bucket "$B"
+$AWS s3api put-public-access-block --bucket "$B" \
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+$AWS s3api put-bucket-encryption --bucket "$B" \
+  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
+
+(`create-bucket` takes no `--create-bucket-configuration` in `us-east-1`; in
+any other region it needs `LocationConstraint=<region>`.) Each deploy uploads
+the template as `ci-runner/<md5>.template`; the objects are small and can be
+deleted at any time. A stack named other than `ci-runner` uses
+`<stack>-deploy-<account id>`, or pass `BUCKET=<name>`.
 
 ```bash
 make deploy      # make test, make build, cloudformation deploy, then print the outputs
@@ -36,7 +56,7 @@ To change a parameter, build, then deploy with an override:
 ```bash
 make build
 $AWS cloudformation deploy --stack-name ci-runner \
-  --template-file build/template.yaml \
+  --template-file build/template.yaml --s3-bucket "$B" --s3-prefix ci-runner \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
   --parameter-overrides SpotCap=6 OnDemandCap=2
 ```
@@ -52,9 +72,8 @@ $AWS cloudformation describe-stacks --stack-name ci-runner \
 Before raising a cap, check the EC2 quota still covers it (see "Measured
 numbers").
 
-The built template must stay under 51,200 bytes (`make build` prints its
-size and fails at the limit). There's little headroom left (see "Measured
-numbers" and the traps table).
+The built template must stay under 1 MB, the S3 deploy's limit (`make build`
+prints its size and fails at the limit).
 
 ## Create the App and the runner group (the wizard)
 
@@ -318,8 +337,9 @@ types.
   For the other three peaks, use `Service` `EC2` and `Class`
   `Standard/OnDemand` as fits.
 
-- **Template size:** 49,908 of 51,200 bytes (97%). A new function, or a big
-  addition to one, will need the S3-bucket deploy.
+- **Template size:** 50,301 bytes, 5% of the S3 deploy's 1 MB limit. It's
+  already over the 51,200 bytes a template can be sent inline, so it deploys
+  only through the deploy bucket.
 
 ## Traps
 
@@ -335,7 +355,9 @@ types.
 | The launcher logs `no instance launched`, with an authorization error from `CreateFleet` | `CreateFleet`'s check on the instance, volumes and network interfaces it creates carries no `ec2:LaunchTemplate` key, so a policy that adds that condition to them denies the launch. Grant those to `CreateFleet` without the condition; `RunInstances` keeps it |
 | The wizard stops with `runner group not created` | Enter at its **y/N** prompt means no. Re-run it, and type `y` at that prompt |
 | Offline runners pile up in the `ci-runner` group | a runner stopped by the 15-minute idle exit stays registered, offline. The sweeper removes it on its next run, once it's 10 minutes past the stamp in its name (`make sweep` to run it now). If they stay, the sweeper's log says why |
-| `make build` fails at or over 51,200 bytes | the largest template `cloudformation deploy` sends without an S3 bucket. Trim the inlined code, or move the deploy to an S3 bucket (`--s3-bucket`, 1 MB limit) |
+| `make deploy` or `make validate` fails `NoSuchBucket`, or `AccessDenied` on the upload | the deploy bucket `ci-runner-deploy-<account id>` doesn't exist in this account yet; make it (see "Deploy and update the stack") |
+| A deploy without `--s3-bucket` fails `Templates with a size greater than 51,200 bytes must be deployed via an S3 Bucket` | the template is over the inline limit; deploy with `make deploy`, or pass `--s3-bucket` as in "Deploy and update the stack" |
+| `make build` fails at or over 1,048,576 bytes | the largest template CloudFormation accepts from S3. Trim the inlined code |
 | The setup URL answers 410 `the GitHub App is already set up` | that's by design once the secret holds a key; see "Re-register the App" |
 | The setup page fails on GitHub: the App's name is taken | App names are global on GitHub; deploy with another `AppName` |
 | The webhook answers 503 | the secret holds no App yet (or was emptied): run the wizard |
