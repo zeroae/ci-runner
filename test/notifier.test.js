@@ -33,7 +33,8 @@ function verifyJwt(auth) {
 
 // The job the tags name, as GitHub reports it when this machine's CI runner
 // is running it.
-const RUNNING = { name: 'build (x64, a)', status: 'in_progress', runner_name: 'ci-runner-20261112115500-555' };
+const RUNNING = { name: 'tests', status: 'in_progress', runner_name: 'ci-runner-20261112115500-555' };
+const TASK_JOB = { ...RUNNING, name: 'build (x64, a)' };
 
 const RECLAIMED = 'Spot capacity reclaimed: re-run this job';
 const SURVIVED = 'The job finished despite the Spot reclaim warning';
@@ -174,9 +175,10 @@ for (const [why, job] of [['still runs', RUNNING], ['failed', DONE('failure')], 
   });
 }
 
-// A report an earlier invocation left standing (its watch ended, or a GitHub
-// call failed mid-watch and EventBridge retried).
-const STANDING = { id: 9, name: 'ci-runner / tests', external_id: '555', output: { title: RECLAIMED } };
+// A report an earlier event left standing: the job finished with success after
+// the webhook's word, or before the report existed.
+const RUN_URL = 'https://github.com/zeroae/app/actions/runs/444';
+const STANDING = { id: 9, name: 'ci-runner / tests', external_id: '555', details_url: `${RUN_URL}/job/555`, output: { title: RECLAIMED } };
 
 test('a retry or a later event clears a standing report whose job has since finished with success', async () => {
   const gh = fakeGitHub({ existing: [STANDING], jobs: [DONE('success')] });
@@ -213,8 +215,14 @@ test('a reclaim whose check run turned neutral is not reported again', async () 
   assert.ok(!gh.keys().includes('POST /repos/zeroae/app/check-runs'));
 });
 
-test('a job name falls back to the job id when the tag is empty', async () => {
-  const { handler, gh } = setup({ inst: instance({ ...TAGS, 'ci-runner:job-name': '' }) });
+test('a job\'s name is GitHub\'s, which the tag may have cut or changed', async () => {
+  const { handler, gh } = setup({ inst: instance({ ...TAGS, 'ci-runner:job-name': 'cut at 256' }), gh: fakeGitHub({ jobs: [{ ...RUNNING, name: 'the whole name' }] }) });
+  await handler(EVENT);
+  assert.equal(gh.calls.find((c) => c.key === 'POST /repos/zeroae/app/check-runs').body.name, 'ci-runner / the whole name');
+});
+
+test('a job name falls back to the tag, then to the job id, when GitHub gives none', async () => {
+  const { handler, gh } = setup({ inst: instance({ ...TAGS, 'ci-runner:job-name': '' }), gh: fakeGitHub({ jobs: [{ ...RUNNING, name: undefined }] }) });
   await handler(EVENT);
   assert.equal(gh.calls.find((c) => c.key === 'POST /repos/zeroae/app/check-runs').body.name, 'ci-runner / job 555');
 });
@@ -302,9 +310,10 @@ const TASK_TAGS = {
 const task = (tags) => ({ taskArn: TASK_ARN, lastStatus: 'RUNNING', tags: Object.entries(tags).map(([key, value]) => ({ key, value })) });
 
 test('a Fargate Spot reclaim creates the same check run as an EC2 one, with the job\'s real name', async () => {
-  const ec2 = setup({ inst: instance({ ...TAGS, 'ci-runner:job-name': 'build (x64, a)' }) });
+  const github = () => fakeGitHub({ jobs: [TASK_JOB] });
+  const ec2 = setup({ inst: instance({ ...TAGS, 'ci-runner:job-name': 'build (x64, a)' }), gh: github() });
   await ec2.handler(EVENT);
-  const fargate = setup({ inst: null, tasks: [task(TASK_TAGS)] });
+  const fargate = setup({ inst: null, tasks: [task(TASK_TAGS)], gh: github() });
   await fargate.handler(TASK_EVENT);
 
   assert.deepEqual(fargate.described, [{ cluster: CLUSTER_ARN, tasks: [TASK_ARN], include: ['TAGS'] }]);
@@ -362,7 +371,7 @@ test('a swapped Fargate CI runner is reported for the job it took', async () => 
 });
 
 test('a Fargate job that has finished with success by the time the report is posted turns its check run neutral', async () => {
-  const gh = fakeGitHub({ jobs: [RUNNING, { ...RUNNING, status: 'completed', conclusion: 'success' }] });
+  const gh = fakeGitHub({ jobs: [TASK_JOB, { ...TASK_JOB, status: 'completed', conclusion: 'success' }] });
   await setup({ inst: null, tasks: [task(TASK_TAGS)], gh }).handler(TASK_EVENT);
   const { body } = patchOf(gh);
   assert.equal(body.conclusion, 'neutral');
@@ -392,7 +401,7 @@ test('a job that succeeded clears its standing reclaim report', async () => {
 for (const [why, existing] of [
   ['a job that never had a reclaim report', []],
   ['a report that is already neutral', [{ ...STANDING, output: { title: SURVIVED } }]],
-  ['another job\'s report', [{ ...STANDING, external_id: '554' }]],
+  ['a report of another run\'s job of that name', [{ ...STANDING, details_url: 'https://github.com/zeroae/app/actions/runs/443/job/554' }]],
   ['a check run of that name that isn\'t ours', [{ ...STANDING, output: { title: 'Lint' } }]],
 ]) {
   test(`a job that succeeded changes nothing for ${why}`, async () => {
@@ -404,6 +413,14 @@ for (const [why, existing] of [
     assert.match(logs.join('\n'), /nothing to clear: zeroae\/app job 555/);
   });
 }
+
+test('a job that succeeded in a re-run clears the report of its earlier attempt', async () => {
+  // The re-run attempt's job has a new id (555); the report names the first attempt's job (500) of the same run.
+  const earlier = { ...STANDING, external_id: '500', details_url: `${RUN_URL}/job/500` };
+  const gh = fakeGitHub({ existing: [earlier] });
+  await setup({ gh }).handler(SUCCEEDED);
+  assert.equal(patchOf(gh).body.conclusion, 'neutral');
+});
 
 test('a job that succeeded, with no installation id, looks the installation up', async () => {
   const gh = fakeGitHub({ existing: [STANDING] });

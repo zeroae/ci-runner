@@ -46,12 +46,12 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
     return (await gh('POST', `/app/installations/${installation}/access_tokens`, jwt)).token;
   }
 
-  // The commit's reclaim check run for a job, if it has one. A task's reclaim
+  // The commit's reclaim check runs under a job's name. A task's reclaim
   // matches on each of its changes, and EventBridge may repeat or retry an
   // event: one check run per job is enough.
-  async function reportedFor(repo, token, sha, name, jobId) {
+  async function reportsNamed(repo, token, sha, name) {
     const { check_runs: existing } = await gh('GET', `/repos/${repo}/commits/${sha}/check-runs?filter=all&check_name=${encodeURIComponent(name)}`, token);
-    return existing.find((c) => c.external_id === jobId && c.output && [RECLAIMED_TITLE, SURVIVED_TITLE].includes(c.output.title));
+    return existing.filter((c) => c.output && [RECLAIMED_TITLE, SURVIVED_TITLE].includes(c.output.title));
   }
 
   // A job that finished with success was not lost: its check run no longer
@@ -66,12 +66,16 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
 
   // The webhook says a job of this stack's runners finished with success. A
   // job that had a reclaim report (AWS warns 2 minutes before it takes the
-  // machine, and a job can finish inside that) is cleared.
+  // machine, and a job can finish inside that) is cleared. So is the report
+  // of an earlier attempt of the job, which a re-run of the run left behind:
+  // its details_url is under the same run.
   async function jobSucceeded(j) {
     const token = await tokenFor(j.repo, j.installation_id);
-    const reported = await reportedFor(j.repo, token, j.head_sha, `ci-runner / ${j.job_name}`, String(j.job_id));
-    if (!reported || reported.output.title !== RECLAIMED_TITLE) return log(`nothing to clear: ${j.repo} job ${j.job_id}`);
-    return clear(j.repo, token, reported.id, j.job_name, `https://github.com/${j.repo}/actions/runs/${j.run_id}`);
+    const run = `https://github.com/${j.repo}/actions/runs/${j.run_id}`;
+    const standing = (await reportsNamed(j.repo, token, j.head_sha, `ci-runner / ${j.job_name}`))
+      .filter((c) => c.output.title === RECLAIMED_TITLE && (c.details_url || '').startsWith(`${run}/`));
+    if (!standing.length) return log(`nothing to clear: ${j.repo} job ${j.job_id}`);
+    for (const c of standing) await clear(j.repo, token, c.id, j.job_name, run);
   }
 
   return async (event) => {
@@ -99,14 +103,15 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
     const token = await tokenFor(repo);
     const jobPath = `/repos/${repo}/actions/jobs/${jobId}`;
     const ghJob = await gh('GET', jobPath, token);
-    // A task's job-name tag has `_` for what ECS refuses (brackets, commas):
-    // the check run carries the real name, from GitHub.
-    const job = (d.taskArn && ghJob.name) || t['job-name'] || `job ${jobId}`;
+    // The check run carries the job's real name, from GitHub, as the webhook's
+    // word does: a task's job-name tag has `_` for what ECS refuses (brackets,
+    // commas), and every tag is cut at 256 characters.
+    const job = ghJob.name || t['job-name'] || `job ${jobId}`;
     const run = `https://github.com/${repo}/actions/runs/${t['run-id']}`;
     const name = `ci-runner / ${job}`;
     const finishedWithSuccess = (j) => j.status === 'completed' && j.conclusion === 'success';
 
-    const reported = await reportedFor(repo, token, t['head-sha'], name, jobId);
+    const reported = (await reportsNamed(repo, token, t['head-sha'], name)).find((c) => c.external_id === jobId);
     if (reported) {
       // An earlier event's report, left standing: the job finished with
       // success after the webhook's word, or before the report existed.

@@ -75,14 +75,21 @@ function createHandler({ secret, queue, notifier, ec2, ecs, env, log = console.l
 
   let key; // the webhook secret, cached once the App exists
 
+  // The job id a runner of this stack was launched for, from its name
+  // `${stack}-<14-digit stamp>-<job id>`; null for any other runner.
+  function launchJobOf(runnerName) {
+    const m = String(runnerName || '').match(/^(.+)-\d{14}-(\d+)$/);
+    return m && m[1] === env.STACK_NAME ? Number(m[2]) : null;
+  }
+
   // A swap: a runner of this stack, named `${stack}-<stamp>-<job id>`, started
   // a job other than the one it was launched for. Re-queue that one, so the
   // launcher's "still queued?" check launches it a runner or drops it, and
   // re-tag the instance or task so the notifier names the job it runs.
   async function repairSwap(p, repo, job) {
     const name = String(job.runner_name || '');
-    const m = name.match(/^(.+)-\d{14}-(\d+)$/);
-    if (!m || m[1] !== env.STACK_NAME || Number(m[2]) === job.id) return reply(200, 'ignored: no swap');
+    const launchJob = launchJobOf(name);
+    if (launchJob === null || launchJob === job.id) return reply(200, 'ignored: no swap');
     const r = await ec2.describeInstances({
       Filters: [
         { Name: 'tag:ci-runner:stack', Values: [env.STACK_NAME] },
@@ -122,8 +129,7 @@ function createHandler({ secret, queue, notifier, ec2, ecs, env, log = console.l
   // clears its reclaim report for the job, if the job had one: AWS warns 2
   // minutes before it takes a Spot machine, and a job can finish inside that.
   async function reportSuccess(p, repo, job) {
-    const m = String(job.runner_name || '').match(/^(.+)-\d{14}-\d+$/);
-    if (job.conclusion !== 'success' || !m || m[1] !== env.STACK_NAME) return reply(200, 'ignored: not a success of ours');
+    if (job.conclusion !== 'success' || launchJobOf(job.runner_name) === null) return reply(200, 'ignored: not a success of ours');
     await notifier.send({ jobSucceeded: {
       repo: repo.full_name, job_id: job.id, run_id: job.run_id, head_sha: job.head_sha, job_name: job.name,
       installation_id: p.installation && p.installation.id,

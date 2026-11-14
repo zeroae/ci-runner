@@ -266,7 +266,7 @@ tags and repairs again. Re-queueing a job that another runner already took is
 harmless: the launcher drops it.
 
 Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue,
-`ec2:DescribeInstances`, and `ec2:CreateTags` only on instances tagged
+`lambda:InvokeFunction` on the notifier, `ec2:DescribeInstances`, and `ec2:CreateTags` only on instances tagged
 `ci-runner:stack=<stack>` and only for the five job tag keys. On ECS:
 `ecs:ListTasks` with the condition `ecs:cluster` = the cluster, and
 `ecs:DescribeTasks` and `ecs:TagResource` only on the cluster's tasks, the
@@ -493,8 +493,9 @@ For each event it:
    and so its tags are still the launch tags. A swapped job that the webhook
    has not yet re-tagged, in the moments after it started, is missed the same
    way.
-4. For a task, takes the job's real name from that job (the tag has `_` for
-   brackets and commas), falling back to the tag.
+4. Takes the job's real name from that job, falling back to the tag: a tag is
+   cut at 256 characters, and a task's has `_` for brackets and commas. The
+   webhook's word (step 8) carries GitHub's name too, so the two meet.
 5. Skips the job if the commit already has its reclaim check run (same name,
    `external_id` the job id, the title below or the survived title), so a task's
    later changes and a repeated event report nothing more.
@@ -510,17 +511,22 @@ For each event it:
    the machine, and a job can finish inside that. A job that finishes with
    `success` was not lost, so its reclaim check run changes to `neutral`,
    titled `The job finished despite the Spot reclaim warning`, and the notifier
-   logs `survived: <repo> <job name>`. Three things get a report there:
+   logs `survived: <repo> <job name>`. Three paths clear a report:
    - **the webhook's word** (above): the notifier gets the token (the event
-     carries the installation id), finds the job's reclaim check run, and
-     clears it. A job with no reclaim report logs `nothing to clear` and
-     changes nothing. The check run's name uses the event's job name;
+     carries the installation id), lists the commit's check runs named `ci-runner
+     / <job name>`, and clears each reclaim `failure` whose `details_url` is
+     under the job's run. That takes in the report of an earlier attempt of the
+     job: a re-run's job has a new id, but the same run. With none to clear it
+     logs `nothing to clear` and changes nothing;
    - **a retry or a later change** of a reclaim event that finds its own
      standing `failure` (step 5) for a job that has since finished with
      `success`;
    - **step 7**, for the word that came before the report existed.
 
-   A job that ends with any other conclusion keeps the `failure`.
+   A job that ends with any other conclusion keeps the `failure`. If the
+   webhook's invoke of the notifier fails, the delivery fails (`502`): redeliver
+   it from the App's advanced settings, or the retry and later-change paths
+   clear the report.
 
 A GitHub failure fails the invocation, and EventBridge's async invoke retries
 it. Two events handled at the same moment can still report twice.

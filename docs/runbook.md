@@ -299,7 +299,8 @@ AWS warns 2 minutes before it takes the machine, and a job can finish inside
 that. When the job ends with `success`, the check run turns `neutral`, titled
 `The job finished despite the Spot reclaim warning`: no re-run is needed (the
 webhook tells the notifier; see `docs/stack.md`, "Reporting a Spot reclaim").
-A `failure` check run whose job passed anyway is safe to ignore. The notifier reports
+A `failure` check run whose job passed anyway is safe to ignore. A re-run that
+passes turns the first attempt's report `neutral` too. The notifier reports
 only a job the machine's CI runner was running: a CI runner that took no job
 (another one served its launch job) is not reported.
 
