@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  ci-runner: single-use EC2 self-hosted GitHub Actions runners for zeroae's
-  private repos. Source template; `make build` inlines functions/*.js.
+  ci-runner: single-use EC2 and Fargate self-hosted GitHub Actions runners
+  for zeroae's private repos. Source template; `make build` inlines
+  functions/*.js.
 
 # Layout rules (see docs/stack.md):
 # - every role and policy is PowerUserPB-${AWS::StackName}-<suffix> with the
@@ -31,6 +32,14 @@ Parameters:
     Type: Number
     Default: 8
     Description: Most vCPUs the On-Demand CI runners hold at once, both architectures (soft). Draws on the EC2 On-Demand vCPU quota.
+  FargateSpotVcpuCap:
+    Type: Number
+    Default: 24
+    Description: Most vCPUs the Fargate Spot CI runners hold at once, both architectures (soft). Draws on the Fargate Spot vCPU quota.
+  FargateVcpuCap:
+    Type: Number
+    Default: 8
+    Description: Most vCPUs the Fargate On-Demand CI runners hold at once, both architectures (soft). Draws on the Fargate On-Demand vCPU quota.
   ExistingOidcProviderArn:
     Type: String
     Default: ""
@@ -328,12 +337,42 @@ Resources:
               - Effect: Allow
                 Action: ssm:GetParameters
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/ami-amazon-linux-latest/*"
+              # Fargate: the two task definitions, in the stack's cluster only.
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: [!Ref RunnerTaskDefinition, !Ref Arm64RunnerTaskDefinition]
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              # The only role a task gets: its execution role (no task role).
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt RunnerExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Effect: Allow
+                Action: ecs:TagResource
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
+                Condition:
+                  StringEquals:
+                    ecs:CreateAction: RunTask
+              # The Fargate budgets count the cluster's tasks.
+              - Effect: Allow
+                Action: ecs:ListTasks
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt RunnerCluster.Arn
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
 
   LauncherFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-launcher"
-      Description: Launches one CI runner instance per still-queued job from the queue.
+      Description: Launches one CI runner instance or task per still-queued job from the queue.
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt LauncherRole.Arn
@@ -353,6 +392,14 @@ Resources:
           QUEUE_URL: !Ref JobQueue
           SPOT_VCPU_CAP: !Ref SpotVcpuCap
           ONDEMAND_VCPU_CAP: !Ref OnDemandVcpuCap
+          FARGATE_SPOT_VCPU_CAP: !Ref FargateSpotVcpuCap
+          FARGATE_VCPU_CAP: !Ref FargateVcpuCap
+          CLUSTER: !Ref RunnerCluster
+          TASK_DEFINITION: !Ref RunnerTaskDefinition
+          ARM64_TASK_DEFINITION: !Ref Arm64RunnerTaskDefinition
+          SECURITY_GROUP_ID: !Ref RunnerSecurityGroup
+          # In SUBNET_IDS' order: arm64 tasks skip a subnet in use1-az3.
+          SUBNET_AZ_IDS: !Join [",", [!GetAtt Subnet0.AvailabilityZoneId, !GetAtt Subnet1.AvailabilityZoneId, !GetAtt Subnet2.AvailabilityZoneId]]
       Code:
         ZipFile: |
           //@inline functions/launcher.js
@@ -666,6 +713,115 @@ Resources:
             Tags:
               - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
 
+  # --- Fargate: the cluster and task definitions of the Fargate capacities --
+  # No Docker daemon (ADR-0001) and no task role: a job finds no AWS
+  # credentials, as on EC2. The launcher runs one task per job.
+  RunnerCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      Tags:
+        - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
+  # The runner's output (Listening for Jobs, Running job), per task.
+  RunnerTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-runner"
+      RetentionInDays: 7
+
+  # Used by ECS to start a task, never by the job: pull the image, write the log.
+  RunnerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-runner-exec"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-runner-exec"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The registry login supports no resource-level permissions.
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt ImageRepository.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt RunnerTaskLogGroup.Arn
+
+  # x64 and arm64 are two task definitions: RunTask can't override the platform.
+  RunnerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-runner"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # The 4-vCPU shape; each RunTask overrides cpu and memory for its size.
+      Cpu: "4096"
+      Memory: "16384"
+      EphemeralStorage: { SizeInGiB: 50 }
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt RunnerExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: runner
+          Image: !Sub "${ImageRepository.RepositoryUri}:latest"
+          Essential: true
+          # The image's idle exit; the launcher's command is ./run.sh --jitconfig.
+          EntryPoint: [/usr/local/bin/ci-runner-idle-exit]
+          Command: [./run.sh]
+          LinuxParameters: { InitProcessEnabled: true }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RunnerTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: runner
+      Tags:
+        - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
+  # The arm64 counterpart: only the architecture differs.
+  Arm64RunnerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-runner-arm64"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # The 4-vCPU shape; each RunTask overrides cpu and memory for its size.
+      Cpu: "4096"
+      Memory: "16384"
+      EphemeralStorage: { SizeInGiB: 50 }
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: ARM64 }
+      ExecutionRoleArn: !GetAtt RunnerExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: runner
+          Image: !Sub "${ImageRepository.RepositoryUri}:latest"
+          Essential: true
+          # The image's idle exit; the launcher's command is ./run.sh --jitconfig.
+          EntryPoint: [/usr/local/bin/ci-runner-idle-exit]
+          Command: [./run.sh]
+          LinuxParameters: { InitProcessEnabled: true }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RunnerTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: runner
+      Tags:
+        - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
+
   # --- image: the runner image in ECR, pushed by image.yml on main ----------
   # Fargate lazy-loads only from private ECR (ADR-0002). image.yml assumes
   # the push role through GitHub OIDC: no stored key or token anywhere.
@@ -762,3 +918,9 @@ Outputs:
   ImagePushRoleArn:
     Description: The repo variable AWS_IMAGE_PUSH_ROLE_ARN, which image.yml assumes on main.
     Value: !GetAtt ImagePushRole.Arn
+  ClusterName:
+    Value: !Ref RunnerCluster
+  TaskDefinitionArn:
+    Value: !Ref RunnerTaskDefinition
+  Arm64TaskDefinitionArn:
+    Value: !Ref Arm64RunnerTaskDefinition
