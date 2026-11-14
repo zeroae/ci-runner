@@ -77,13 +77,13 @@ function fakeEc2({ fleet = { Instances: [{ InstanceIds: ['i-0123'] }], Errors: [
   };
 }
 
-// `running` lists the cluster's tasks, as { capacity, vcpus, desired } with
+// `running` lists the cluster's tasks, as { capacity, vcpus, desired, last } with
 // the launcher's shape tags (left off when undefined). `run` is RunTask's
 // answer; by default one task.
 function fakeEcs({ running = [], run } = {}) {
   const calls = [];
   const all = running.map((t, i) => ({
-    taskArn: `arn:aws:ecs:us-east-1:1:task/ci-runner/t${i}`, desiredStatus: t.desired || 'RUNNING', lastStatus: 'RUNNING',
+    taskArn: `arn:aws:ecs:us-east-1:1:task/ci-runner/t${i}`, desiredStatus: t.desired || 'RUNNING', lastStatus: t.last || 'RUNNING',
     tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', t.capacity], ['ci-runner:vcpus', t.vcpus]]
       .filter(([, v]) => v !== undefined).map(([key, value]) => ({ key, value: String(value) })),
   }));
@@ -489,19 +489,31 @@ const fg = (vcpus) => ({ capacity: 'ci-fargate', vcpus });
 const FGOD_MSG = { ...FG_MSG, label: 'ci-fargate', labels: ['self-hosted', 'ci-fargate', 'ci-cpu-4', 'x64'] };
 const ran = (ecs) => ecs.calls.some((c) => c[0] === 'runTask');
 
-test('the Fargate budget lists the cluster\'s tasks not told to stop, and reads their tags', async () => {
-  const ecs = fakeEcs({ running: [fgSpot(4), fgSpot(2)] });
+test('the Fargate budget lists the cluster\'s tasks, running and told to stop, and reads their tags', async () => {
+  const ecs = fakeEcs({ running: [fgSpot(4), fgSpot(2), { ...fgSpot(2), desired: 'STOPPED' }] });
   const { handler } = setup({ ecs });
   await handler(sqsEvent(FG_MSG));
   const lists = ecs.calls.filter((c) => c[0] === 'listTasks').map((c) => c[1]);
   assert.deepEqual(lists, [
     { cluster: 'ci-runner', desiredStatus: 'RUNNING', nextToken: undefined },
     { cluster: 'ci-runner', desiredStatus: 'RUNNING', nextToken: '1' },
+    { cluster: 'ci-runner', desiredStatus: 'STOPPED', nextToken: undefined },
   ]);
   for (const [, d] of ecs.calls.filter((c) => c[0] === 'describeTasks')) {
     assert.equal(d.cluster, 'ci-runner');
     assert.deepEqual(d.include, ['TAGS']);
   }
+});
+
+test('a task told to stop counts towards the Fargate budget until it is STOPPED', async () => {
+  // 16 running + 8 told to stop but still deprovisioning = 24 of 24; the 8
+  // already STOPPED no longer counts.
+  const running = [fgSpot(16), { ...fgSpot(8), desired: 'STOPPED', last: 'DEPROVISIONING' },
+    { ...fgSpot(8), desired: 'STOPPED', last: 'STOPPED' }];
+  const s = setup({ ecs: fakeEcs({ running }) });
+  await s.handler(sqsEvent({ ...FG_MSG, vcpus: 2 }));
+  assert.ok(!ran(s.ecs));
+  assert.equal(JSON.parse(s.logs.find((l) => l.includes('"deferred"'))).deferred, '24+2 of 24 fargate-spot vCPUs');
 });
 
 test('Fargate budgets sum mixed sizes across tasks; a job over the budget waits, logged in vCPUs', async () => {

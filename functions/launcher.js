@@ -154,22 +154,24 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
   }
 
   // vCPUs of the cluster's tasks on one Fargate capacity, from the shape
-  // tags. A task counts until it is told to stop (desired STOPPED), as an
-  // instance does until it shuts down.
+  // tags. A task counts until it is STOPPED: one told to stop (desired
+  // STOPPED) still holds its vCPUs while it deprovisions.
   async function taskVcpusIn(type) {
     let n = 0;
-    let nextToken;
-    do {
-      const r = await ecs.listTasks({ cluster: env.CLUSTER, desiredStatus: 'RUNNING', nextToken });
-      if ((r.taskArns || []).length) {
-        const d = await ecs.describeTasks({ cluster: env.CLUSTER, tasks: r.taskArns, include: ['TAGS'] });
-        for (const task of d.tasks || []) {
-          const t = Object.fromEntries((task.tags || []).map((x) => [x.key, x.value]));
-          if (CAPACITY[t['ci-runner:capacity']] === type) n += Number(t['ci-runner:vcpus']) || 4;
+    for (const desiredStatus of ['RUNNING', 'STOPPED']) {
+      let nextToken;
+      do {
+        const r = await ecs.listTasks({ cluster: env.CLUSTER, desiredStatus, nextToken });
+        if ((r.taskArns || []).length) {
+          const d = await ecs.describeTasks({ cluster: env.CLUSTER, tasks: r.taskArns, include: ['TAGS'] });
+          for (const task of d.tasks || []) {
+            const t = Object.fromEntries((task.tags || []).map((x) => [x.key, x.value]));
+            if (task.lastStatus !== 'STOPPED' && CAPACITY[t['ci-runner:capacity']] === type) n += Number(t['ci-runner:vcpus']) || 4;
+          }
         }
-      }
-      nextToken = r.nextToken;
-    } while (nextToken);
+        nextToken = r.nextToken;
+      } while (nextToken);
+    }
     return n;
   }
 

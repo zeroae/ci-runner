@@ -407,9 +407,10 @@ runbook's "Run a task by hand".
 
 **The budgets.** `FargateSpotVcpuCap` (default 24) and `FargateVcpuCap`
 (default 8) budget the two capacities, both architectures together, as the
-EC2 budgets do. The launcher lists the cluster's tasks whose desired status is
-`RUNNING` (provisioning, pending or running, not yet told to stop: a task
-stopping no longer counts, like a shutting-down instance) and sums their
+EC2 budgets do. The launcher lists the cluster's tasks not yet `STOPPED`:
+those whose desired status is `RUNNING` (provisioning, pending or running),
+and those told to stop (desired `STOPPED`) whose last status isn't `STOPPED`
+yet, since a deprovisioning task still holds its vCPUs. It sums their
 `ci-runner:vcpus` on the job's capacity (`ci-runner:capacity`). A task with no
 vCPU tag counts as 4. EC2 instances and tasks never count towards each
 other's budgets.
