@@ -691,10 +691,15 @@ Resources:
             Principal:
               Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
             Action: sts:AssumeRoleWithWebIdentity
+            # zeroae/ci-runner uses GitHub's immutable subject, so its token's
+            # sub names the owner and repo by id (owner 11018406, repo
+            # 1455021495), not by name. A rename or a re-created repo with the
+            # same name doesn't match. Read it with
+            # `gh api repos/zeroae/ci-runner/actions/oidc/customization/sub`.
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: repo:zeroae/ci-runner:ref:refs/heads/main
+                token.actions.githubusercontent.com:sub: repo:zeroae@11018406/ci-runner@1455021495:ref:refs/heads/main
       Policies:
         - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-image-push"
           PolicyDocument:

@@ -342,7 +342,10 @@ an instance has no instance profile, so it can't pull from private ECR.
 - **`ImagePushRole`**, `PowerUserPB-${stack}-image-push`, trusted only for
   `sts:AssumeRoleWithWebIdentity` from that provider with `aud`
   `sts.amazonaws.com` and `sub` exactly
-  `repo:zeroae/ci-runner:ref:refs/heads/main`. Any other branch, a pull
+  `repo:zeroae@11018406/ci-runner@1455021495:ref:refs/heads/main`. The repo
+  uses GitHub's immutable subject, so the `sub` names the owner and repo by id
+  (`gh api repos/zeroae/ci-runner/actions/oidc/customization/sub` shows the
+  prefix); the name-only form `repo:zeroae/ci-runner:...` never matches. Any other branch, a pull
   request, a tag or another repo carries a different `sub`, and can't assume
   it. It allows `ecr:GetAuthorizationToken` (which has no resource-level
   permissions) and, on the repo only, the layer upload calls, `PutImage`,

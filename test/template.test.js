@@ -50,7 +50,7 @@ test('the image push role trusts only zeroae/ci-runner\'s main, through whicheve
   assert.equal((trust.match(/- Effect: Allow/g) || []).length, 1, 'one trust statement');
   assert.match(trust, /Federated: !If \[CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn\]/);
   assert.match(trust, /Action: sts:AssumeRoleWithWebIdentity/);
-  assert.match(trust, /StringEquals:\n\s+token\.actions\.githubusercontent\.com:aud: sts\.amazonaws\.com\n\s+token\.actions\.githubusercontent\.com:sub: repo:zeroae\/ci-runner:ref:refs\/heads\/main$/);
+  assert.match(trust, /StringEquals:\n\s+token\.actions\.githubusercontent\.com:aud: sts\.amazonaws\.com\n\s+token\.actions\.githubusercontent\.com:sub: repo:zeroae@11018406\/ci-runner@1455021495:ref:refs\/heads\/main$/);
   assert.doesNotMatch(trust, /StringLike|\*/, 'no wildcard in the trust');
 });
 
