@@ -28,7 +28,7 @@ case $SIZE in
 esac
 # The architecture's launch template and families, as the launcher picks them.
 case $ARCH in
-  x64) lt_output=LaunchTemplateId; TYPES=(m7i.$size m6i.$size m6a.$size m7a.$size) ;;
+  x64) lt_output=LaunchTemplateId; TYPES=(m8i.$size m8a.$size m7i.$size m6i.$size m6a.$size m7a.$size) ;;
   arm64) lt_output=Arm64LaunchTemplateId; TYPES=(m7g.$size m6g.$size m8g.$size) ;;
   *) echo "unknown architecture $ARCH: one of x64, arm64" >&2; exit 1 ;;
 esac

@@ -14,7 +14,7 @@ Docker.
 
 | Label in `runs-on` | Capacity | For |
 |---|---|---|
-| `ci-spot` | EC2 Spot (`m7i`/`m6i`/`m6a`/`m7a` for `x64`, `m7g`/`m6g`/`m8g` for `arm64`) | long jobs: a job that runs well over 2 minutes, which is about how long a CI runner takes to come up |
+| `ci-spot` | EC2 Spot (`m8i`/`m8a`/`m7i`/`m6i`/`m6a`/`m7a` for `x64`, `m7g`/`m6g`/`m8g` for `arm64`) | long jobs: a job that runs well over 2 minutes, which is about how long a CI runner takes to come up |
 | `ci-ondemand` | EC2 On-Demand (the same families) | critical jobs: a job that, cut off half-way, leaves state a person must repair (`terraform apply`) |
 | `ci-fargate-spot` | Fargate Spot, **no Docker** | Docker-free jobs that should start fast: about 30 s from queued to started |
 | `ci-fargate` | Fargate On-Demand, **no Docker** | Docker-free jobs that must not be cut off half-way |
