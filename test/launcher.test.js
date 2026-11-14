@@ -16,7 +16,7 @@ const JIT = 'ZW5jb2RlZGppdA==';
 
 const MSG = {
   repo: 'zeroae/app', job_id: 555, run_id: 444, head_sha: 'abc123', job_name: 'tests',
-  label: 'ci-spot', labels: ['self-hosted', 'ci-spot'], installation_id: 181,
+  label: 'ci-spot', vcpus: 4, arch: 'x64', labels: ['self-hosted', 'ci-spot'], installation_id: 181,
 };
 
 function verifyJwt(auth) {
@@ -136,11 +136,61 @@ test('a queued job launches one Spot instance from the launch template, tagged w
   assert.deepEqual(tags(fleet), {
     'ci-runner:runner': 'ci-runner-20261112120000-555', 'ci-runner:runner-id': '77', 'ci-runner:label': 'ci-spot', 'ci-runner:repo': 'zeroae/app',
     'ci-runner:job-id': '555', 'ci-runner:run-id': '444', 'ci-runner:head-sha': 'abc123', 'ci-runner:job-name': 'tests',
+    'ci-runner:capacity': 'ci-spot', 'ci-runner:vcpus': '4', 'ci-runner:arch': 'x64',
   });
 
   assert.deepEqual(ec2.calls[3][1], { LaunchTemplateId: 'lt-0abc', Versions: ['9'] });
   assert.ok(logs.some((l) => /i-0123/.test(l)), 'the instance id is logged');
   assert.ok(!logs.some((l) => l.includes(JIT) || l.includes('ghs_install')), 'no secrets in the logs');
+});
+
+test('each size launches its instance size across the four x64 families in the three subnets', async () => {
+  const sizes = { 2: 'large', 4: 'xlarge', 8: '2xlarge', 16: '4xlarge' };
+  for (const [vcpus, size] of Object.entries(sizes)) {
+    const { handler, ec2 } = setup();
+    await handler(sqsEvent({ ...MSG, vcpus: Number(vcpus), labels: ['self-hosted', 'ci-spot', `ci-cpu-${vcpus}`, 'x64'] }));
+    const fleet = ec2.calls.find((c) => c[0] === 'createFleet')[1];
+    const overrides = fleet.LaunchTemplateConfigs[0].Overrides;
+    const want = ['m7i', 'm6i', 'm6a', 'm7a'].flatMap((f) => ['subnet-a', 'subnet-b', 'subnet-c'].map((s) => `${f}.${size} ${s}`));
+    assert.deepEqual(overrides.map((o) => `${o.InstanceType} ${o.SubnetId}`).sort(), want.sort(), `ci-cpu-${vcpus}`);
+    assert.deepEqual(
+      [tags(fleet)['ci-runner:capacity'], tags(fleet)['ci-runner:vcpus'], tags(fleet)['ci-runner:arch']],
+      ['ci-spot', vcpus, 'x64'],
+    );
+  }
+});
+
+test('an On-Demand job is tagged with its capacity', async () => {
+  const { handler, ec2 } = setup();
+  await handler(sqsEvent({ ...MSG, label: 'ci-ondemand', vcpus: 8, labels: ['self-hosted', 'ci-ondemand', 'ci-cpu-8'] }));
+  const t = tags(ec2.calls.find((c) => c[0] === 'createFleet')[1]);
+  assert.deepEqual([t['ci-runner:capacity'], t['ci-runner:vcpus'], t['ci-runner:arch']], ['ci-ondemand', '8', 'x64']);
+});
+
+test('a message from before the size labels (no vcpus, no arch) launches a 4-vCPU x64 .xlarge', async () => {
+  const { vcpus, arch, ...old } = MSG;
+  const { handler, ec2 } = setup();
+  assert.deepEqual(await handler(sqsEvent(old)), { batchItemFailures: [] });
+  const fleet = ec2.calls.find((c) => c[0] === 'createFleet')[1];
+  assert.deepEqual(new Set(fleet.LaunchTemplateConfigs[0].Overrides.map((o) => o.InstanceType)), new Set(['m7i.xlarge', 'm6i.xlarge', 'm6a.xlarge', 'm7a.xlarge']));
+  assert.equal(tags(fleet)['ci-runner:vcpus'], '4');
+  assert.equal(tags(fleet)['ci-runner:arch'], 'x64');
+});
+
+test('a message with an unknown size or architecture is dropped as malformed', async () => {
+  for (const bad of [{ vcpus: 3 }, { vcpus: 32 }, { vcpus: '8' }, { arch: 'arm64' }, { arch: 'X64' }]) {
+    const { handler, gh, logs } = setup();
+    assert.deepEqual(await handler(sqsEvent({ ...MSG, ...bad })), { batchItemFailures: [] }, JSON.stringify(bad));
+    assert.equal(gh.calls.length, 0, JSON.stringify(bad));
+    assert.match(logs.join('\n'), /malformed/);
+  }
+});
+
+test('the launch is logged with the job\'s shape', async () => {
+  const { handler, logs } = setup();
+  await handler(sqsEvent({ ...MSG, vcpus: 8 }));
+  const line = JSON.parse(logs.find((l) => l.includes('"launched"')));
+  assert.deepEqual([line.label, line.vcpus, line.arch], ['ci-spot', 8, 'x64']);
 });
 
 test('a ci-ondemand job launches On-Demand capacity', async () => {
