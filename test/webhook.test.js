@@ -318,8 +318,13 @@ test('both Fargate capacities are enqueued with every size and architecture', as
   assert.equal(sent[0].label, 'ci-fargate-spot');
 });
 
-test('a Fargate capacity next to another capacity label is outside the contract', async () => {
+test('a Fargate job follows the same contract: no default size or architecture, one capacity', async () => {
   for (const labels of [
+    ['self-hosted', 'ci-fargate-spot'],
+    ['self-hosted', 'ci-fargate', 'x64'],
+    ['self-hosted', 'ci-fargate-spot', 'ci-cpu-4'],
+    ['self-hosted', 'ci-fargate', 'ci-cpu-4', 'ci-cpu-8', 'x64'],
+    ['self-hosted', 'ci-fargate-spot', 'ci-cpu-4', 'x64', 'arm64'],
     ['self-hosted', 'ci-fargate', 'ci-fargate-spot', 'ci-cpu-4', 'x64'],
     ['self-hosted', 'ci-fargate-spot', 'ci-spot', 'ci-cpu-4', 'x64'],
     ['self-hosted', 'ci-fargate', 'ci-ondemand', 'ci-cpu-4', 'x64'],
