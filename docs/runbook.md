@@ -288,15 +288,35 @@ types.
   moving when it runs well over 2 minutes. The first job after a deploy took
   about 3½ minutes, while the stack's functions were still cold. A hand
   launch (`make hand-launch`) took about 97 s to pick up its job.
-- **EC2 quotas** in `us-east-1`: 256 Spot and 384 On-Demand vCPUs. At 4 vCPUs
-  per `.xlarge`, the default caps use 24 Spot and 8 On-Demand vCPUs. Other
-  workloads in the account share the quotas, so check them before raising a
-  cap:
+- **vCPU quotas** in `us-east-1`, read 2026-11-13. Each budget draws on one
+  quota, shared with every other workload in the account:
+
+  | Quota | Code | Value | AWS default | Budget default | Account peak, 14 days |
+  |---|---|---|---|---|---|
+  | EC2 Spot (All Standard Spot Instance Requests) | `L-34B43A08` | 256 | 5 | 24 | 32 |
+  | EC2 On-Demand (Running On-Demand Standard instances) | `L-1216C47A` | 384 | 5 | 8 | 4 |
+  | Fargate Spot vCPU resource count | `L-36FBB829` | 140 | 6 | 24 | 0 |
+  | Fargate On-Demand vCPU resource count | `L-3032A538` | 140 | 6 | 8 | 0 |
+
+  All four cover the default budgets with room to spare, so no increase was
+  requested. The peak is the `AWS/Usage` `ResourceCount` maximum, and it
+  includes this stack's own runners. Check the quota, and the peak, before
+  raising a budget:
 
   ```bash
-  $AWS service-quotas get-service-quota --service-code ec2 --quota-code L-34B43A08  # Spot
-  $AWS service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A  # On-Demand
+  $AWS service-quotas get-service-quota --service-code ec2 --quota-code L-34B43A08      # EC2 Spot
+  $AWS service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A      # EC2 On-Demand
+  $AWS service-quotas get-service-quota --service-code fargate --quota-code L-36FBB829  # Fargate Spot
+  $AWS service-quotas get-service-quota --service-code fargate --quota-code L-3032A538  # Fargate On-Demand
+  $AWS cloudwatch get-metric-statistics --namespace AWS/Usage --metric-name ResourceCount \
+    --dimensions Name=Service,Value=Fargate Name=Type,Value=Resource Name=Resource,Value=vCPU \
+      Name=Class,Value=Standard/Spot \
+    --start-time "$(date -u -d '-14 days' +%FT%TZ)" --end-time "$(date -u +%FT%TZ)" \
+    --period 86400 --statistics Maximum --query 'max(Datapoints[].Maximum)'
   ```
+
+  For the other three peaks, use `Service` `EC2` and `Class`
+  `Standard/OnDemand` as fits.
 
 - **Template size:** 49,908 of 51,200 bytes (97%). A new function, or a big
   addition to one, will need the S3-bucket deploy.
