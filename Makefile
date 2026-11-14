@@ -6,12 +6,12 @@ AWS      = aws --profile $(PROFILE) --region $(REGION)
 # The deploy bucket, made outside the stack (docs/runbook.md). Looked up only when used.
 BUCKET  ?= $(STACK)-deploy-$(shell $(AWS) sts get-caller-identity --query Account --output text)
 
-.PHONY: help test build validate deploy outputs hand-launch runners sweep canary-runs
+.PHONY: help test build validate deploy outputs hand-launch runners sweep canary-runs consumers
 .DEFAULT_GOAL := help
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-12s %s\n", $$1, $$2}'
-	@echo "  Layout and conventions: docs/stack.md; procedures and traps: docs/runbook.md"
+	@echo "  Layout and conventions: docs/stack.md; procedures: docs/runbook.md; traps: docs/traps.md"
 
 test: ## Run the unit tests (node --test, no npm deps)
 	node --test test/*.test.js
@@ -49,3 +49,6 @@ sweep: ## Run the sweeper now, and print what it terminated, stopped and removed
 canary-runs: ## List the canary repo's recent workflow runs (CI_RUNNER_CANARY_REPO, from .env)
 	@test -f .env || { echo "no .env: run scripts/setup-github.sh first" >&2; exit 1; }
 	@. ./.env && gh run list --repo $(ORG)/$$CI_RUNNER_CANARY_REPO --limit 10
+
+consumers: ## List every job, in the runner group's repos, whose runs-on names a capacity (needs gh with admin:org)
+	@ORG=$(ORG) scripts/consumers.sh

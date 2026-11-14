@@ -99,7 +99,8 @@ it's in both.
 include `linux`. None of them has a default. A job missing a size or an
 architecture label, or with any other label (`aarch64`, an unknown
 `ci-cpu-*`, two size labels, both `x64` and `arm64`), is ignored, and it waits
-for a runner that never comes.
+for a runner that never comes. Before changing the contract, `make consumers`
+lists every job it affects.
 
 **What the job gets:** Ubuntu 24.04, the runner as user `runner` (passwordless
 sudo), Docker through the host's socket, the `docker compose` and `buildx`
@@ -142,7 +143,8 @@ must drop that condition before a deploy job moves.
 ## Docs
 
 - [docs/runbook.md](docs/runbook.md): deploy, create the App, turn repos on and
-  off, read a lost job or the logs, and the traps table.
+  off, read a lost job or the logs, prove a change live.
+- [docs/traps.md](docs/traps.md): symptoms and their causes.
 - [docs/stack.md](docs/stack.md): the stack's layout, the Lambdas, and how to
   change them.
 - [The design spec](docs/superpowers/specs/2026-11-12-ci-runner-design.md).

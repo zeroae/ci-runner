@@ -1,8 +1,8 @@
 # The stack: layout and conventions
 
 One CloudFormation stack, `ci-runner`, in `zeroae-code` / `us-east-1`.
-`make help` lists the targets. The owner's procedures and the traps table are in
-[runbook.md](runbook.md).
+`make help` lists the targets. The owner's procedures are in
+[runbook.md](runbook.md), and the traps in [traps.md](traps.md).
 
 ```
 template.yaml               source template (valid YAML, with inline markers)
@@ -547,3 +547,12 @@ On `main`, with both variables set, it then assumes the push role and
 pushes the same index to ECR under `:<date>-<sha>` and `:latest`. Without
 the variables (before the stack has the repo) those two steps are skipped
 and the GHCR publish is unaffected.
+
+### Image changes land on `main` first
+
+`image.yml` publishes, to GHCR and to ECR, only from `main`, and the push
+role trusts only `main`, so a change under `image/` reaches no runner until
+it is on `main`. Make an `image/` change its own commit, and land it on
+`main` before anything that needs it live. An integration branch that
+carries such commits (cherry-picked to `main`, then merged back) lands with
+a merge commit: a rebase would re-resolve every one of those conflicts.
