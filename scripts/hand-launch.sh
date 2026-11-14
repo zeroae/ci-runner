@@ -14,7 +14,7 @@
 set -euo pipefail
 
 STACK=${STACK:-ci-runner}
-PROFILE=${PROFILE:-zeroae-code/AWSPowerUserAccess}
+PROFILE=${PROFILE:-zeroae-code/ZAEPowerUserAccess}
 REGION=${REGION:-us-east-1}
 ORG=${ORG:-zeroae}
 GROUP=${GROUP:-ci-runner}

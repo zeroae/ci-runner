@@ -1,5 +1,5 @@
 STACK   ?= ci-runner
-PROFILE ?= zeroae-code/AWSPowerUserAccess
+PROFILE ?= zeroae-code/ZAEPowerUserAccess
 REGION  ?= us-east-1
 ORG     ?= zeroae
 AWS      = aws --profile $(PROFILE) --region $(REGION)

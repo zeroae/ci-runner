@@ -15,11 +15,13 @@ permissions:
 
 env:
   IMAGE: ghcr.io/zeroae/ci-runner
+  SOCI_VERSION: 0.16.1
 
 jobs:
   # Each architecture builds and smoke-tests on its own native runner (no
   # QEMU). Only main publishes: a push to main, the schedule (which runs on
-  # main), or a dispatch run on main. Other branches build and smoke.
+  # main), or a dispatch run on main. Other branches build, smoke and make
+  # the SOCI-enabled image, but push it only to a throwaway local registry.
   build:
     strategy:
       fail-fast: false
@@ -87,6 +89,24 @@ jobs:
           path: digests/${{ matrix.arch }}
           retention-days: 1
 
+      # The same build once more, as an OCI layout for the soci job, on every
+      # branch. No provenance, so the layout holds just the image manifest.
+      - name: Export the OCI layout
+        uses: docker/build-push-action@v6
+        with:
+          context: image
+          platforms: linux/${{ matrix.arch }}
+          provenance: false
+          outputs: type=oci,dest=${{ runner.temp }}/oci-${{ matrix.arch }}.tar
+
+      - name: Upload the OCI layout
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-${{ matrix.arch }}
+          path: ${{ runner.temp }}/oci-${{ matrix.arch }}.tar
+          compression-level: 0
+          retention-days: 1
+
   publish:
     needs: build
     if: github.ref == 'refs/heads/main'
@@ -115,3 +135,101 @@ jobs:
           docker buildx imagetools create -t "$IMAGE:latest" -t "$IMAGE:$tag" "${refs[@]}"
           docker buildx imagetools inspect "$IMAGE:$tag"
           echo "Published $IMAGE:latest and $IMAGE:$tag (linux/amd64, linux/arm64)" >> "$GITHUB_STEP_SUMMARY"
+
+  # Fargate lazy-loads the image only from private ECR, and only through a
+  # SOCI index (ADR-0002). This job merges both architectures into one OCI
+  # layout, runs `soci convert` on it (standalone: no containerd), and pushes
+  # the converted image index to ECR on main. GHCR keeps the plain image,
+  # which the EC2 runners pull. Every branch also pushes it to a throwaway
+  # local registry, so the push itself is exercised before main.
+  soci:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # the OIDC token for the ECR push role, used on main only
+    services:
+      registry:
+        image: registry:3
+        ports: ["5000:5000"]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: oci-*
+          path: ${{ runner.temp }}/oci
+          merge-multiple: true
+
+      - name: Install soci
+        run: |
+          base=https://github.com/awslabs/soci-snapshotter/releases/download/v$SOCI_VERSION
+          tgz=soci-snapshotter-$SOCI_VERSION-linux-amd64-static.tar.gz
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o "$tgz" "$base/$tgz" -o "$tgz.sha256sum" "$base/$tgz.sha256sum"
+          sha256sum -c "$tgz.sha256sum"
+          sudo tar -xzf "$tgz" -C /usr/local/bin soci
+          soci --version
+
+      # One layout, one index: both image manifests, each with the platform
+      # its own config names, and every blob of both.
+      - name: Merge both architectures into one OCI layout
+        run: |
+          out="$RUNNER_TEMP/layout"
+          mkdir -p "$out/blobs/sha256"
+          descs=()
+          for arch in amd64 arm64; do
+            dir="$RUNNER_TEMP/oci/$arch"
+            mkdir -p "$dir"
+            tar -xf "$RUNNER_TEMP/oci/oci-$arch.tar" -C "$dir"
+            cp -n "$dir"/blobs/sha256/* "$out/blobs/sha256/"
+            desc=$(jq -c '.manifests[0] | del(.annotations)' "$dir/index.json")
+            test "$(jq -r .mediaType <<<"$desc")" = application/vnd.oci.image.manifest.v1+json
+            manifest="$dir/blobs/sha256/$(jq -r '.digest | ltrimstr("sha256:")' <<<"$desc")"
+            config="$dir/blobs/sha256/$(jq -r '.config.digest | ltrimstr("sha256:")' "$manifest")"
+            descs+=("$(jq -c --slurpfile c "$config" \
+              '. + {platform: ($c[0] | {architecture, os} + (if .variant then {variant} else {} end))}' <<<"$desc")")
+          done
+          echo '{"imageLayoutVersion":"1.0.0"}' > "$out/oci-layout"
+          printf '%s\n' "${descs[@]}" \
+            | jq -s '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: .}' \
+            > "$out/index.json"
+          jq . "$out/index.json"
+
+      - name: Convert to a SOCI-enabled image (SOCI index manifest v2)
+        run: |
+          out="$RUNNER_TEMP/soci-layout"
+          soci convert --standalone --all-platforms --format oci-dir "$RUNNER_TEMP/layout" "$out"
+          index="$out/blobs/sha256/$(jq -r '.manifests[0].digest | ltrimstr("sha256:")' "$out/index.json")"
+          jq . "$index"
+          # Both architectures, and a SOCI v2 index for each.
+          jq -e '[.manifests[].platform.architecture] | contains(["amd64", "arm64"])' "$index"
+          jq -e '[.manifests[] | select(.artifactType == "application/vnd.amazon.soci.index.v2+json")] | length == 2' "$index"
+
+      - name: Push to the local registry
+        run: |
+          skopeo copy --all --preserve-digests --dest-tls-verify=false \
+            "oci:$RUNNER_TEMP/soci-layout" docker://localhost:5000/ci-runner:latest
+          skopeo inspect --raw --tls-verify=false docker://localhost:5000/ci-runner:latest \
+            | jq -e '[.manifests[] | select(.artifactType == "application/vnd.amazon.soci.index.v2+json")] | length == 2'
+
+      - name: Assume the ECR push role
+        if: github.ref == 'refs/heads/main' && vars.AWS_IMAGE_PUSH_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_IMAGE_PUSH_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # The same index under both tags. The lifecycle rule keeps the last 4.
+      - name: Push to ECR
+        if: github.ref == 'refs/heads/main' && vars.AWS_IMAGE_PUSH_ROLE_ARN != ''
+        env:
+          ECR_IMAGE: ${{ vars.ECR_IMAGE }}
+        run: |
+          tag="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          creds="AWS:$(aws ecr get-login-password)"
+          for t in "$tag" latest; do
+            skopeo copy --all --preserve-digests --dest-creds "$creds" \
+              "oci:$RUNNER_TEMP/soci-layout" "docker://$ECR_IMAGE:$t"
+          done
+          skopeo inspect --raw --creds "$creds" "docker://$ECR_IMAGE:latest" \
+            | jq -e '[.manifests[] | select(.artifactType == "application/vnd.amazon.soci.index.v2+json")] | length == 2'
+          echo "Published $ECR_IMAGE:latest and $ECR_IMAGE:$tag, with a SOCI v2 index (linux/amd64, linux/arm64)" >> "$GITHUB_STEP_SUMMARY"

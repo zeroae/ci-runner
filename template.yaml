@@ -31,6 +31,13 @@ Parameters:
     Type: Number
     Default: 8
     Description: Most vCPUs the On-Demand CI runners hold at once, both architectures (soft). Draws on the EC2 On-Demand vCPU quota.
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: Leave empty to create GitHub's OIDC provider. An account holds one provider per URL, so if `aws iam list-open-id-connect-providers` already shows token.actions.githubusercontent.com, give its ARN here.
+
+Conditions:
+  CreateProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
 
 Resources:
   # App id, private key and webhook secret. Created holding only `state_key`
@@ -144,7 +151,7 @@ Resources:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
-  # --- webhook: verify, label contract, fence 3, enqueue ----------------------
+  # --- webhook: verify, label contract, fence 3, enqueue, swap repair ---------
   WebhookLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -176,6 +183,19 @@ Resources:
               - Effect: Allow
                 Action: sqs:SendMessage
                 Resource: !GetAtt JobQueue.Arn
+              # Swap repair: find a runner's instance, and re-tag it with the
+              # job it really runs. Only the job tags, only the stack's instances.
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
+                  ForAllValues:StringEquals:
+                    aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
 
   WebhookFunction:
     Type: AWS::Lambda::Function
@@ -194,6 +214,7 @@ Resources:
           SECRET_ARN: !Ref AppSecret
           QUEUE_URL: !Ref JobQueue
           GITHUB_ORG: !Ref GitHubOrg
+          STACK_NAME: !Ref AWS::StackName
       Code:
         ZipFile: |
           //@inline functions/webhook.js
@@ -645,6 +666,76 @@ Resources:
             Tags:
               - { Key: ci-runner:stack, Value: !Ref AWS::StackName }
 
+  # --- image: the runner image in ECR, pushed by image.yml on main ----------
+  # Fargate lazy-loads only from private ECR (ADR-0002). image.yml assumes
+  # the push role through GitHub OIDC: no stored key or token anywhere.
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  ImagePushRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PowerUserPB-${AWS::StackName}-image-push"
+      PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Only image.yml on this repo's main (a push, the schedule or a
+          # dispatch there). Any other branch, a pull request, a tag or
+          # another repo has a different sub.
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            # zeroae/ci-runner uses GitHub's immutable subject, so its token's
+            # sub names the owner and repo by id (owner 11018406, repo
+            # 1455021495), not by name. A rename or a re-created repo with the
+            # same name doesn't match. Read it with
+            # `gh api repos/zeroae/ci-runner/actions/oidc/customization/sub`.
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:zeroae@11018406/ci-runner@1455021495:ref:refs/heads/main
+      Policies:
+        - PolicyName: !Sub "PowerUserPB-${AWS::StackName}-image-push"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The registry login supports no resource-level permissions.
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              # Push, and read back what it pushed, on this repo only.
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt ImageRepository.Arn
+
+  # Each build tags one image index (:latest and :<date>-<sha>), and the
+  # rule keeps the last 4 of those. It counts only tagged images: the index's
+  # children (each architecture's manifest and SOCI index) are untagged, and
+  # an untagged rule could expire the children of an index still in use.
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AWS::StackName
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [{"rulePriority": 1, "description": "keep the last 4 builds",
+            "selection": {"tagStatus": "tagged", "tagPatternList": ["*"], "countType": "imageCountMoreThan", "countNumber": 4},
+            "action": {"type": "expire"}}]}
+
 Outputs:
   SetupUrl:
     Description: Open in a browser to create the GitHub App (refuses everything once done).
@@ -665,3 +756,9 @@ Outputs:
     Value: !Ref JobQueue
   JobDeadLetterQueueUrl:
     Value: !Ref JobDeadLetterQueue
+  ImageRepositoryUri:
+    Description: The repo variable ECR_IMAGE, which image.yml pushes to on main.
+    Value: !GetAtt ImageRepository.RepositoryUri
+  ImagePushRoleArn:
+    Description: The repo variable AWS_IMAGE_PUSH_ROLE_ARN, which image.yml assumes on main.
+    Value: !GetAtt ImagePushRole.Arn
