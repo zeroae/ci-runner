@@ -604,9 +604,9 @@ Resources:
       SourceArn: !GetAtt NotifierRule.Arn
 
   # A Fargate Spot reclaim: every change of the task from the warning on
-  # carries the stop code. ECS drops a task's tags once it is told to stop
-  # (aws-emulator does), so the first change may be the only one the notifier
-  # can read; it reports one check run per job.
+  # carries the stop code. ECS keeps a stopping or stopped task's tags in
+  # DescribeTasks (aws-emulator drops them), so every change can be read;
+  # the notifier reports one check run per job.
   NotifierTaskRule:
     Type: AWS::Events::Rule
     Properties:
