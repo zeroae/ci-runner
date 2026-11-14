@@ -136,6 +136,7 @@ test('a queued job launches one Spot instance from the launch template, tagged w
   assert.deepEqual(tags(fleet), {
     'ci-runner:runner': 'ci-runner-20261112120000-555', 'ci-runner:runner-id': '77', 'ci-runner:label': 'ci-spot', 'ci-runner:repo': 'zeroae/app',
     'ci-runner:job-id': '555', 'ci-runner:run-id': '444', 'ci-runner:head-sha': 'abc123', 'ci-runner:job-name': 'tests',
+    'ci-runner:labels': 'self-hosted,ci-spot',
   });
 
   assert.deepEqual(ec2.calls[3][1], { LaunchTemplateId: 'lt-0abc', Versions: ['9'] });
