@@ -251,13 +251,14 @@ A repo is served when all of these hold:
 
 ## Read a lost job
 
-When AWS reclaims a Spot instance, GitHub marks the job failed, with *The
+When AWS reclaims a Spot instance or a Fargate Spot task, GitHub marks the job failed, with *The
 runner has received a shutdown signal*, *lost communication with the server*,
 or (seen in the live FIS test) just *Process completed with exit code 130*
 on the running step. On the same commit there is a failed check run from the App, named
 `ci-runner / <job name>` and titled `Spot capacity reclaimed: re-run this job`.
-Its summary names the instance and links the run. That is the whole story:
-re-run the failed job. Nothing retries it automatically.
+Its summary names the instance (or the task's id) and links the run. That is
+the whole story: re-run the failed job. Nothing retries it automatically.
+One check run per job: the notifier skips a job whose commit has it already.
 
 To list those check runs on a commit:
 
@@ -267,9 +268,12 @@ gh api repos/zeroae/<repo>/commits/<sha>/check-runs \
 ```
 
 A job lost **without** that check run wasn't a Spot reclaim. Look in the
-notifier's log for a line `reported <instance>: <repo> job <id>`. An instance
-from `make hand-launch` carries no job tags, so the notifier ignores it and
-logs `ignored: <instance> is no job instance of this stack`. A job that sits
+notifier's log for a line `reported <instance or task id>: <repo> job <id>`
+(or `already reported ...`). An instance from `make hand-launch`, or a task
+run by hand, carries no job tags, so the notifier ignores it and logs
+`ignored: <instance> is no job instance of this stack` (`... no job task
+...` for a task). A task's stop code is in `describe-tasks` (below):
+`SpotInterruption` is a reclaim. A job that sits
 *Waiting for a runner* is not lost: see the traps table, then the launcher's
 log.
 
@@ -287,8 +291,8 @@ $AWS logs tail /aws/lambda/ci-runner-notifier --since 1d
 **The webhook** logs one JSON line per accepted job, `{"enqueued": "<repo>",
 "job_id": ..., "label": ...}`, and `{"refused": "<repo>", "visibility": ...}`
 for a job from any repo but a private `zeroae` one (fence 3), and `{"swap":
-"<runner>", "instance": "i-...", "took": {...}, "requeued": {...}}` for each
-swap it repairs: the runner launched for the `requeued` job started the `took`
+"<runner>", "instance": "i-...", "took": {...}, "requeued": {...}}` (with
+`"task": "<task ARN>"` for a Fargate runner) for each swap it repairs: the runner launched for the `requeued` job started the `took`
 job instead. Everything else it ignores without a log line.
 
 **The launcher** logs one JSON line per job, carrying the job's fields plus one
@@ -329,13 +333,15 @@ $AWS ecs describe-tasks --cluster ci-runner --tasks <arn> --include TAGS \
 
 **The sweeper** runs every 10 minutes and logs only what it did:
 `sweeper: terminated i-...` (an instance launched over 2 hours ago),
+`sweeper: stopped arn:aws:ecs:...:task/ci-runner/<id>` (a task launched over
+2 hours ago; its `stoppedReason` says `ci-runner sweeper`),
 `sweeper: removed runner <name> (id <id>)` (an offline registration with no
-instance), or that it skipped the registrations: `the GitHub App is not set up
-yet`, or `no runner group named ci-runner yet`.
+instance or task), or that it skipped the registrations: `the GitHub App is
+not set up yet`, or `no runner group named ci-runner yet`.
 
 ```bash
 make runners     # the stack's instances that are not terminated
-make sweep       # run the sweeper now; prints {"terminated": [...], "removed": [...]}
+make sweep       # run the sweeper now; prints {"terminated": [...], "stopped": [...], "removed": [...]}
 ```
 
 ## Re-register the App
@@ -411,7 +417,9 @@ $AWS ecs run-task --cluster ci-runner --task-definition "$(out TaskDefinitionArn
 ```
 
 The task stops about 2 minutes after `Listening for Jobs`. Its registration
-stays, offline, until the sweeper removes it.
+stays, offline, until the sweeper removes it. A hand-run task that never
+stops is stopped by the sweeper 2 hours after launch, as any task in the
+cluster is.
 
 ## Measured numbers
 
@@ -509,7 +517,8 @@ types.
 | A job sits "Waiting for a runner" | its capacity's vCPU budget is full, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), exactly one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
 | A job that ran on our runners before now sits "Waiting for a runner", and the webhook's log shows no `enqueued` line for it | missing size or architecture label: its `runs-on` names only its capacity (`self-hosted`, `ci-spot`). There are no defaults; add a size and an architecture label (`ci-cpu-4` and `x64` keep the old shape), then cancel and re-run the job |
 | An `arm64` runner's instance comes up and terminates without taking its job, and its console shows `no matching manifest for linux/arm64` | `ghcr.io/zeroae/ci-runner:latest` has no arm64 entry yet: the image workflow hasn't pushed a multi-arch `:latest` since it began building arm64. Run the image workflow on `main`, then re-run the job |
-| A job's runner was launched for another job (`$RUNNER_NAME` ends in another job id), and that other job sits "Waiting for a runner" | a swap. The webhook repairs it on the job's `in_progress` (its log says `swap`), and the launcher then launches a runner for the other job. No `swap` line: check the webhook's log for errors (its role needs `ec2:DescribeInstances` and `ec2:CreateTags`); cancel and re-run the waiting job |
+| A job's runner was launched for another job (`$RUNNER_NAME` ends in another job id), and that other job sits "Waiting for a runner" | a swap. The webhook repairs it on the job's `in_progress` (its log says `swap`), and the launcher then launches a runner for the other job. No `swap` line: check the webhook's log for errors (its role needs `ec2:DescribeInstances` and `ec2:CreateTags`, and for a task `ecs:ListTasks`, `ecs:DescribeTasks` and `ecs:TagResource`); cancel and re-run the waiting job |
+| A Fargate Spot job was lost (its task's `stopCode` is `SpotInterruption`) and its commit has no `ci-runner / <job>` check run | the notifier logged `ignored: <task id> is no job task of this stack` for every change of the stop: the task's tags were gone before it read them (ECS drops a task's tags once it is told to stop). Re-run the job. If it recurs, the notifier needs the job from somewhere other than the task's tags |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
 | A budget lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8 FargateSpotVcpuCap=24 FargateVcpuCap=8`. Each draws on its own vCPU quota (see "Deploy and update the stack") |
 | A job on `ci-fargate-spot` or `ci-fargate` fails at a Docker step: `failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running`, or a `services:`/`container:` job or Docker action fails to start | Docker used on Fargate. A Fargate capacity has no Docker daemon, by design (ADR-0001): move the job to `ci-spot` or `ci-ondemand`, or drop its Docker use |

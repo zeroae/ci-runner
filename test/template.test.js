@@ -150,3 +150,41 @@ test('the launcher\'s role runs only the two task definitions in the cluster, an
     assert.match(s, /RunnerCluster|RunnerTaskDefinition/, `${s}: not limited to the cluster`);
   }
 });
+
+// Tasks get the instances' lifecycle (#30).
+test('a second notifier rule matches every change of a Fargate Spot reclaim in the cluster', () => {
+  const rule = resource('NotifierTaskRule');
+  assert.match(rule, /^ {4}Type: AWS::Events::Rule\n/);
+  assert.match(rule, /Name: !Sub "\$\{AWS::StackName\}-notifier-tasks"\n/);
+  assert.equal(rule.split('EventPattern:\n')[1].split(/\n {6}\w/)[0], [
+    '        source: [aws.ecs]',
+    '        detail-type: [ECS Task State Change]',
+    '        detail:',
+    '          clusterArn: [!GetAtt RunnerCluster.Arn]',
+    '          stopCode: [SpotInterruption]',
+  ].join('\n'));
+  assert.match(rule, /Arn: !GetAtt NotifierFunction\.Arn\n/);
+  const perm = resource('NotifierTaskRulePermission');
+  assert.match(perm, /Principal: events\.amazonaws\.com\n/);
+  assert.match(perm, /SourceArn: !GetAtt NotifierTaskRule\.Arn\n/);
+});
+
+test('the notifier may describe only the cluster\'s tasks, and nothing else on ECS', () => {
+  const ecs = statements(resource('NotifierRole')).filter((s) => /ecs:/.test(s));
+  assert.deepEqual(ecs, [
+    'Allow\n                Action: ecs:DescribeTasks\n                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"\n',
+  ]);
+});
+
+test('the webhook may find and re-tag only the cluster\'s tasks, and only with the job tags', () => {
+  const ecs = statements(resource('WebhookRole')).filter((s) => /ecs:/.test(s));
+  const tasks = 'Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"';
+  const at = (n) => '\n' + ' '.repeat(n);
+  assert.deepEqual(ecs, [
+    `Allow${at(16)}Action: ecs:ListTasks${at(16)}Resource: "*"${at(16)}Condition:${at(18)}ArnEquals:${at(20)}ecs:cluster: !GetAtt RunnerCluster.Arn`,
+    `Allow${at(16)}Action: ecs:DescribeTasks${at(16)}${tasks}`,
+    `Allow${at(16)}Action: ecs:TagResource${at(16)}${tasks}${at(16)}Condition:${at(18)}ForAllValues:StringEquals:${at(20)}`
+      + 'aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]\n',
+  ]);
+  assert.match(resource('WebhookFunction'), /CLUSTER: !Ref RunnerCluster\n/);
+});

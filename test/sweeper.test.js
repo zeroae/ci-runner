@@ -1,11 +1,48 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createHandler } = require('../functions/sweeper.js');
+const { createHandler: create } = require('../functions/sweeper.js');
 
 const NOW = Date.parse('2026-11-12T12:00:00Z');
 const ago = (min) => new Date(NOW - min * 60 * 1000);
-const env = { STACK_NAME: 'ci-runner', GITHUB_ORG: 'zeroae', RUNNER_GROUP: 'ci-runner' };
+const env = { STACK_NAME: 'ci-runner', GITHUB_ORG: 'zeroae', RUNNER_GROUP: 'ci-runner', CLUSTER: 'ci-runner' };
+
+// The cluster's tasks, as ECS answers ListTasks and DescribeTasks: ListTasks
+// returns at most 100 ARNs a page and filters on the desired status.
+function fakeEcs(tasks) {
+  const stopped = [];
+  const calls = [];
+  return {
+    stopped,
+    calls,
+    listTasks: async (i) => {
+      calls.push(['listTasks', i]);
+      assert.equal(i.cluster, 'ci-runner');
+      const arns = tasks.filter((t) => t.desiredStatus === (i.desiredStatus || 'RUNNING')).map((t) => t.taskArn);
+      const from = Number(i.nextToken || 0);
+      return { taskArns: arns.slice(from, from + 100), ...(from + 100 < arns.length && { nextToken: String(from + 100) }) };
+    },
+    describeTasks: async (i) => {
+      calls.push(['describeTasks', i]);
+      assert.equal(i.cluster, 'ci-runner');
+      assert.ok(i.tasks.length <= 100);
+      assert.deepEqual(i.include, ['TAGS']);
+      return { tasks: tasks.filter((t) => i.tasks.includes(t.taskArn)), failures: [] };
+    },
+    stopTask: async (i) => { calls.push(['stopTask', i]); stopped.push(i.task); return { task: {} }; },
+  };
+}
+
+function task(id, minutesOld, { lastStatus = 'RUNNING', desiredStatus = 'RUNNING', tags = { 'ci-runner:stack': 'ci-runner' } } = {}) {
+  return {
+    taskArn: `arn:aws:ecs:us-east-1:123456789012:task/ci-runner/${id}`,
+    createdAt: ago(minutesOld), lastStatus, desiredStatus,
+    tags: Object.entries(tags).map(([key, value]) => ({ key, value })),
+  };
+}
+
+// Every test runs with an empty cluster unless it brings its own.
+const createHandler = (deps) => create({ ecs: fakeEcs([]), ...deps });
 
 function instance(id, minutesOld, { state = 'running', tags = { 'ci-runner:stack': 'ci-runner' } } = {}) {
   return {
@@ -42,6 +79,31 @@ test('terminates only instances carrying the stack tag that are older than 2 hou
   const out = await sweep({});
   assert.deepEqual(ec2.terminated.sort(), ['i-old', 'i-old-stopped']);
   assert.deepEqual(out.terminated.sort(), ['i-old', 'i-old-stopped']);
+});
+
+test('stops the cluster\'s tasks launched over 2 hours ago', async () => {
+  const ecs = fakeEcs([
+    task('t-old', 121),
+    task('t-young', 119),
+    // A task launched by hand, without our tags, is still in the stack's cluster.
+    task('t-old-hand', 300, { tags: {} }),
+    // Already told to stop: ListTasks for RUNNING doesn't return it.
+    task('t-old-stopping', 300, { desiredStatus: 'STOPPED', lastStatus: 'DEACTIVATING' }),
+  ]);
+  const out = await createHandler({ ec2: fakeEc2([]), ecs, secret: noApp, fetch: assert.fail, now: () => NOW, env })({});
+  const arn = (id) => `arn:aws:ecs:us-east-1:123456789012:task/ci-runner/${id}`;
+  assert.deepEqual(ecs.stopped.sort(), [arn('t-old'), arn('t-old-hand')]);
+  assert.deepEqual(out.stopped.sort(), [arn('t-old'), arn('t-old-hand')]);
+  for (const [op, i] of ecs.calls.filter(([op]) => op === 'stopTask')) {
+    assert.equal(i.cluster, 'ci-runner', op);
+    assert.match(i.reason, /2 hours/);
+  }
+});
+
+test('pages through a cluster with more than 100 tasks', async () => {
+  const ecs = fakeEcs(Array.from({ length: 150 }, (_, i) => task(`t${i}`, 200)));
+  await createHandler({ ec2: fakeEc2([]), ecs, secret: noApp, fetch: assert.fail, now: () => NOW, env })({});
+  assert.equal(ecs.stopped.length, 150);
 });
 
 test('terminates nothing when nothing is stray', async () => {
@@ -131,6 +193,41 @@ test('removes only offline registrations in the group that have no instance', as
     assert.ok(claims.iat <= NOW / 1000 && claims.exp > NOW / 1000 && claims.exp - claims.iat <= 600);
   }
   assert.equal(gh.jwts.length, 2);
+});
+
+test('a registration is kept while its task lives and removed once the task is gone, next to instances', async () => {
+  const tags = (more) => ({ 'ci-runner:stack': 'ci-runner', ...more });
+  const ec2 = fakeEc2([
+    instance('i-1', 10, { tags: tags({ 'ci-runner:runner': 'ci-runner-on-ec2' }) }),
+  ]);
+  const ecs = fakeEcs([
+    task('t-1', 10, { tags: tags({ 'ci-runner:runner': 'ci-runner-on-fargate' }) }),
+    task('t-2', 10, { lastStatus: 'PROVISIONING', tags: tags({ 'ci-runner:runner-id': '53' }) }),
+    // Told to stop (stopped, or on its way): its runner no longer has a machine.
+    task('t-3', 10, { desiredStatus: 'STOPPED', lastStatus: 'STOPPED', tags: tags({ 'ci-runner:runner': 'ci-runner-task-gone' }) }),
+    task('t-4', 10, { desiredStatus: 'STOPPED', lastStatus: 'DEPROVISIONING', tags: tags({ 'ci-runner:runner': 'ci-runner-task-stopping' }) }),
+  ]);
+  const gh = fakeGitHub([
+    runner(50, 'ci-runner-on-ec2'),        // its instance is running: kept
+    runner(51, 'ci-runner-on-fargate'),    // its task is running: kept
+    runner(52, 'ci-runner-task-gone'),     // its task stopped: removed
+    runner(53, 'renamed'),                 // its task carries its id: kept
+    runner(54, 'ci-runner-task-stopping'), // its task is stopping: removed
+    runner(55, 'ci-runner-nowhere'),       // neither: removed
+  ]);
+  const out = await createHandler({ ec2, ecs, secret: app, fetch: gh.fetch, now: () => NOW, env })({});
+  assert.deepEqual(gh.deleted.sort(), [52, 54, 55]);
+  assert.deepEqual(out, { terminated: [], stopped: [], removed: [52, 54, 55] });
+});
+
+test('an ECS failure fails the run after the terminations, and removes no registration', async () => {
+  const ec2 = fakeEc2([instance('i-old', 200)]);
+  const ecs = fakeEcs([]);
+  ecs.listTasks = async () => { throw new Error('ThrottlingException'); };
+  const gh = fakeGitHub([runner(60, 'ci-runner-orphan')]);
+  await assert.rejects(createHandler({ ec2, ecs, secret: app, fetch: gh.fetch, now: () => NOW, env })({}), /Throttling/);
+  assert.deepEqual(ec2.terminated, ['i-old']);
+  assert.deepEqual(gh.deleted, []);
 });
 
 test('a registration minted in the last 10 minutes is left alone, even with no instance yet', async () => {
@@ -225,7 +322,17 @@ test('the sweeper may terminate only instances carrying the stack tag', () => {
 
   const logs = all.filter((s) => s.some((l) => l.includes('logs:')));
   assert.equal(logs.length, 1);
-  assert.equal(all.length, 4, 'nothing else is granted');
+  assert.equal(all.length, 6, 'nothing else is granted');
+});
+
+test('the sweeper may list, describe and stop only the tasks of the stack\'s cluster', () => {
+  const ecs = statements().filter((s) => s.some((l) => l.includes('ecs:')));
+  const tasks = 'Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"';
+  assert.deepEqual(ecs, [
+    ['Effect: Allow', 'Action: ecs:ListTasks', 'Resource: "*"', 'Condition:', 'ArnEquals:', 'ecs:cluster: !GetAtt RunnerCluster.Arn'],
+    ['Effect: Allow', 'Action: [ecs:DescribeTasks, ecs:StopTask]', tasks],
+  ]);
+  assert.match(resource('SweeperFunction'), /CLUSTER: !Ref RunnerCluster\n/);
 });
 
 test('the sweeper runs every 10 minutes', () => {
