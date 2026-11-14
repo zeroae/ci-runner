@@ -20,7 +20,14 @@ function appJwt(appId, pem, nowMs) {
 // keyed without the ci-runner: prefix.
 const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x.key).replace(/^ci-runner:/, ''), x.Value ?? x.value]));
 
-function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log }) {
+// AWS warns 2 minutes before it takes a Spot machine, and the job can finish
+// inside the warning. After posting, the notifier watches the job for that long.
+const WATCH_MS = 10000;
+const WATCHES = 15;
+const TITLE = 'Spot capacity reclaimed: re-run this job';
+const SURVIVED = 'The job finished despite the Spot reclaim warning';
+
+function createHandler({ secret, fetch, sleep, ec2, ecs, now, env, log = console.log }) {
   async function gh(method, path, token, body) {
     const res = await fetch(API + path, {
       method, body: body && JSON.stringify(body),
@@ -58,27 +65,47 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
     const { id: installation } = await gh('GET', `/repos/${repo}/installation`, jwt);
     const { token } = await gh('POST', `/app/installations/${installation}/access_tokens`, jwt);
 
+    // Only a job this machine's CI runner is running can be lost with it. The
+    // tags name the job the machine was launched for, or took in a swap (the
+    // webhook re-tags it); a CI runner that took no job (another one served
+    // its launch job) is idle, and a completed job is no loss.
+    const ghJob = await gh('GET', `/repos/${repo}/actions/jobs/${jobId}`, token);
+    if (ghJob.status !== 'in_progress' || ghJob.runner_name !== t.runner) {
+      return log(`ignored ${id}: its runner is not running job ${jobId} (${ghJob.status}, runner ${ghJob.runner_name || 'none'})`);
+    }
     // A task's job-name tag has `_` for what ECS refuses (brackets, commas):
     // the check run carries the real name, from GitHub.
-    const ghJob = d.taskArn && (await gh('GET', `/repos/${repo}/actions/jobs/${jobId}`, token).catch(() => null));
-    const job = (ghJob && ghJob.name) || t['job-name'] || `job ${jobId}`;
+    const job = (d.taskArn && ghJob.name) || t['job-name'] || `job ${jobId}`;
     const run = `https://github.com/${repo}/actions/runs/${t['run-id']}`;
     const name = `ci-runner / ${job}`;
-    const title = 'Spot capacity reclaimed: re-run this job';
     // A task's reclaim matches on each of its changes, and EventBridge may
     // repeat an event: one check run per job is enough.
     const { check_runs: existing } = await gh('GET', `/repos/${repo}/commits/${t['head-sha']}/check-runs?filter=all&check_name=${encodeURIComponent(name)}`, token);
-    if (existing.some((c) => c.external_id === jobId && c.output && c.output.title === title)) return log(`already reported ${id}: ${repo} job ${jobId}`);
-    await gh('POST', `/repos/${repo}/check-runs`, token, {
+    if (existing.some((c) => c.external_id === jobId && c.output && [TITLE, SURVIVED].includes(c.output.title))) return log(`already reported ${id}: ${repo} job ${jobId}`);
+    const { id: checkId } = await gh('POST', `/repos/${repo}/check-runs`, token, {
       name, head_sha: t['head-sha'], external_id: jobId,
       status: 'completed', conclusion: 'failure', completed_at: new Date(now()).toISOString(),
       details_url: `${run}/job/${jobId}`,
       output: {
-        title,
+        title: TITLE,
         summary: `AWS reclaimed the Spot ${machine} running \`${job}\`. Re-run the job: ${run}`,
       },
     });
     log(`reported ${id}: ${repo} job ${jobId}`);
+
+    // A job that finishes with success was not lost: the check run no longer
+    // asks for a re-run. Any other end, or none in time, keeps the failure.
+    for (let i = 0; i < WATCHES; i++) {
+      await sleep(WATCH_MS);
+      const latest = await gh('GET', `/repos/${repo}/actions/jobs/${jobId}`, token);
+      if (latest.status !== 'completed') continue;
+      if (latest.conclusion !== 'success') return;
+      await gh('PATCH', `/repos/${repo}/check-runs/${checkId}`, token, {
+        conclusion: 'neutral',
+        output: { title: SURVIVED, summary: `AWS warned that it would reclaim the Spot ${machine} running \`${job}\`, but the job finished with success. No re-run is needed: ${run}` },
+      });
+      return log(`survived ${id}: ${repo} job ${jobId}`);
+    }
   };
 }
 
@@ -96,6 +123,7 @@ module.exports.handler = async (event) => {
     live = createHandler({
       secret: { get: async () => JSON.parse((await smc.send(new sm.GetSecretValueCommand({ SecretId: process.env.SECRET_ARN }))).SecretString) },
       fetch,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       ec2: { describe: (id) => ec2c.send(new EC2.DescribeInstancesCommand({ InstanceIds: [id] })) },
       ecs: { describeTasks: (i) => ecsc.send(new ECS.DescribeTasksCommand(i)) },
       now: Date.now,

@@ -169,6 +169,13 @@ test('a second notifier rule matches every change of a Fargate Spot reclaim in t
   assert.match(perm, /SourceArn: !GetAtt NotifierTaskRule\.Arn\n/);
 });
 
+test('the notifier\'s timeout outlasts its watch of a job after a Spot warning', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'functions', 'notifier.js'), 'utf8');
+  const watchMs = Number(src.match(/^const WATCH_MS = (\d+);/m)[1]) * Number(src.match(/^const WATCHES = (\d+);/m)[1]);
+  const timeout = Number(resource('NotifierFunction').match(/\n {6}Timeout: (\d+)\n/)[1]);
+  assert.ok(timeout * 1000 >= watchMs + 30000, `${timeout} s is too short for a ${watchMs / 1000} s watch plus the calls around it`);
+});
+
 test('the notifier may describe only the cluster\'s tasks, and nothing else on ECS', () => {
   const ecs = statements(resource('NotifierRole')).filter((s) => /ecs:/.test(s));
   assert.deepEqual(ecs, [

@@ -295,6 +295,14 @@ Its summary names the instance (or the task's id) and links the run. That is
 the whole story: re-run the failed job. Nothing retries it automatically.
 One check run per job: the notifier skips a job whose commit has it already.
 
+AWS warns 2 minutes before it takes the machine, and a job can finish inside
+that. The notifier watches the job for 150 s after the warning. If the job
+ends with `success`, the check run turns `neutral`, titled `The job finished
+despite the Spot reclaim warning`: no re-run is needed. A `failure` check run
+whose job later passed anyway (the job ended after the watch) is also safe to
+ignore. The notifier reports only a job the machine's CI runner was running: a
+CI runner that took no job (another one served its launch job) is not reported.
+
 To list those check runs on a commit:
 
 ```bash
@@ -304,7 +312,9 @@ gh api repos/zeroae/<repo>/commits/<sha>/check-runs \
 
 A job lost **without** that check run wasn't a Spot reclaim. Look in the
 notifier's log for a line `reported <instance or task id>: <repo> job <id>`
-(or `already reported ...`). An instance from `make hand-launch`, or a task
+(or `already reported ...`, or `survived ...`). A line
+`ignored <id>: its runner is not running job <id> (...)` means the machine's
+CI runner ran no job when the warning came. An instance from `make hand-launch`, or a task
 run by hand, carries no job tags, so the notifier ignores it and logs
 `ignored: <instance> is no job instance of this stack` (`... no job task
 ...` for a task). A task's stop code is in `describe-tasks` (below):

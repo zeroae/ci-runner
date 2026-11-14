@@ -90,7 +90,7 @@ const secret = { get: async () => ({ app_id: 42, private_key: privateKey.export(
 // exists, JIT configs mint, and runners and check runs are recorded (and a
 // commit's check runs listed).
 const JOB_NAMES = { 999: 'build (x64, a)', 555: 'test (x64, b)' };
-function fakeGitHub(runners = []) {
+function fakeGitHub(runners = [], job = {}) {
   const calls = [];
   const fetch = async (url, init = {}) => {
     const { pathname } = new URL(url);
@@ -99,8 +99,8 @@ function fakeGitHub(runners = []) {
     const res = (status, json) => ({ ok: status < 300, status, json: async () => json });
     if (key.endsWith('/installation')) return res(200, { id: 181 });
     if (key.endsWith('/access_tokens')) return res(201, { token: 't', expires_at: new Date(Date.now() + 3600e3).toISOString() });
-    const job = pathname.match(/\/actions\/jobs\/(\d+)$/);
-    if (job) return res(200, { id: Number(job[1]), status: 'queued', name: JOB_NAMES[job[1]] });
+    const jobPath = pathname.match(/\/actions\/jobs\/(\d+)$/);
+    if (jobPath) return res(200, { id: Number(jobPath[1]), status: 'queued', name: JOB_NAMES[jobPath[1]], ...job });
     if (key.endsWith('/actions/runner-groups')) return res(200, { runner_groups: [{ id: 3, name: 'ci-runner' }] });
     if (key.endsWith('/runner-groups/3/runners')) return res(200, { total_count: runners.length, runners });
     if (key.endsWith('/generate-jitconfig')) return res(201, { runner: { id: 77 }, encoded_jit_config: 'ZW5jb2RlZGppdA==' });
@@ -204,7 +204,7 @@ async function changesOf(arn, done) {
 }
 
 test('a Fargate Spot reclaim: template.yaml\'s rule matches each change of the stop, and the notifier reports it once', { skip }, async () => {
-  const { arn } = await launch();
+  const { arn, runner } = await launch();
   const pattern = JSON.stringify(notifierTaskPattern());
   const matches = async (e) => (await aws.events('TestEventPattern', { EventPattern: pattern, Event: JSON.stringify(e) })).Result;
   // AWS stops a reclaimed task with SpotInterruption, the emulator only with
@@ -215,9 +215,10 @@ test('a Fargate Spot reclaim: template.yaml\'s rule matches each change of the s
   const warning = { ...first, detail: { ...first.detail, desiredStatus: 'STOPPED', stopCode: 'SpotInterruption' } };
   assert.equal(await matches(warning), true);
 
-  const gh = fakeGitHub();
+  // The task's runner is running job 999 (the notifier reports only a running job).
+  const gh = fakeGitHub([], { status: 'in_progress', runner_name: runner });
   const logs = [];
-  const h = notifier.createHandler({ secret, fetch: gh.fetch, ec2: { describe: assert.fail }, ecs, now: Date.now, env, log: (l) => logs.push(l) });
+  const h = notifier.createHandler({ secret, fetch: gh.fetch, sleep: async () => {}, ec2: { describe: assert.fail }, ecs, now: Date.now, env, log: (l) => logs.push(l) });
   await h(warning);
   const check = gh.calls.find((c) => c.key === 'POST /repos/zeroae/lib/check-runs');
   assert.ok(check, logs.join('\n'));

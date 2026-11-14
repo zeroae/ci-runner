@@ -470,18 +470,37 @@ For each event it:
    as is a task whose tags are gone.
 2. Signs an App JWT, finds the repo's installation
    (`GET /repos/{repo}/installation`) and gets its token.
-3. For a task, reads the job's real name from
-   `GET /repos/{repo}/actions/jobs/{job_id}` (the tag has `_` for brackets and
-   commas), falling back to the tag.
-4. Skips the job if the commit already has its reclaim check run (same name,
-   `external_id` the job id, the title below), so a task's later changes and a
-   repeated event report nothing more.
-5. Creates a check run on the head sha: name `ci-runner / <job name>` (or
+3. Reads the job from GitHub (`GET /repos/{repo}/actions/jobs/{job_id}`), the
+   job the tags name: the one the machine was launched for, or the one it took
+   in a swap (the webhook re-tags it). It **reports only a job the machine's CI
+   runner is running**: `status` `in_progress` and `runner_name` equal to the
+   machine's `ci-runner:runner` tag. Otherwise it logs `ignored <id>: its runner
+   is not running job <id> (...)` and posts nothing: the job is `queued`, or
+   `completed`, or another CI runner runs it. The usual case is an idle CI
+   runner: another CI runner took the job it was launched for, it took none,
+   and so its tags are still the launch tags. A swapped job that the webhook
+   has not yet re-tagged, in the moments after it started, is missed the same
+   way.
+4. For a task, takes the job's real name from that job (the tag has `_` for
+   brackets and commas), falling back to the tag.
+5. Skips the job if the commit already has its reclaim check run (same name,
+   `external_id` the job id, the title below or the survived title), so a task's
+   later changes and a repeated event report nothing more.
+6. Creates a check run on the head sha: name `ci-runner / <job name>` (or
    `job <id>` with no name), `completed`, conclusion `failure`, title
    `Spot capacity reclaimed: re-run this job`, a summary naming the job and
    the instance or task and linking the run, and `details_url` the job's page.
    An EC2 reclaim and a Fargate one give the same check run, but for the
    summary's machine.
+7. **Watches the job** for 150 s (15 looks, 10 s apart; the Lambda's timeout is
+   200 s): AWS warns 2 minutes before it takes the machine, and the job can
+   finish inside that. A job that completes with `success` was not lost, so the
+   notifier changes the check run to `neutral`, titled `The job finished
+   despite the Spot reclaim warning`, and logs `survived <id>: <repo> job <id>`.
+   A job that completes with any other conclusion, or is still running when the
+   watch ends, keeps the `failure`. A task's later changes find the check run
+   (either title) and stop at step 5, or find the job no longer running and stop
+   at step 3, so only the first change watches.
 
 A GitHub failure fails the invocation, and EventBridge's async invoke retries
 it. Two events handled at the same moment can still report twice.
@@ -492,7 +511,7 @@ bytes than the copies. `test/conventions.test.js` fails if the copies differ,
 so change all three at once.
 
 Its role allows `GetSecretValue` on the secret, `ec2:DescribeInstances`, and
-`ecs:DescribeTasks` only on the cluster's tasks.
+`ecs:DescribeTasks` only on the cluster's tasks. The watch needs no more.
 
 ## The runner image in ECR
 

@@ -570,7 +570,7 @@ Resources:
       Runtime: nodejs22.x
       Handler: index.handler
       Role: !GetAtt NotifierRole.Arn
-      Timeout: 30
+      Timeout: 200
       MemorySize: 256
       LoggingConfig:
         LogGroup: !Ref NotifierLogGroup
