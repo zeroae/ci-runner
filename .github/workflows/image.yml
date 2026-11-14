@@ -17,8 +17,21 @@ env:
   IMAGE: ghcr.io/zeroae/ci-runner
 
 jobs:
+  # Each architecture builds and smoke-tests on its own native runner (no
+  # QEMU). Only main publishes: a push to main, the schedule (which runs on
+  # main), or a dispatch run on main. Other branches build and smoke.
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            uname: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            uname: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,7 +41,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: image
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           pull: true
           load: true
           tags: ci-runner:smoke
@@ -36,35 +49,69 @@ jobs:
       - name: Smoke
         run: >-
           docker run --rm
+          -e EXPECT_ARCH=${{ matrix.uname }}
           -v "$PWD/image/smoke.sh:/smoke.sh:ro"
           --entrypoint bash
           ci-runner:smoke /smoke.sh
 
-      - name: Decide whether to publish
-        id: publish
-        run: |
-          # Only main publishes: a push to main, the schedule (which runs on
-          # main), or a dispatch run on main. Other branches build and smoke.
-          publish=false
-          if [ "${{ github.ref }}" = refs/heads/main ]; then publish=true; fi
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
       - name: Log in to GHCR
-        if: steps.publish.outputs.publish == 'true'
+        if: github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish
-        if: steps.publish.outputs.publish == 'true'
+      # The same build again, from the builder's cache, pushed untagged by
+      # digest. The merge job tags the manifest list of both digests.
+      - name: Push by digest
+        if: github.ref == 'refs/heads/main'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: image
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Save the digest
+        if: github.ref == 'refs/heads/main'
         run: |
-          tag="${{ steps.publish.outputs.date }}-${{ steps.publish.outputs.sha }}"
-          for t in latest "$tag"; do
-            docker tag ci-runner:smoke "$IMAGE:$t"
-            docker push "$IMAGE:$t"
-          done
-          echo "Published $IMAGE:latest and $IMAGE:$tag" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p digests
+          echo "${{ steps.push.outputs.digest }}" > "digests/${{ matrix.arch }}"
+
+      - name: Upload the digest
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the manifest list
+        run: |
+          tag="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          refs=()
+          for arch in amd64 arm64; do refs+=("$IMAGE@$(cat "digests/$arch")"); done
+          docker buildx imagetools create -t "$IMAGE:latest" -t "$IMAGE:$tag" "${refs[@]}"
+          docker buildx imagetools inspect "$IMAGE:$tag"
+          echo "Published $IMAGE:latest and $IMAGE:$tag (linux/amd64, linux/arm64)" >> "$GITHUB_STEP_SUMMARY"

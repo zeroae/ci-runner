@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Smoke test for the ci-runner image. Run it inside the image:
-#   docker run --rm -v "$PWD/image/smoke.sh:/smoke.sh:ro" --entrypoint bash IMAGE /smoke.sh
+#   docker run --rm -e EXPECT_ARCH=aarch64 -v "$PWD/image/smoke.sh:/smoke.sh:ro" --entrypoint bash IMAGE /smoke.sh
 # Prints every added tool's version and fails if any check fails.
+# EXPECT_ARCH (x86_64 or aarch64, as `uname -m` prints it) is the architecture
+# the image was built for; without it the machine's own is expected.
 set -uo pipefail
 
 fail=0
@@ -44,6 +46,25 @@ check node           node --version
 check npm            npm --version
 check aws            aws --version
 expect python3.12    3.12 "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>&1)"
+
+echo "== architecture"
+# Each binary the image adds must be built for the image's architecture, so a
+# wrong download (the arm64 AWS CLI or compose plugin) fails here, not in a job.
+arch=${EXPECT_ARCH:-$(uname -m)}
+elf_arch() {
+  # e_machine, bytes 18-19 of the ELF header: 62 is x86_64, 183 is aarch64.
+  case $(od -An -tu2 -j18 -N2 "$1" 2>/dev/null | tr -d ' ') in
+    62) echo x86_64 ;; 183) echo aarch64 ;; *) echo "not ELF: $1" ;;
+  esac
+}
+expect uname          "$arch" "$(uname -m)"
+expect docker-bin     "$arch" "$(elf_arch "$(command -v docker)")"
+expect buildx-bin     "$arch" "$(elf_arch /usr/local/lib/docker/cli-plugins/docker-buildx)"
+expect compose-bin    "$arch" "$(elf_arch /usr/local/lib/docker/cli-plugins/docker-compose)"
+expect gh-bin         "$arch" "$(elf_arch "$(command -v gh)")"
+expect node-bin       "$arch" "$(elf_arch "$(command -v node)")"
+expect aws-bin        "$arch" "$(elf_arch "$(readlink -f "$(command -v aws)")")"
+expect aws-exe        "exe/$arch" "$(aws --version 2>&1 | grep -o 'exe/[a-z0-9_]*')"
 
 echo "== runner user"
 id runner
