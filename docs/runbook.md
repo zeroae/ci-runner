@@ -276,8 +276,10 @@ $AWS logs tail /aws/lambda/ci-runner-notifier --since 1d
 
 **The webhook** logs one JSON line per accepted job, `{"enqueued": "<repo>",
 "job_id": ..., "label": ...}`, and `{"refused": "<repo>", "visibility": ...}`
-for a job from any repo but a private `zeroae` one (fence 3). Everything else it
-ignores without a log line.
+for a job from any repo but a private `zeroae` one (fence 3), and `{"swap":
+"<runner>", "instance": "i-...", "took": {...}, "requeued": {...}}` for each
+swap it repairs: the runner launched for the `requeued` job started the `took`
+job instead. Everything else it ignores without a log line.
 
 **The launcher** logs one JSON line per job, carrying the job's fields plus one
 of:
@@ -416,6 +418,7 @@ types.
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
 | A job sits "Waiting for a runner" | its capacity's vCPU budget is full, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), at most one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
 | An `arm64` runner's instance comes up and terminates without taking its job, and its console shows `no matching manifest for linux/arm64` | `ghcr.io/zeroae/ci-runner:latest` has no arm64 entry yet: the image workflow hasn't pushed a multi-arch `:latest` since it began building arm64. Run the image workflow on `main`, then re-run the job |
+| A job's runner was launched for another job (`$RUNNER_NAME` ends in another job id), and that other job sits "Waiting for a runner" | a swap. The webhook repairs it on the job's `in_progress` (its log says `swap`), and the launcher then launches a runner for the other job. No `swap` line: check the webhook's log for errors (its role needs `ec2:DescribeInstances` and `ec2:CreateTags`); cancel and re-run the waiting job |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
 | A budget lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8`. `SpotVcpuCap` draws on the EC2 Spot vCPU quota (`L-34B43A08`), `OnDemandVcpuCap` on the EC2 On-Demand one (`L-1216C47A`) |
 | The launcher logs `no instance launched`, with an authorization error from `CreateFleet` | `CreateFleet`'s check on the instance, volumes and network interfaces it creates carries no `ec2:LaunchTemplate` key, so a policy that adds that condition to them denies the launch. Grant those to `CreateFleet` without the condition; `RunInstances` keeps it |

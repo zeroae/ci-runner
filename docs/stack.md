@@ -189,19 +189,48 @@ App's webhook points at), for each delivery:
 2. Ignores (`200`) any event but `workflow_job`.
 3. **Fence 3:** refuses (`403`, logged) unless `repository.visibility` is
    `private` and the owner is `GITHUB_ORG`.
-4. Ignores (`200`) actions other than `queued`, and jobs outside the label
+4. On `in_progress`, repairs a swap (below) and answers.
+5. Ignores (`200`) actions other than `queued`, and jobs outside the label
    contract (case-insensitive): `self-hosted`, exactly one of
    `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`, `-4`, `-8`,
    `-16`), at most one of `x64`/`arm64`, and optionally `linux`. An unknown
    `ci-cpu-*`, or both `x64` and `arm64`, are outside it. A missing size or architecture label defaults to
    `ci-cpu-4` and `x64`: this is the expand step, and the defaults go once
    every repo names its shape.
-5. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
+6. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
    labels, installation_id}` (`label` is the capacity label, lower case;
    `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
 
-Its role allows only `GetSecretValue` on the secret and `SendMessage` on the
-queue.
+**Swap repair** (ADR-0003). GitHub gives a queued job to any idle runner whose
+labels cover it, so a runner launched for job Y may take job X. Left alone,
+X's own message is later dropped as not queued, and Y never gets a runner.
+On `workflow_job` `in_progress` the webhook reads `runner_name`:
+
+- a name that isn't `${stack}-<14-digit stamp>-<job id>` (a hand launch, a
+  GitHub-hosted runner, another stack), or whose job id is the event's, is
+  ignored (`200`) with no AWS call;
+- otherwise it describes the stack's `pending`/`running` instance tagged
+  `ci-runner:runner=<name>`. No instance, or a `ci-runner:job-id` tag already
+  equal to the event's job (a repeated delivery), is ignored too;
+- otherwise it **re-queues** the instance's job, rebuilt from its tags
+  (`repo`, `job-id`, `run-id`, `head-sha`, `job-name`, `label`, `vcpus`,
+  `arch`, `labels`; the event's installation id), so the launcher's "still
+  queued?" check launches it a runner or drops it. An instance launched
+  before those tags existed re-queues as `ci-cpu-4`/`x64` with `self-hosted`
+  and its capacity label;
+- then **re-tags** the instance with the event's job (`ci-runner:repo`,
+  `job-id`, `run-id`, `head-sha`, `job-name`), so the notifier reports a
+  reclaim on the commit of the job it really ran, and logs
+  `{"swap": <runner>, "instance", "took": {repo, job_id}, "requeued": {repo,
+  job_id}}`, answering `202`.
+
+It queues before it tags: if the tag fails, a redelivery still sees the old
+tags and repairs again. Re-queueing a job that another runner already took is
+harmless: the launcher drops it.
+
+Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue,
+`ec2:DescribeInstances`, and `ec2:CreateTags` only on instances tagged
+`ci-runner:stack=<stack>` and only for the five job tag keys.
 
 **The queue** `${stack}-jobs` has a 120 s visibility timeout. A message that
 fails 5 receives goes to `${stack}-jobs-dlq` (kept 14 days). The outputs are
@@ -238,7 +267,8 @@ failures per message), for each job:
    families of the job's architecture. Tags: `ci-runner:runner`,
    `ci-runner:runner-id`, `ci-runner:label`, `ci-runner:repo`,
    `ci-runner:job-id`, `ci-runner:run-id`, `ci-runner:head-sha`,
-   `ci-runner:job-name`, and the shape: `ci-runner:capacity` (the capacity
+   `ci-runner:job-name`, `ci-runner:labels` (the job's labels, comma-joined,
+   for the swap repair), and the shape: `ci-runner:capacity` (the capacity
    label), `ci-runner:vcpus` and `ci-runner:arch`; plus the launch template's
    `ci-runner:stack`. The `launched` log line carries `label`, `vcpus` and
    `arch`.

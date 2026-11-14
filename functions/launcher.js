@@ -125,7 +125,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
           Tags: [
             tag('ci-runner:runner', name), tag('ci-runner:runner-id', runnerId), tag('ci-runner:label', m.label), tag('ci-runner:repo', m.repo),
             tag('ci-runner:job-id', m.job_id), tag('ci-runner:run-id', m.run_id), tag('ci-runner:head-sha', m.head_sha),
-            tag('ci-runner:job-name', m.job_name),
+            tag('ci-runner:job-name', m.job_name), tag('ci-runner:labels', m.labels.join(',')),
             tag('ci-runner:capacity', m.label), tag('ci-runner:vcpus', vcpus), tag('ci-runner:arch', arch),
           ],
         }],
