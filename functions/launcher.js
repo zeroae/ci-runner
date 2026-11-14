@@ -1,8 +1,9 @@
 'use strict';
 // launcher: consumes the queue the webhook fills. For each job: an App JWT, an
 // installation token, a check that the job is still queued, a JIT config in
-// the runner group, the #cloud-config, and one instance from the launch
-// template. Inlined into the template; the build bundles ./cloud-config.js.
+// the runner group, and one machine: on EC2 the #cloud-config and one instance
+// from the launch template, on Fargate one task of the runner's task
+// definition. Inlined into the template; the build bundles ./cloud-config.js.
 const crypto = require('node:crypto');
 const { renderCloudConfig } = require('./cloud-config.js');
 
@@ -11,7 +12,13 @@ const API = 'https://api.github.com';
 const SIZES = { 2: 'large', 4: 'xlarge', 8: '2xlarge', 16: '4xlarge' };
 // An architecture -> its families, offered at every size in the stack's AZs.
 const FAMILIES = { x64: ['m7i', 'm6i', 'm6a', 'm7a'], arm64: ['m7g', 'm6g', 'm8g'] };
-const CAPACITY = { 'ci-spot': 'spot', 'ci-ondemand': 'on-demand' };
+const CAPACITY = { 'ci-spot': 'spot', 'ci-ondemand': 'on-demand', 'ci-fargate-spot': 'fargate-spot', 'ci-fargate': 'fargate' };
+// A Fargate capacity's capacity provider.
+const PROVIDER = { 'ci-fargate-spot': 'FARGATE_SPOT', 'ci-fargate': 'FARGATE' };
+// Fargate offers no arm64 in this AZ, so arm64 tasks skip a subnet there.
+const NO_ARM64_AZ = 'use1-az3';
+// ECS allows only these characters in a tag (EC2 allows any).
+const ECS_TAG_CHARS = /[^\p{L}\p{Z}\p{N}_.:/=+\-@]/gu;
 
 const b64u = (s) => Buffer.from(s).toString('base64url');
 
@@ -32,9 +39,10 @@ function valid(m, org) {
     && Object.hasOwn(FAMILIES, shapeOf(m).arch);
 }
 
-function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log }) {
+function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.log }) {
   const org = env.GITHUB_ORG;
   const subnets = env.SUBNET_IDS.split(',');
+  const budgets = { spot: env.SPOT_VCPU_CAP, 'on-demand': env.ONDEMAND_VCPU_CAP, 'fargate-spot': env.FARGATE_SPOT_VCPU_CAP, fargate: env.FARGATE_VCPU_CAP };
   const tokens = new Map(); // installation id -> { token, until }
   let app;
   let groupId;
@@ -98,6 +106,72 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     return n;
   }
 
+  // The tags a runner's instance or task carries: the job, for the swap
+  // repair and the notifier, and the shape, for the budgets.
+  function jobTags(m, name, runnerId, labelsSep) {
+    const { vcpus, arch } = shapeOf(m);
+    return [
+      ['ci-runner:runner', name], ['ci-runner:runner-id', runnerId], ['ci-runner:label', m.label], ['ci-runner:repo', m.repo],
+      ['ci-runner:job-id', m.job_id], ['ci-runner:run-id', m.run_id], ['ci-runner:head-sha', m.head_sha],
+      ['ci-runner:job-name', m.job_name], ['ci-runner:labels', m.labels.join(labelsSep)],
+      ['ci-runner:capacity', m.label], ['ci-runner:vcpus', vcpus], ['ci-runner:arch', arch],
+    ];
+  }
+
+  // One Fargate task. The image's entrypoint (ci-runner-idle-exit, named by
+  // the task definition) runs the command and gives it the idle exit.
+  async function launchTask(m, name, runnerId, jitConfig) {
+    const { vcpus, arch } = shapeOf(m);
+    const azs = env.SUBNET_AZ_IDS.split(',');
+    // Inside a task nproc can report the host's CPUs, not the task's, so
+    // tools that size their parallelism from it get the task's vCPUs here.
+    // The runner's environment reaches every step.
+    const environment = [['CARGO_BUILD_JOBS', vcpus], ['CMAKE_BUILD_PARALLEL_LEVEL', vcpus], ['MAKEFLAGS', `-j${vcpus}`],
+      ...(env.IDLE_SECONDS ? [['IDLE_SECONDS', env.IDLE_SECONDS]] : [])].map(([n, v]) => ({ name: n, value: String(v) }));
+    const r = await ecs.runTask({
+      cluster: env.CLUSTER, count: 1,
+      taskDefinition: arch === 'arm64' ? env.ARM64_TASK_DEFINITION : env.TASK_DEFINITION,
+      capacityProviderStrategy: [{ capacityProvider: PROVIDER[m.label], weight: 1 }],
+      networkConfiguration: { awsvpcConfiguration: {
+        subnets: subnets.filter((s, i) => arch !== 'arm64' || azs[i] !== NO_ARM64_AZ),
+        securityGroups: [env.SECURITY_GROUP_ID], assignPublicIp: 'ENABLED',
+      } },
+      overrides: {
+        cpu: String(vcpus * 1024), memory: String(vcpus * 4096),
+        containerOverrides: [{ name: 'runner', command: ['./run.sh', '--jitconfig', jitConfig], environment }],
+      },
+      // Labels joined by spaces: ECS refuses a comma in a tag.
+      tags: [['ci-runner:stack', env.STACK_NAME], ...jobTags(m, name, runnerId, ' ')]
+        .map(([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_').slice(0, 256) })),
+    });
+    const arn = r.tasks && r.tasks[0] && r.tasks[0].taskArn;
+    if (!arn) {
+      const errs = [...new Set((r.failures || []).map((f) => `${f.reason}${f.detail ? `: ${f.detail}` : ''}`))];
+      throw new Error(`no task launched: ${errs.join('; ') || 'no failure given'}`);
+    }
+    return arn;
+  }
+
+  // vCPUs of the cluster's tasks on one Fargate capacity, from the shape
+  // tags. A task counts until it is told to stop (desired STOPPED), as an
+  // instance does until it shuts down.
+  async function taskVcpusIn(type) {
+    let n = 0;
+    let nextToken;
+    do {
+      const r = await ecs.listTasks({ cluster: env.CLUSTER, desiredStatus: 'RUNNING', nextToken });
+      if ((r.taskArns || []).length) {
+        const d = await ecs.describeTasks({ cluster: env.CLUSTER, tasks: r.taskArns, include: ['TAGS'] });
+        for (const task of d.tasks || []) {
+          const t = Object.fromEntries((task.tags || []).map((x) => [x.key, x.value]));
+          if (CAPACITY[t['ci-runner:capacity']] === type) n += Number(t['ci-runner:vcpus']) || 4;
+        }
+      }
+      nextToken = r.nextToken;
+    } while (nextToken);
+    return n;
+  }
+
   async function launchInstance(m, name, runnerId, jitConfig) {
     const { vcpus, arch } = shapeOf(m);
     // Each architecture has its own launch template, for its own AL2023 image.
@@ -122,12 +196,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
         }],
         TagSpecifications: [{
           ResourceType: 'instance',
-          Tags: [
-            tag('ci-runner:runner', name), tag('ci-runner:runner-id', runnerId), tag('ci-runner:label', m.label), tag('ci-runner:repo', m.repo),
-            tag('ci-runner:job-id', m.job_id), tag('ci-runner:run-id', m.run_id), tag('ci-runner:head-sha', m.head_sha),
-            tag('ci-runner:job-name', m.job_name), tag('ci-runner:labels', m.labels.join(',')),
-            tag('ci-runner:capacity', m.label), tag('ci-runner:vcpus', vcpus), tag('ci-runner:arch', arch),
-          ],
+          Tags: jobTags(m, name, runnerId, ',').map(([k, v]) => tag(k, v)),
         }],
       });
       const id = fleet.Instances && fleet.Instances[0] && fleet.Instances[0].InstanceIds[0];
@@ -152,8 +221,8 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     // job that would go over it goes back on the queue as a new message, so
     // retries don't pile up towards the dead-letter queue.
     const type = CAPACITY[m.label];
-    const budget = Number(type === 'spot' ? env.SPOT_VCPU_CAP : env.ONDEMAND_VCPU_CAP);
-    const held = await vcpusIn(type);
+    const budget = Number(budgets[type]);
+    const held = await (PROVIDER[m.label] ? taskVcpusIn(type) : vcpusIn(type));
     const { vcpus } = shapeOf(m);
     if (held + vcpus > budget) {
       await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
@@ -169,8 +238,9 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     });
 
     try {
-      const instance = await launchInstance(m, name, r.runner.id, r.encoded_jit_config);
-      log(JSON.stringify({ ...job, launched: instance, runner: name, label: m.label, ...shapeOf(m) }));
+      const launch = PROVIDER[m.label] ? launchTask : launchInstance;
+      const machine = await launch(m, name, r.runner.id, r.encoded_jit_config);
+      log(JSON.stringify({ ...job, launched: machine, runner: name, label: m.label, ...shapeOf(m) }));
     } catch (e) {
       // Unregister now rather than leave it to the sweeper; the retry mints anew.
       await gh('DELETE', `/orgs/${org}/actions/runners/${r.runner.id}`, token).catch(() => {});
@@ -203,7 +273,9 @@ module.exports.handler = async (event) => {
     const sm = require('@aws-sdk/client-secrets-manager');
     const EC2 = require('@aws-sdk/client-ec2');
     const SQS = require('@aws-sdk/client-sqs');
+    const ECS = require('@aws-sdk/client-ecs');
     const sqsc = new SQS.SQSClient({});
+    const ecsc = new ECS.ECSClient({});
     const smc = new sm.SecretsManagerClient({});
     const ec2c = new EC2.EC2Client({});
     live = createHandler({
@@ -214,6 +286,11 @@ module.exports.handler = async (event) => {
         createFleet: (i) => ec2c.send(new EC2.CreateFleetCommand(i)),
         deleteLaunchTemplateVersions: (i) => ec2c.send(new EC2.DeleteLaunchTemplateVersionsCommand(i)),
         describeInstances: (i) => ec2c.send(new EC2.DescribeInstancesCommand(i)),
+      },
+      ecs: {
+        runTask: (i) => ecsc.send(new ECS.RunTaskCommand(i)),
+        listTasks: (i) => ecsc.send(new ECS.ListTasksCommand(i)),
+        describeTasks: (i) => ecsc.send(new ECS.DescribeTasksCommand(i)),
       },
       sqs: { sendMessage: (i) => sqsc.send(new SQS.SendMessageCommand(i)) },
       now: Date.now,

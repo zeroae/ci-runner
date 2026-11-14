@@ -1,17 +1,23 @@
 # ci-runner
 
-Single-use EC2 runners for the GitHub Actions jobs of zeroae's private repos.
+Single-use EC2 and Fargate runners for the GitHub Actions jobs of zeroae's
+private repos.
 
 Each queued job labelled `ci-spot` or `ci-ondemand` gets a fresh EC2
 instance of the size and architecture it asks for. The instance runs that one job in `ghcr.io/zeroae/ci-runner:latest`
 (GitHub's runner image on Ubuntu 24.04, plus general tools) and then
-terminates. The instance has no IAM role, so a job finds no AWS credentials
-on it. Short jobs stay on GitHub-hosted runners.
+terminates. Each job labelled `ci-fargate-spot` or `ci-fargate` gets a fresh
+Fargate task instead, from the same image, which runs that one job and exits.
+Neither has an IAM role, so a job finds no AWS credentials on it. Short jobs
+stay on GitHub-hosted runners, or go to a Fargate capacity if they need no
+Docker.
 
 | Label in `runs-on` | Capacity | For |
 |---|---|---|
 | `ci-spot` | EC2 Spot (`m7i`/`m6i`/`m6a`/`m7a` for `x64`, `m7g`/`m6g`/`m8g` for `arm64`) | long jobs: a job that runs well over 2 minutes, which is about how long a CI runner takes to come up |
 | `ci-ondemand` | EC2 On-Demand (the same families) | critical jobs: a job that, cut off half-way, leaves state a person must repair (`terraform apply`) |
+| `ci-fargate-spot` | Fargate Spot, **no Docker** | Docker-free jobs that should start fast: about 30 s from queued to started |
+| `ci-fargate` | Fargate On-Demand, **no Docker** | Docker-free jobs that must not be cut off half-way |
 | (none; `ubuntu-latest`) | GitHub-hosted | everything else |
 
 A **size label** picks the vCPUs, at 4 GB of memory per vCPU, and an
@@ -24,15 +30,19 @@ A **size label** picks the vCPUs, at 4 GB of memory per vCPU, and an
 | `ci-cpu-8` | 8 / 32 GB | `.2xlarge` |
 | `ci-cpu-16` | 16 / 64 GB | `.4xlarge` |
 
+On a Fargate capacity the size label sets the task's vCPUs and memory the
+same way.
+
 The architecture label is `x64` (Intel and AMD) or `arm64` (Graviton). Both
 architectures run the same image, built natively for each. Every job names
 one size label and one architecture label: neither has a default, so a job
 without them waits for a runner that never comes. A job that used to name only
 its capacity got 4 vCPUs and `x64`; add `ci-cpu-4` and `x64` to keep that shape.
 
-The CI runners hold at most 24 Spot and 8 On-Demand vCPUs at once, across all
-repos (six and two `ci-cpu-4` runners). A job that would go over that waits in
-a queue until enough finish. If a Spot reclaim kills
+The CI runners hold at most 24 Spot, 8 On-Demand, 24 Fargate Spot and 8
+Fargate On-Demand vCPUs at once, across all repos (six, two, six and two
+`ci-cpu-4` runners). A job that would go over that waits in
+a queue until enough finish. If an EC2 Spot reclaim kills
 a job, a failed check run named `ci-runner / <job name>` appears on its
 commit. Nothing retries it automatically: a person re-runs it.
 
@@ -76,7 +86,7 @@ it's in both.
    canary.
 
 **The label contract:** `runs-on` must include `self-hosted`, exactly one of
-`ci-spot` or `ci-ondemand`, exactly one size label (`ci-cpu-2`, `ci-cpu-4`,
+`ci-spot`, `ci-ondemand`, `ci-fargate-spot` or `ci-fargate`, exactly one size label (`ci-cpu-2`, `ci-cpu-4`,
 `ci-cpu-8`, `ci-cpu-16`) and exactly one of `x64` or `arm64`. It may also
 include `linux`. None of them has a default. A job missing a size or an
 architecture label, or with any other label (`aarch64`, an unknown
@@ -96,6 +106,26 @@ a bind mount from any of them works as it does on a GitHub-hosted runner,
 `/etc`, `/var`) gets an empty host path. Nothing is pinned: every boot pulls
 `:latest`, and the image is rebuilt weekly, for linux/amd64 and linux/arm64,
 each built and smoke-tested on its own native runner.
+
+**On a Fargate capacity** the job gets the same image, user, tools, paths and
+50 GB, with three differences:
+
+- **No Docker.** There is no daemon and no socket (the `docker` CLI is still
+  there, and fails). Picking `ci-fargate-spot` or `ci-fargate` is the job's
+  promise never to use Docker: no `services:`, no `container:`, no Docker
+  actions, no `docker build`. A job that breaks it fails at that step
+  ([ADR-0001](docs/adr/0001-fargate-capacities-have-no-docker.md)).
+- **Older CPUs.** A Fargate task starts in about 30 s against EC2's 100 s,
+  but its CPUs are older: a 4-minute Rust build ran about 45% longer. So
+  Fargate wins for short jobs, and is even at about 4 minutes; for builds
+  much longer than that, EC2 is faster (the runbook's "Measured numbers").
+- **`nproc` over-reports.** Inside a task, `nproc` can show twice the task's
+  vCPUs. The job's environment caps the usual knobs at the task's vCPUs:
+  `CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and `MAKEFLAGS=-j<n>`. A
+  tool that sizes itself by `nproc` some other way should be given `-j` from
+  one of them.
+
+`/tmp`, `$HOME` and `_work` are the container's own paths on its 50 GB disk.
 
 **Deploy jobs** keep their AWS access as before (typically GitHub OIDC into the
 repo's own role). A trust policy that pins `runner_environment: github-hosted`

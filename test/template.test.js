@@ -76,3 +76,77 @@ test('the image repo keeps the last 4 tagged images', () => {
   });
   assert.deepEqual(rules[0].action, { type: 'expire' });
 });
+
+// The Fargate capacities (#29, ADR-0001).
+const statements = (policy) => policy.split(/\n {14}- Effect: /).slice(1);
+
+test('the cluster offers both Fargate capacity providers', () => {
+  const c = resource('RunnerCluster');
+  assert.match(c, /^ {4}Type: AWS::ECS::Cluster\n/);
+  assert.match(c, /CapacityProviders: \[FARGATE, FARGATE_SPOT\]\n/);
+  assert.match(c, /ClusterName: !Ref AWS::StackName\n/);
+});
+
+test('the two task definitions differ only in architecture and family: ECR image, wrapper, 50 GB, no task role', () => {
+  const x64 = resource('RunnerTaskDefinition');
+  const arm = resource('Arm64RunnerTaskDefinition');
+  assert.match(x64, /CpuArchitecture: X86_64 \}/);
+  assert.match(arm, /CpuArchitecture: ARM64 \}/);
+  assert.match(x64, /Family: !Sub "\$\{AWS::StackName\}-runner"\n/);
+  assert.match(arm, /Family: !Sub "\$\{AWS::StackName\}-runner-arm64"\n/);
+  const same = (s) => s.split('Properties:')[1].replace(/Family: .*\n/, '').replace(/CpuArchitecture: \w+/, '');
+  assert.equal(same(arm), same(x64));
+  assert.match(x64, /^ {4}Type: AWS::ECS::TaskDefinition\n/);
+  assert.match(x64, /RequiresCompatibilities: \[FARGATE\]\n/);
+  assert.match(x64, /NetworkMode: awsvpc\n/);
+  assert.match(x64, /EphemeralStorage: \{ SizeInGiB: 50 \}\n/);
+  assert.match(x64, /ExecutionRoleArn: !GetAtt RunnerExecutionRole\.Arn\n/);
+  assert.doesNotMatch(x64, /TaskRoleArn/, 'no task role: a job finds no AWS credentials');
+  assert.match(x64, /Image: !Sub "\$\{ImageRepository\.RepositoryUri\}:latest"\n/);
+  assert.match(x64, /- Name: runner\n/);
+  assert.match(x64, /EntryPoint: \[\/usr\/local\/bin\/ci-runner-idle-exit\]\n/);
+  assert.match(x64, /awslogs-group: !Ref RunnerTaskLogGroup\n/);
+  assert.doesNotMatch(x64, /Privileged|docker\.sock/, 'no Docker on Fargate');
+});
+
+test('the image itself sets no entrypoint, so EC2 runs it as before', () => {
+  const dockerfile = fs.readFileSync(path.join(__dirname, '..', 'image', 'Dockerfile'), 'utf8');
+  assert.doesNotMatch(dockerfile, /^\s*(ENTRYPOINT|CMD)\b/m);
+  assert.match(dockerfile, /^COPY --chmod=0755 ci-runner-idle-exit \/usr\/local\/bin\/ci-runner-idle-exit$/m);
+});
+
+test('the tasks log to /ecs/<stack>-runner, kept 7 days', () => {
+  const g = resource('RunnerTaskLogGroup');
+  assert.match(g, /LogGroupName: !Sub "\/ecs\/\$\{AWS::StackName\}-runner"\n/);
+  assert.match(g, /RetentionInDays: 7\n/);
+});
+
+test('the execution role may only pull the stack\'s image and write the task log group', () => {
+  const r = resource('RunnerExecutionRole');
+  assert.match(r, /RoleName: !Sub "PowerUserPB-\$\{AWS::StackName\}-runner-exec"/);
+  assert.match(r, /Principal: \{ Service: ecs-tasks\.amazonaws\.com \}/);
+  const st = statements(r.split('PolicyDocument:')[2]);
+  assert.equal(st.length, 3);
+  assert.match(st[0], /^Allow\n {16}Action: ecr:GetAuthorizationToken\n {16}Resource: "\*"\n?$/);
+  assert.match(st[1], /^Allow\n {16}Action: \[ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability\]\n {16}Resource: !GetAtt ImageRepository\.Arn\n?$/);
+  assert.match(st[2], /^Allow\n {16}Action: \[logs:CreateLogStream, logs:PutLogEvents\]\n {16}Resource: !GetAtt RunnerTaskLogGroup\.Arn\n?$/);
+});
+
+test('the launcher\'s role runs only the two task definitions in the cluster, and passes only the execution role', () => {
+  const st = statements(resource('LauncherRole'));
+  const run = st.find((s) => /Action: ecs:RunTask\n/.test(s));
+  assert.ok(run, 'no ecs:RunTask statement');
+  assert.match(run, /Resource: \[!Ref RunnerTaskDefinition, !Ref Arm64RunnerTaskDefinition\]\n/);
+  assert.match(run, /ArnEquals:\n\s+ecs:cluster: !GetAtt RunnerCluster\.Arn/);
+  const pass = st.filter((s) => /Action: iam:PassRole/.test(s));
+  assert.equal(pass.length, 1);
+  assert.match(pass[0], /Resource: !GetAtt RunnerExecutionRole\.Arn\n/);
+  assert.match(pass[0], /iam:PassedToService: ecs-tasks\.amazonaws\.com/);
+  const tag = st.find((s) => /Action: ecs:TagResource\n/.test(s));
+  assert.match(tag, /ecs:CreateAction: RunTask/);
+  // The budget reads the cluster's tasks; nothing else on ECS.
+  for (const s of st.filter((x) => /ecs:/.test(x))) {
+    assert.doesNotMatch(s, /Action: .*(ecs:\*|StopTask|ecs:(Create|Delete|Update|Register))/, s);
+    assert.match(s, /RunnerCluster|RunnerTaskDefinition/, `${s}: not limited to the cluster`);
+  }
+});

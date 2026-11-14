@@ -51,7 +51,8 @@ make outputs     # SetupUrl, WebhookUrl, AppSecretArn, LaunchTemplateId, Arm64La
 
 The first run creates the stack `ci-runner`, and later runs update it. A run
 with no changes does nothing. `make deploy` never passes parameters, so a new
-stack takes the defaults (`SpotVcpuCap` 24, `OnDemandVcpuCap` 8, `AppName`
+stack takes the defaults (`SpotVcpuCap` 24, `OnDemandVcpuCap` 8,
+`FargateSpotVcpuCap` 24, `FargateVcpuCap` 8, `AppName`
 `zeroae-ci-runner`, `RunnerGroup` `ci-runner`, `LogRetentionDays` 30,
 `ExistingOidcProviderArn` empty), and an existing stack keeps whatever values
 it already has. In `zeroae-code` GitHub's OIDC provider already exists, so
@@ -66,12 +67,14 @@ make build
 $AWS cloudformation deploy --stack-name ci-runner \
   --template-file build/template.yaml --s3-bucket "$B" --s3-prefix ci-runner \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
-  --parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8
+  --parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8 FargateSpotVcpuCap=24 FargateVcpuCap=8
 ```
 
-`SpotVcpuCap` draws on the EC2 Spot vCPU quota (`L-34B43A08`) and
-`OnDemandVcpuCap` on the EC2 On-Demand one (`L-1216C47A`); each covers x64 and
-arm64 runners together.
+`SpotVcpuCap` draws on the EC2 Spot vCPU quota (`L-34B43A08`),
+`OnDemandVcpuCap` on the EC2 On-Demand one (`L-1216C47A`),
+`FargateSpotVcpuCap` on the Fargate Spot vCPU quota (`L-36FBB829`) and
+`FargateVcpuCap` on the Fargate On-Demand one (`L-3032A538`); each covers x64
+and arm64 runners together.
 
 A budget is **soft**: a burst can go over it. The launcher handles queue
 messages in parallel, and each one counts only the runners already running, so
@@ -311,6 +314,19 @@ for q in JobQueueUrl JobDeadLetterQueueUrl; do
 done
 ```
 
+**A Fargate task's runner** logs to `/ecs/ci-runner-runner` (kept 7 days),
+one stream per task, `runner/runner/<task id>`: `Listening for Jobs`, then
+`Running job: <name>`, or the idle exit's `ci-runner: no job within 900s,
+stopping`. The launcher's `launched` line names the task's ARN; its last part
+is the task id.
+
+```bash
+$AWS logs tail /ecs/ci-runner-runner --since 1h --format short
+$AWS ecs list-tasks --cluster ci-runner                     # the live tasks
+$AWS ecs describe-tasks --cluster ci-runner --tasks <arn> --include TAGS \
+  --query 'tasks[].[lastStatus,capacityProviderName,stopCode,stoppedReason]'
+```
+
 **The sweeper** runs every 10 minutes and logs only what it did:
 `sweeper: terminated i-...` (an instance launched over 2 hours ago),
 `sweeper: removed runner <name> (id <id>)` (an offline registration with no
@@ -367,6 +383,35 @@ on GitHub-hosted runners in the meantime.
        --description "restarted $(date -u +%FT%TZ) after re-registering the App" >/dev/null
    done
    ```
+
+## Run a task by hand
+
+To test the Fargate path without the launcher (the idle exit, say), mint a
+JIT config as `scripts/hand-launch.sh` does and run one task of the stack's
+task definition. Its labels should match no queued job, so nothing takes it;
+`IDLE_SECONDS` in the override shortens its idle exit, for this task only:
+
+```bash
+out() { $AWS cloudformation describe-stacks --stack-name ci-runner \
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+GROUP_ID=$(gh api orgs/zeroae/actions/runner-groups --paginate \
+  --jq '.runner_groups[] | select(.name == "ci-runner") | .id')
+NAME=ci-runner-hand-$(date -u +%Y%m%d%H%M%S)
+JIT=$(gh api -X POST orgs/zeroae/actions/runners/generate-jitconfig -f name="$NAME" \
+  -F runner_group_id="$GROUP_ID" -f work_folder=_work \
+  -f 'labels[]=self-hosted' -f 'labels[]=hand-test' --jq .encoded_jit_config)
+NET=$(jq -nc --arg sg "$(out SecurityGroupId)" --arg s "$(out SubnetIds)" \
+  '{awsvpcConfiguration: {subnets: ($s | split(",")), securityGroups: [$sg], assignPublicIp: "ENABLED"}}')
+$AWS ecs run-task --cluster ci-runner --task-definition "$(out TaskDefinitionArn)" \
+  --capacity-provider-strategy capacityProvider=FARGATE_SPOT,weight=1 --network-configuration "$NET" \
+  --overrides "$(jq -nc --arg jit "$JIT" '{containerOverrides: [{name: "runner",
+    command: ["./run.sh", "--jitconfig", $jit], environment: [{name: "IDLE_SECONDS", value: "120"}]}]}')" \
+  --tags key=ci-runner:stack,value=ci-runner key=ci-runner:runner,value="$NAME" \
+  --query 'tasks[0].taskArn' --output text
+```
+
+The task stops about 2 minutes after `Listening for Jobs`. Its registration
+stays, offline, until the sweeper removes it.
 
 ## Measured numbers
 
@@ -445,8 +490,9 @@ types.
   For the other three peaks, use `Service` `EC2` and `Class`
   `Standard/OnDemand` as fits.
 
-  The Fargate budgets aren't in the stack yet; their rows are for when the
-  Fargate capacities land.
+  A Fargate quota at its AWS default of 6 vCPUs is below its budget: with
+  the default budgets, a job then fails to launch instead of waiting (see the
+  traps table).
 
 - **Template size:** 55,871 bytes, 5% of the S3 deploy's 1 MB limit. It's
   already over the 51,200 bytes a template can be sent inline, so it deploys
@@ -460,12 +506,17 @@ types.
 | `permission denied` on `/var/run/docker.sock` | the host's `docker` group isn't gid 123 |
 | `setup-python` fails, or picks up a broken Python | `AGENT_TOOLSDIRECTORY` isn't `/opt/hostedtoolcache` |
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
-| A job sits "Waiting for a runner" | its capacity's vCPU budget is full, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, exactly one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), exactly one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
+| A job sits "Waiting for a runner" | its capacity's vCPU budget is full, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), exactly one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
 | A job that ran on our runners before now sits "Waiting for a runner", and the webhook's log shows no `enqueued` line for it | missing size or architecture label: its `runs-on` names only its capacity (`self-hosted`, `ci-spot`). There are no defaults; add a size and an architecture label (`ci-cpu-4` and `x64` keep the old shape), then cancel and re-run the job |
 | An `arm64` runner's instance comes up and terminates without taking its job, and its console shows `no matching manifest for linux/arm64` | `ghcr.io/zeroae/ci-runner:latest` has no arm64 entry yet: the image workflow hasn't pushed a multi-arch `:latest` since it began building arm64. Run the image workflow on `main`, then re-run the job |
 | A job's runner was launched for another job (`$RUNNER_NAME` ends in another job id), and that other job sits "Waiting for a runner" | a swap. The webhook repairs it on the job's `in_progress` (its log says `swap`), and the launcher then launches a runner for the other job. No `swap` line: check the webhook's log for errors (its role needs `ec2:DescribeInstances` and `ec2:CreateTags`); cancel and re-run the waiting job |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
-| A budget lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8`. `SpotVcpuCap` draws on the EC2 Spot vCPU quota (`L-34B43A08`), `OnDemandVcpuCap` on the EC2 On-Demand one (`L-1216C47A`) |
+| A budget lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotVcpuCap=24 OnDemandVcpuCap=8 FargateSpotVcpuCap=24 FargateVcpuCap=8`. Each draws on its own vCPU quota (see "Deploy and update the stack") |
+| A job on `ci-fargate-spot` or `ci-fargate` fails at a Docker step: `Cannot connect to the Docker daemon at unix:///var/run/docker.sock`, or a `services:`/`container:` job or Docker action fails to start | Docker used on Fargate. A Fargate capacity has no Docker daemon, by design (ADR-0001): move the job to `ci-spot` or `ci-ondemand`, or drop its Docker use |
+| The launcher logs `no task launched:` with a reason about a vCPU limit, and the job's message keeps coming back until the dead-letter queue | a Fargate quota at its default (6 vCPUs, `L-36FBB829` Spot, `L-3032A538` On-Demand) or below the capacity's budget. Request an increase (Service Quotas, service `fargate`) or lower `FargateSpotVcpuCap`/`FargateVcpuCap` under the quota; then re-run the job. The quota counts every Fargate task in the account, not only ours |
+| A Fargate job's build is slow, or runs out of memory, with many more compiler processes than the size's vCPUs | `nproc` over-reports inside a task. The job's environment caps `CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and `MAKEFLAGS`; a tool that reads `nproc` any other way needs `-j` from one of them |
+| A Fargate task stops at once, its `stoppedReason` naming `ci-runner-idle-exit` (no such file) | the ECR image's `:latest` predates the idle-exit wrapper: run the image workflow on `main`, then re-run the job |
+| A Fargate task sits `PROVISIONING`, then stops `TaskFailedToStart` with `CannotPullContainerError` | the execution role can't pull from the stack's ECR repo, or `:latest` isn't there (see "Push the image to ECR") |
 | The launcher logs `no instance launched`, with an authorization error from `CreateFleet` | `CreateFleet`'s check on the instance, volumes and network interfaces it creates carries no `ec2:LaunchTemplate` key, so a policy that adds that condition to them denies the launch. Grant those to `CreateFleet` without the condition; `RunInstances` keeps it |
 | The wizard stops with `runner group not created` | Enter at its **y/N** prompt means no. Re-run it, and type `y` at that prompt |
 | Offline runners pile up in the `ci-runner` group | a runner stopped by the 15-minute idle exit stays registered, offline. The sweeper removes it on its next run, once it's 10 minutes past the stamp in its name (`make sweep` to run it now). If they stay, the sweeper's log says why |

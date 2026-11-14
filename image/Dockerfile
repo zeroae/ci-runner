@@ -40,4 +40,9 @@ ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache \
     RUNNER_TOOL_CACHE=/opt/hostedtoolcache
 RUN install -d -o runner -g runner /opt/hostedtoolcache
 
+# The Fargate capacities' entrypoint: the runner with a 15-minute idle exit.
+# Their task definitions name it; the image sets no ENTRYPOINT, so EC2's host
+# script, which runs ./run.sh and does its own idle exit, is unchanged.
+COPY --chmod=0755 ci-runner-idle-exit /usr/local/bin/ci-runner-idle-exit
+
 USER runner

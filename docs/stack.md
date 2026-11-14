@@ -192,7 +192,7 @@ App's webhook points at), for each delivery:
 4. On `in_progress`, repairs a swap (below) and answers.
 5. Ignores (`200`) actions other than `queued`, and jobs outside the label
    contract (case-insensitive): `self-hosted`, exactly one of
-   `ci-spot`/`ci-ondemand`, exactly one size label (`ci-cpu-2`, `-4`, `-8`,
+   `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`, `-4`, `-8`,
    `-16`), exactly one of `x64`/`arm64`, and optionally `linux`. None has a
    default: a missing size or architecture label, an unknown `ci-cpu-*`, or
    both `x64` and `arm64`, are outside it.
@@ -257,10 +257,13 @@ failures per message), for each job:
    the dead-letter queue. Nothing is minted. A job that brings the sum exactly
    to the budget launches. It's a soft budget: messages checked at the same
    moment can overshoot it. A shutting-down instance no longer counts.
+   A Fargate job counts the cluster's tasks instead (see "The Fargate
+   capacities").
 5. Looks up the `RunnerGroup` parameter's group id by name (cached), and
    mints a JIT config with the job's labels. The runner is named
    `${stack}-<UTC YYYYmmddHHMMSS>-<job id>`, as the sweeper requires.
-6. Renders the `#cloud-config` and launches one instance as in "Launching one
+6. For a Fargate job, runs one task (see "The Fargate capacities"). Otherwise
+   renders the `#cloud-config` and launches one instance as in "Launching one
    by hand": Spot `capacity-optimized` for `ci-spot`, On-Demand `lowest-price`
    for `ci-ondemand`, at the job's size, from the launch template and the
    families of the job's architecture. Tags: `ci-runner:runner`,
@@ -271,8 +274,8 @@ failures per message), for each job:
    label), `ci-runner:vcpus` and `ci-runner:arch`; plus the launch template's
    `ci-runner:stack`. The `launched` log line carries `label`, `vcpus` and
    `arch`.
-7. If no instance launches, it removes the registration it just minted and
-   fails the message, which comes back 120 s later.
+7. If no instance or task launches, it removes the registration it just
+   minted and fails the message, which comes back 120 s later.
 
 There is no de-duplication on job id. A duplicate delivery launches a second
 runner at worst, and the idle exit and the sweeper remove it.
@@ -287,10 +290,98 @@ send, `ec2:DescribeInstances` (for the budgets),
 `CreateFleet`/`RunInstances` pinned to the two launch templates, the three subnets
 and the security group. It also allows `CreateTags` only while creating
 (`ec2:CreateAction`), and `ssm:GetParameters` on the public AL2023 parameters,
-which the launch template's `resolve:ssm:` image needs. It has no
-`iam:PassRole`. `CreateFleet`'s check on the instances, volumes and network
+which the launch template's `resolve:ssm:` image needs. For Fargate it
+allows `ecs:RunTask` on the two task definitions in the stack's cluster
+(`ecs:cluster`), `iam:PassRole` on the execution role only and only to
+`ecs-tasks.amazonaws.com`, `ecs:TagResource` only while creating
+(`ecs:CreateAction: RunTask`), and `ecs:ListTasks`/`ecs:DescribeTasks` on the
+cluster (for the budgets). It has no other `iam:PassRole`. `CreateFleet`'s check on the instances, volumes and network
 interfaces it creates carries no launch-template key, so those resources
 are granted to `CreateFleet` without one. `RunInstances` keeps the condition.
+
+## The Fargate capacities
+
+`ci-fargate-spot` (Fargate Spot) and `ci-fargate` (Fargate On-Demand) run a
+job in a Fargate task: no instance to boot, no host to clean up, and **no
+Docker daemon** (ADR-0001). The template's Fargate resources:
+
+- **`RunnerCluster`**, named after the stack, with the `FARGATE` and
+  `FARGATE_SPOT` capacity providers and no default strategy.
+- **`RunnerTaskDefinition`** (x64, family `${stack}-runner`) and
+  **`Arm64RunnerTaskDefinition`** (arm64, `${stack}-runner-arm64`): two,
+  because `RunTask` can't override the platform. They differ only in
+  `CpuArchitecture`: `awsvpc`, 4 vCPU / 16 GB (each launch overrides both),
+  50 GB of ephemeral storage, one essential container `runner` from
+  `${ImageRepositoryUri}:latest` (ECR, lazy-loaded through its SOCI index),
+  entrypoint `/usr/local/bin/ci-runner-idle-exit`, `InitProcessEnabled`, and
+  `awslogs` to `RunnerTaskLogGroup` with the stream prefix `runner`. They have
+  **no task role**, so a job finds no AWS credentials: no
+  `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, and the instance metadata service
+  isn't reachable from Fargate. The task metadata endpoint
+  (`ECS_CONTAINER_METADATA_URI_V4`) is there, and holds no credentials.
+- **`RunnerExecutionRole`**, `PowerUserPB-${stack}-runner-exec`, which ECS
+  uses to start a task and the job never sees: `ecr:GetAuthorizationToken`,
+  the pull calls on `ImageRepository` only, and writing to the log group.
+- **`RunnerTaskLogGroup`**, `/ecs/${stack}-runner`, kept 7 days: the runner's
+  output (`Listening for Jobs`, `Running job`), one stream per task
+  (`runner/runner/<task id>`).
+
+The outputs `ClusterName`, `TaskDefinitionArn` and `Arm64TaskDefinitionArn`
+are what a hand-run task needs.
+
+**The launch.** For a Fargate job the launcher calls `RunTask` with:
+
+- the capacity provider (`FARGATE_SPOT` or `FARGATE`), weight 1, and the
+  task definition of the job's architecture;
+- task-level `cpu` and `memory` for the size (`ci-cpu-8`: `8192` and
+  `32768`, so 4 GB per vCPU as on EC2);
+- a container override: the command `./run.sh --jitconfig <config>`, and the
+  environment below. The JIT config is readable to `ecs:DescribeTasks`, the
+  same exposure as an instance's user-data;
+- `assignPublicIp: ENABLED` in the stack's subnets and security group. arm64
+  leaves out any subnet in `use1-az3`, where Fargate has no arm64 (the
+  template passes each subnet's AZ id as `SUBNET_AZ_IDS`; the stack's subnets
+  are in `use1-az1`, `-az2` and `-az4` today, so nothing is left out);
+- the instances' `ci-runner:*` tags, plus `ci-runner:stack`. ECS allows only
+  letters, digits, spaces and `_ . : / = + - @` in a tag, so on a task
+  `ci-runner:labels` is joined by spaces, not commas, and any other character
+  (a job name's brackets or commas) becomes `_`.
+
+The launch is logged as `launched: <task ARN>`. A `RunTask` that returns no
+task fails the message with `no task launched: <reason>: <detail>`.
+
+**The environment.** Inside a task, `nproc` can report the host's CPUs (8
+on a 4-vCPU task in 3 of the spike's 4 tasks) and there is no cgroup
+`cpu.max`, so tools that size their parallelism by it oversubscribe. The
+container override sets `CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL` and
+`MAKEFLAGS=-j<n>` to the task's vCPUs; the runner's environment reaches every
+step. `IDLE_SECONDS` is passed on too, when the launcher has it (a test).
+
+**The idle exit.** `image/ci-runner-idle-exit` runs its arguments in their own
+session, copying their output to a file, and stops them (TERM to the whole
+session) if that output has no `Running job` line after `IDLE_SECONDS`
+(default 900). It passes a TERM or INT on (a `StopTask`), and exits with the
+runner's status, so the essential container exits and the task stops. The
+image sets no `ENTRYPOINT`, so EC2's host script, which runs `./run.sh` with
+its own idle exit, is unchanged; only the task definitions use the wrapper.
+`image/smoke.sh` checks it with fake runners and a 2 s timeout. For a test,
+`IDLE_SECONDS` can be set per task in a container override, as in the
+runbook's "Run a task by hand".
+
+**The budgets.** `FargateSpotVcpuCap` (default 24) and `FargateVcpuCap`
+(default 8) budget the two capacities, both architectures together, as the
+EC2 budgets do. The launcher lists the cluster's tasks whose desired status is
+`RUNNING` (provisioning, pending or running, not yet told to stop: a task
+stopping no longer counts, like a shutting-down instance) and sums their
+`ci-runner:vcpus` on the job's capacity (`ci-runner:capacity`). A task with no
+vCPU tag counts as 4. EC2 instances and tasks never count towards each
+other's budgets.
+
+**Not yet for tasks** (#30): the sweeper doesn't stop tasks after 2 hours or
+match a registration to a task, the notifier doesn't report a Fargate Spot
+reclaim, and the swap repair re-tags only instances. Until then a job's
+`timeout-minutes` bounds a task, and an offline Fargate runner is removed by
+the sweeper once it's past its grace period.
 
 ## Reporting a Spot reclaim: the notifier
 

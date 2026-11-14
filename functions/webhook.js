@@ -5,7 +5,7 @@
 // Inlined into the template; keep it one dependency-free CommonJS file.
 const crypto = require('node:crypto');
 
-const CAPACITY = ['ci-spot', 'ci-ondemand'];
+const CAPACITY = ['ci-spot', 'ci-ondemand', 'ci-fargate-spot', 'ci-fargate'];
 const SIZE = { 'ci-cpu-2': 2, 'ci-cpu-4': 4, 'ci-cpu-8': 8, 'ci-cpu-16': 16 };
 const ARCH = ['x64', 'arm64'];
 

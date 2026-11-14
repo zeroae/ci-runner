@@ -11,6 +11,10 @@ const ENV = {
   GITHUB_ORG: 'zeroae', RUNNER_GROUP: 'ci-runner', STACK_NAME: 'ci-runner',
   LAUNCH_TEMPLATE_ID: 'lt-0abc', ARM64_LAUNCH_TEMPLATE_ID: 'lt-0arm', SUBNET_IDS: 'subnet-a,subnet-b,subnet-c',
   QUEUE_URL: 'https://sqs.example/jobs', SPOT_VCPU_CAP: '24', ONDEMAND_VCPU_CAP: '8',
+  CLUSTER: 'ci-runner', TASK_DEFINITION: 'arn:aws:ecs:us-east-1:1:task-definition/ci-runner-runner:3',
+  ARM64_TASK_DEFINITION: 'arn:aws:ecs:us-east-1:1:task-definition/ci-runner-runner-arm64:3',
+  SECURITY_GROUP_ID: 'sg-0run', SUBNET_AZ_IDS: 'use1-az1,use1-az2,use1-az4',
+  FARGATE_SPOT_VCPU_CAP: '24', FARGATE_VCPU_CAP: '8',
 };
 const JIT = 'ZW5jb2RlZGppdA==';
 
@@ -73,15 +77,48 @@ function fakeEc2({ fleet = { Instances: [{ InstanceIds: ['i-0123'] }], Errors: [
   };
 }
 
-function setup({ gh = fakeGitHub(), ec2 = fakeEc2(), env = ENV } = {}) {
+// `running` lists the cluster's tasks, as { capacity, vcpus, desired } with
+// the launcher's shape tags (left off when undefined). `run` is RunTask's
+// answer; by default one task.
+function fakeEcs({ running = [], run } = {}) {
+  const calls = [];
+  const all = running.map((t, i) => ({
+    taskArn: `arn:aws:ecs:us-east-1:1:task/ci-runner/t${i}`, desiredStatus: t.desired || 'RUNNING', lastStatus: 'RUNNING',
+    tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', t.capacity], ['ci-runner:vcpus', t.vcpus]]
+      .filter(([, v]) => v !== undefined).map(([key, value]) => ({ key, value: String(value) })),
+  }));
+  return {
+    calls,
+    runTask: async (input) => {
+      calls.push(['runTask', input]);
+      if (run instanceof Error) throw run;
+      return run || { tasks: [{ taskArn: 'arn:aws:ecs:us-east-1:1:task/ci-runner/new1', lastStatus: 'PROVISIONING' }], failures: [] };
+    },
+    // Pages of one, to check nextToken is followed.
+    listTasks: async (input) => {
+      calls.push(['listTasks', input]);
+      const want = all.filter((t) => t.desiredStatus === (input.desiredStatus || 'RUNNING'));
+      const i = input.nextToken ? Number(input.nextToken) : 0;
+      return { taskArns: want.slice(i, i + 1).map((t) => t.taskArn), ...(i + 1 < want.length ? { nextToken: String(i + 1) } : {}) };
+    },
+    describeTasks: async (input) => {
+      calls.push(['describeTasks', input]);
+      const tasks = all.filter((t) => input.tasks.includes(t.taskArn))
+        .map((t) => (input.include || []).includes('TAGS') ? t : { ...t, tags: undefined });
+      return { tasks, failures: [] };
+    },
+  };
+}
+
+function setup({ gh = fakeGitHub(), ec2 = fakeEc2(), ecs = fakeEcs(), env = ENV } = {}) {
   const logs = [];
   const sent = [];
   const sqs = { sendMessage: async (input) => { sent.push(input); return {}; } };
   const handler = createHandler({
     secret: { get: async () => ({ app_id: 42, private_key: PEM, webhook_secret: 'w' }) },
-    fetch: gh.fetch, ec2, sqs, now: () => T0, env, log: (l) => logs.push(l),
+    fetch: gh.fetch, ec2, ecs, sqs, now: () => T0, env, log: (l) => logs.push(l),
   });
-  return { handler, gh, ec2, sqs: sent, logs };
+  return { handler, gh, ec2, ecs, sqs: sent, logs };
 }
 
 const sqsEvent = (...msgs) => ({ Records: msgs.map((m, i) => ({ messageId: `m${i}`, body: JSON.stringify(m) })) });
@@ -361,4 +398,164 @@ test('a job no longer queued is dropped before the budget is checked', async () 
   const s = setup({ gh: fakeGitHub({ jobStatus: 'completed' }), ec2: fakeEc2({ running: [spot(16), spot(8)] }) });
   await s.handler(sqsEvent(MSG));
   assert.deepEqual(s.sqs, []);
+});
+
+// --- the Fargate capacities (#29) ------------------------------------------
+const FG_MSG = { ...MSG, label: 'ci-fargate-spot', labels: ['self-hosted', 'ci-fargate-spot', 'ci-cpu-4', 'x64'] };
+const runTaskInput = (ecs) => (ecs.calls.find((c) => c[0] === 'runTask') || [])[1];
+const taskTags = (input) => Object.fromEntries(input.tags.map((t) => [t.key, t.value]));
+const envOf = (input) => Object.fromEntries(input.overrides.containerOverrides[0].environment.map((e) => [e.name, e.value]));
+
+test('a ci-fargate-spot job runs one Fargate Spot task with the runner as its command, and no instance', async () => {
+  const { handler, ec2, ecs, logs } = setup();
+  assert.deepEqual(await handler(sqsEvent(FG_MSG)), { batchItemFailures: [] });
+  assert.ok(!ec2.calls.some((c) => c[0] !== 'describe'), 'no EC2 launch');
+  const input = runTaskInput(ecs);
+  assert.equal(input.cluster, 'ci-runner');
+  assert.equal(input.taskDefinition, ENV.TASK_DEFINITION);
+  assert.equal(input.count, 1);
+  assert.deepEqual(input.capacityProviderStrategy, [{ capacityProvider: 'FARGATE_SPOT', weight: 1 }]);
+  assert.equal(input.launchType, undefined, 'a capacity provider strategy excludes a launch type');
+  assert.deepEqual(input.networkConfiguration, { awsvpcConfiguration: {
+    subnets: ['subnet-a', 'subnet-b', 'subnet-c'], securityGroups: ['sg-0run'], assignPublicIp: 'ENABLED',
+  } });
+  assert.equal(input.overrides.cpu, '4096');
+  assert.equal(input.overrides.memory, '16384');
+  const [c] = input.overrides.containerOverrides;
+  assert.equal(c.name, 'runner');
+  assert.deepEqual(c.command, ['./run.sh', '--jitconfig', JIT]);
+  // nproc over-reports on Fargate: the job's tools get the task's vCPUs.
+  assert.deepEqual(envOf(input), { CARGO_BUILD_JOBS: '4', CMAKE_BUILD_PARALLEL_LEVEL: '4', MAKEFLAGS: '-j4' });
+  assert.deepEqual(taskTags(input), {
+    'ci-runner:stack': 'ci-runner',
+    'ci-runner:runner': 'ci-runner-20261112120000-555', 'ci-runner:runner-id': '77', 'ci-runner:label': 'ci-fargate-spot',
+    'ci-runner:repo': 'zeroae/app', 'ci-runner:job-id': '555', 'ci-runner:run-id': '444', 'ci-runner:head-sha': 'abc123',
+    'ci-runner:job-name': 'tests', 'ci-runner:labels': 'self-hosted ci-fargate-spot ci-cpu-4 x64',
+    'ci-runner:capacity': 'ci-fargate-spot', 'ci-runner:vcpus': '4', 'ci-runner:arch': 'x64',
+  });
+  const line = JSON.parse(logs.find((l) => l.includes('"launched"')));
+  assert.equal(line.launched, 'arn:aws:ecs:us-east-1:1:task/ci-runner/new1');
+  assert.deepEqual([line.label, line.vcpus, line.arch], ['ci-fargate-spot', 4, 'x64']);
+  assert.ok(!logs.some((l) => l.includes(JIT)), 'no JIT config in the logs');
+});
+
+test('each Fargate capacity, size and architecture: its capacity provider, task definition, cpu, memory and parallelism', async () => {
+  const mem = { 2: '8192', 4: '16384', 8: '32768', 16: '65536' };
+  for (const [label, provider] of [['ci-fargate-spot', 'FARGATE_SPOT'], ['ci-fargate', 'FARGATE']]) {
+    for (const vcpus of [2, 4, 8, 16]) {
+      for (const [arch, td] of [['x64', ENV.TASK_DEFINITION], ['arm64', ENV.ARM64_TASK_DEFINITION]]) {
+        const what = `${label} ${vcpus} ${arch}`;
+        const { handler, ecs } = setup({ env: { ...ENV, FARGATE_SPOT_VCPU_CAP: '64', FARGATE_VCPU_CAP: '64' } });
+        const m = { ...MSG, label, vcpus, arch, labels: ['self-hosted', label, `ci-cpu-${vcpus}`, arch] };
+        assert.deepEqual(await handler(sqsEvent(m)), { batchItemFailures: [] }, what);
+        const input = runTaskInput(ecs);
+        assert.deepEqual(input.capacityProviderStrategy, [{ capacityProvider: provider, weight: 1 }], what);
+        assert.equal(input.taskDefinition, td, what);
+        assert.deepEqual([input.overrides.cpu, input.overrides.memory], [String(vcpus * 1024), mem[vcpus]], what);
+        assert.deepEqual(envOf(input), { CARGO_BUILD_JOBS: `${vcpus}`, CMAKE_BUILD_PARALLEL_LEVEL: `${vcpus}`, MAKEFLAGS: `-j${vcpus}` }, what);
+        const t = taskTags(input);
+        assert.deepEqual([t['ci-runner:capacity'], t['ci-runner:vcpus'], t['ci-runner:arch']], [label, String(vcpus), arch], what);
+      }
+    }
+  }
+});
+
+test('an arm64 task leaves out a subnet in use1-az3, where Fargate has no arm64; an x64 task keeps it', async () => {
+  const env = { ...ENV, SUBNET_AZ_IDS: 'use1-az1,use1-az3,use1-az4' };
+  let s = setup({ env });
+  await s.handler(sqsEvent({ ...FG_MSG, arch: 'arm64' }));
+  assert.deepEqual(runTaskInput(s.ecs).networkConfiguration.awsvpcConfiguration.subnets, ['subnet-a', 'subnet-c']);
+  s = setup({ env });
+  await s.handler(sqsEvent(FG_MSG));
+  assert.deepEqual(runTaskInput(s.ecs).networkConfiguration.awsvpcConfiguration.subnets, ['subnet-a', 'subnet-b', 'subnet-c']);
+});
+
+test('a task\'s tags carry only characters ECS allows', async () => {
+  const { handler, ecs } = setup();
+  await handler(sqsEvent({ ...FG_MSG, job_name: 'build (x64, release) #1' }));
+  const t = taskTags(runTaskInput(ecs));
+  assert.equal(t['ci-runner:job-name'], 'build _x64_ release_ _1');
+  for (const { key, value } of runTaskInput(ecs).tags) assert.match(key + value, /^[\p{L}\p{Z}\p{N}_.:/=+\-@]*$/u);
+});
+
+test('IDLE_SECONDS on the launcher reaches the task, for a test', async () => {
+  const { handler, ecs } = setup({ env: { ...ENV, IDLE_SECONDS: '120' } });
+  await handler(sqsEvent(FG_MSG));
+  assert.equal(envOf(runTaskInput(ecs)).IDLE_SECONDS, '120');
+});
+
+const fgSpot = (vcpus) => ({ capacity: 'ci-fargate-spot', vcpus });
+const fg = (vcpus) => ({ capacity: 'ci-fargate', vcpus });
+const FGOD_MSG = { ...FG_MSG, label: 'ci-fargate', labels: ['self-hosted', 'ci-fargate', 'ci-cpu-4', 'x64'] };
+const ran = (ecs) => ecs.calls.some((c) => c[0] === 'runTask');
+
+test('the Fargate budget lists the cluster\'s tasks not told to stop, and reads their tags', async () => {
+  const ecs = fakeEcs({ running: [fgSpot(4), fgSpot(2)] });
+  const { handler } = setup({ ecs });
+  await handler(sqsEvent(FG_MSG));
+  const lists = ecs.calls.filter((c) => c[0] === 'listTasks').map((c) => c[1]);
+  assert.deepEqual(lists, [
+    { cluster: 'ci-runner', desiredStatus: 'RUNNING', nextToken: undefined },
+    { cluster: 'ci-runner', desiredStatus: 'RUNNING', nextToken: '1' },
+  ]);
+  for (const [, d] of ecs.calls.filter((c) => c[0] === 'describeTasks')) {
+    assert.equal(d.cluster, 'ci-runner');
+    assert.deepEqual(d.include, ['TAGS']);
+  }
+});
+
+test('Fargate budgets sum mixed sizes across tasks; a job over the budget waits, logged in vCPUs', async () => {
+  // 2 + 4 + 8 + 8 = 22 Fargate Spot vCPUs: a 2 fits exactly, a 4 doesn't.
+  const running = [fgSpot(2), fgSpot(4), fgSpot(8), fgSpot(8), fg(8)];
+  let s = setup({ ecs: fakeEcs({ running }) });
+  await s.handler(sqsEvent({ ...FG_MSG, vcpus: 2 }));
+  assert.ok(ran(s.ecs));
+  s = setup({ ecs: fakeEcs({ running }) });
+  assert.deepEqual(await s.handler(sqsEvent(FG_MSG)), { batchItemFailures: [] });
+  assert.ok(!ran(s.ecs));
+  assert.equal(s.sqs.length, 1);
+  assert.equal(s.sqs[0].DelaySeconds, 60);
+  assert.ok(!s.gh.keys().some((k) => k.includes('generate-jitconfig')), 'nothing is minted');
+  assert.equal(JSON.parse(s.logs.find((l) => l.includes('"deferred"'))).deferred, '22+4 of 24 fargate-spot vCPUs');
+});
+
+test('each Fargate capacity has its own budget, and EC2 instances count towards neither', async () => {
+  // Fargate On-Demand holds 8 of 8; Fargate Spot and EC2 Spot are free.
+  const ecs = () => fakeEcs({ running: [fg(4), fg(4), fgSpot(16)] });
+  let s = setup({ ecs: ecs() });
+  await s.handler(sqsEvent({ ...FGOD_MSG, vcpus: 2 }));
+  assert.ok(!ran(s.ecs));
+  assert.equal(JSON.parse(s.logs.find((l) => l.includes('"deferred"'))).deferred, '8+2 of 8 fargate vCPUs');
+  s = setup({ ecs: ecs() });
+  await s.handler(sqsEvent({ ...FG_MSG, vcpus: 8 }));
+  assert.ok(ran(s.ecs), '16+8 of 24 Fargate Spot');
+  // 24 EC2 Spot vCPUs held: Fargate Spot doesn't see them, and EC2 doesn't see tasks.
+  s = setup({ ec2: fakeEc2({ running: [spot(16), spot(8)] }) });
+  await s.handler(sqsEvent(FG_MSG));
+  assert.ok(ran(s.ecs));
+  assert.deepEqual(s.ec2.calls, [], 'a Fargate job describes no instances');
+  s = setup({ ecs: fakeEcs({ running: [fgSpot(16), fgSpot(8)] }) });
+  await s.handler(sqsEvent(MSG));
+  assert.ok(launched(s.ec2));
+  assert.deepEqual(s.ecs.calls, [], 'an EC2 job lists no tasks');
+});
+
+test('the Fargate budgets come from the environment', async () => {
+  let s = setup({ ecs: fakeEcs({ running: [fgSpot(2)] }), env: { ...ENV, FARGATE_SPOT_VCPU_CAP: '4' } });
+  await s.handler(sqsEvent(FG_MSG));
+  assert.ok(!ran(s.ecs));
+  s = setup({ env: { ...ENV, FARGATE_VCPU_CAP: '16' } });
+  await s.handler(sqsEvent({ ...FGOD_MSG, vcpus: 16 }));
+  assert.ok(ran(s.ecs));
+});
+
+test('a failed RunTask removes the registration and fails the message, as a failed fleet does', async () => {
+  const failed = { tasks: [], failures: [{ arn: 'x', reason: 'Capacity is unavailable at this time', detail: 'FARGATE_SPOT' }] };
+  for (const run of [failed, Object.assign(new Error('AccessDeniedException: no'), { name: 'AccessDeniedException' })]) {
+    const { handler, gh, logs } = setup({ ecs: fakeEcs({ run }) });
+    assert.deepEqual(await handler(sqsEvent(FG_MSG)), { batchItemFailures: [{ itemIdentifier: 'm0' }] });
+    assert.ok(gh.keys().includes('DELETE /orgs/zeroae/actions/runners/77'), 'the registration is removed');
+    const err = JSON.parse(logs.find((l) => l.includes('"error"'))).error;
+    assert.match(err, run === failed ? /^no task launched: Capacity is unavailable at this time: FARGATE_SPOT$/ : /AccessDenied/);
+  }
 });
