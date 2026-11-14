@@ -99,7 +99,8 @@ it's in both.
 include `linux`. None of them has a default. A job missing a size or an
 architecture label, or with any other label (`aarch64`, an unknown
 `ci-cpu-*`, two size labels, both `x64` and `arm64`), is ignored, and it waits
-for a runner that never comes.
+for a runner that never comes. Before changing the contract, `make consumers`
+lists every job it affects.
 
 **What the job gets:** Ubuntu 24.04, the runner as user `runner` (passwordless
 sudo), Docker through the host's socket, the `docker compose` and `buildx`

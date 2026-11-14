@@ -277,6 +277,11 @@ A repo is served when all of these hold:
   gh api -X DELETE orgs/zeroae/actions/runner-groups/$GROUP_ID/repositories/$REPO_ID
   ```
 
+**Who a label-contract change affects:** `make consumers` (`scripts/consumers.sh`)
+prints `repo  workflow  job  runs-on` for every job, in the group's repos,
+whose `runs-on` names a capacity. It reads each repo's workflows directly,
+since GitHub's code search misses private repos.
+
 ## Read a lost job
 
 When AWS reclaims a Spot instance or a Fargate Spot task, GitHub marks the job failed, with *The
