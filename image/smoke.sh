@@ -78,5 +78,21 @@ expect RUNNER_TOOL_CACHE    /opt/hostedtoolcache "${RUNNER_TOOL_CACHE:-}"
 expect toolcache-owner      runner "$(stat -c %U /opt/hostedtoolcache 2>&1)"
 expect toolcache-writable   yes "$(touch /opt/hostedtoolcache/.w 2>/dev/null && rm /opt/hostedtoolcache/.w && echo yes || echo no)"
 
+echo "== idle exit"
+# The Fargate capacities' entrypoint (EC2's host script does its own idle
+# exit). Fake runners stand in for ./run.sh, with a 2 s timeout.
+idle=/usr/local/bin/ci-runner-idle-exit
+expect idle-exit-installed yes "$([[ -x $idle ]] && echo yes || echo no)"
+t0=$SECONDS
+out=$(IDLE_SECONDS=2 timeout 60 "$idle" bash -c 'echo "Listening for Jobs"; sleep 50' 2>&1)
+rc=$?
+expect idle-exit-stops   "stopped in time" "$( ((SECONDS - t0 < 30)) && [[ $rc != 124 ]] && echo "stopped in time" || echo "rc $rc after $((SECONDS - t0))s")"
+expect idle-exit-says    yes "$(grep -q 'no job within 2s' <<<"$out" && echo yes || echo no)"
+out=$(IDLE_SECONDS=2 timeout 60 "$idle" bash -c 'echo "Running job: build"; sleep 4; echo finished; exit 3' 2>&1)
+rc=$?
+expect idle-exit-keeps   "3 finished" "$rc $(grep -x finished <<<"$out")"
+out=$(IDLE_SECONDS=0 timeout 10 "$idle" true 2>&1)
+expect idle-exit-refuses "2" "$?"
+
 if (( fail )); then echo "SMOKE FAILED"; exit 1; fi
 echo "SMOKE PASSED"

@@ -1,0 +1,42 @@
+#!/bin/bash
+# The entrypoint of a CI runner on the Fargate capacities (the task
+# definitions name it; the image itself sets no ENTRYPOINT, so EC2's host
+# script, which runs ./run.sh and does its own idle exit, is unchanged).
+#
+#   ci-runner-idle-exit ./run.sh --jitconfig <config>
+#
+# Runs its arguments (the runner), and stops them if the runner hasn't logged
+# "Running job" within IDLE_SECONDS (default 900): a runner whose job went to
+# another runner then exits, and so does its task. Exits with the runner's
+# status. A TERM or INT (ECS stopping the task) is passed on to the runner.
+set -u
+
+idle=${IDLE_SECONDS:-900}
+if [[ ! $idle =~ ^[1-9][0-9]*$ ]]; then
+  echo "ci-runner: IDLE_SECONDS must be a positive integer, not '$idle'" >&2
+  exit 2
+fi
+
+log=$(mktemp /tmp/ci-runner-idle-exit.XXXXXX)
+# Its own session, so a stop reaches run.sh, its helper and the listener.
+setsid "$@" > >(tee -a "$log") 2>&1 &
+pid=$!
+stop() { kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; }
+trap stop TERM INT
+
+# Its sleep goes with it, rather than hold the output open for IDLE_SECONDS.
+( trap 'kill "$s" 2>/dev/null; exit 0' TERM
+  sleep "$idle" & s=$!
+  wait "$s"
+  if ! grep -q 'Running job' "$log"; then
+    echo "ci-runner: no job within ${idle}s, stopping"
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  fi ) &
+watcher=$!
+
+# A trapped signal interrupts wait; wait again until the runner is gone.
+wait "$pid"
+rc=$?
+while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
+kill "$watcher" 2>/dev/null
+exit "$rc"
