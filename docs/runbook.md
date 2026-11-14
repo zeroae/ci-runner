@@ -337,6 +337,10 @@ types.
   For the other three peaks, use `Service` `EC2` and `Class`
   `Standard/OnDemand` as fits.
 
+  Until the vCPU budgets land, the caps still count runners (6 Spot, 2
+  On-Demand), so at `ci-cpu-16` (a `.4xlarge`) they can hold 96 Spot and 32
+  On-Demand vCPUs; at the default `ci-cpu-4`, 24 and 8.
+
 - **Template size:** 50,301 bytes, 5% of the S3 deploy's 1 MB limit. It's
   already over the 51,200 bytes a template can be sent inline, so it deploys
   only through the deploy bucket.
@@ -349,7 +353,7 @@ types.
 | `permission denied` on `/var/run/docker.sock` | the host's `docker` group isn't gid 123 |
 | `setup-python` fails, or picks up a broken Python | `AGENT_TOOLSDIRECTORY` isn't `/opt/hostedtoolcache` |
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
-| A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, and otherwise only `linux`/`x64`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
+| A job sits "Waiting for a runner" | the cap is reached, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), and otherwise only `linux`/`x64`; `arm64` isn't served yet. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |
 | A cap lowered for a test is still low after the next `make deploy` | `cloudformation deploy` keeps a parameter's previous value unless it's overridden; restore it with `--parameter-overrides SpotCap=6 OnDemandCap=2` |
 | The launcher logs `no instance launched`, with an authorization error from `CreateFleet` | `CreateFleet`'s check on the instance, volumes and network interfaces it creates carries no `ec2:LaunchTemplate` key, so a policy that adds that condition to them denies the launch. Grant those to `CreateFleet` without the condition; `RunInstances` keeps it |

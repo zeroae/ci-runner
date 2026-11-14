@@ -46,8 +46,37 @@ test('an accepted ci-spot job is enqueued with every field', async () => {
   assert.equal(res.statusCode, 202);
   assert.deepEqual(sent, [{
     repo: 'zeroae/app', job_id: 555, run_id: 444, head_sha: 'abc123', job_name: 'tests',
-    label: 'ci-spot', labels: ['self-hosted', 'ci-spot'], installation_id: 181,
+    label: 'ci-spot', vcpus: 4, arch: 'x64', labels: ['self-hosted', 'ci-spot'], installation_id: 181,
   }]);
+});
+
+test('every size label is enqueued with its vCPUs and the architecture', async () => {
+  for (const [size, vcpus] of [['ci-cpu-2', 2], ['ci-cpu-4', 4], ['ci-cpu-8', 8], ['ci-cpu-16', 16]]) {
+    for (const cap of ['ci-spot', 'ci-ondemand']) {
+      const labels = ['self-hosted', cap, size, 'x64'];
+      const { handler, sent } = setup();
+      assert.equal((await handler(delivery(job({ labels })))).statusCode, 202, labels.join(','));
+      assert.deepEqual(
+        { label: sent[0].label, vcpus: sent[0].vcpus, arch: sent[0].arch, labels: sent[0].labels },
+        { label: cap, vcpus, arch: 'x64', labels },
+      );
+    }
+  }
+});
+
+test('a missing size or architecture label defaults to ci-cpu-4 and x64', async () => {
+  for (const labels of [['self-hosted', 'ci-spot', 'x64'], ['self-hosted', 'ci-spot', 'ci-cpu-4'], ['self-hosted', 'linux', 'ci-ondemand']]) {
+    const { handler, sent } = setup();
+    await handler(delivery(job({ labels })));
+    assert.equal(sent[0].vcpus, 4, labels.join(','));
+    assert.equal(sent[0].arch, 'x64', labels.join(','));
+  }
+});
+
+test('the size label is read case-insensitively', async () => {
+  const { handler, sent } = setup();
+  await handler(delivery(job({ labels: ['Self-Hosted', 'CI-Spot', 'CI-CPU-16', 'X64'] })));
+  assert.equal(sent[0].vcpus, 16);
 });
 
 test('a base64-encoded body is verified on its decoded bytes', async () => {
@@ -82,12 +111,14 @@ test('the webhook secret is read once and cached', async () => {
   assert.equal(reads(), 1);
 });
 
-test('the label contract: self-hosted plus exactly one capacity label, otherwise only linux/x64', async () => {
+test('the label contract: self-hosted, exactly one capacity label, at most one size and one x64 label, and linux', async () => {
   const accepted = [
     ['self-hosted', 'ci-spot'],
     ['self-hosted', 'ci-ondemand'],
     ['self-hosted', 'linux', 'x64', 'ci-spot'],
     ['Self-Hosted', 'CI-Spot'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'x64'],
+    ['self-hosted', 'linux', 'ci-ondemand', 'ci-cpu-2'],
   ];
   const ignored = [
     ['ci-spot'],
@@ -95,6 +126,13 @@ test('the label contract: self-hosted plus exactly one capacity label, otherwise
     ['self-hosted', 'ci-spot', 'ci-ondemand'],
     ['self-hosted', 'ci-spot', 'gpu'],
     ['self-hosted', 'ci-spot', 'arm64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-4', 'ci-cpu-8'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'ci-cpu-8'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-3'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-32'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'arm64'],
+    ['self-hosted', 'ci-spot', 'x64', 'arm64'],
+    ['self-hosted', 'ci-spot', 'x64', 'x64'],
     ['ubuntu-latest'],
     [],
   ];

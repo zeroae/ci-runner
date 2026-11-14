@@ -2,17 +2,33 @@
 
 Single-use EC2 runners for the GitHub Actions jobs of zeroae's private repos.
 
-Each queued job labelled `ci-spot` or `ci-ondemand` gets a fresh `.xlarge`
-EC2 instance. The instance runs that one job in `ghcr.io/zeroae/ci-runner:latest`
+Each queued job labelled `ci-spot` or `ci-ondemand` gets a fresh EC2
+instance of the size it asks for (a `.xlarge` by default). The instance runs that one job in `ghcr.io/zeroae/ci-runner:latest`
 (GitHub's runner image on Ubuntu 24.04, plus general tools) and then
 terminates. The instance has no IAM role, so a job finds no AWS credentials
 on it. Short jobs stay on GitHub-hosted runners.
 
 | Label in `runs-on` | Capacity | For |
 |---|---|---|
-| `ci-spot` | EC2 Spot, `.xlarge` (`m7i`/`m6i`/`m6a`/`m7a`) | long jobs: a job that runs well over 2 minutes, which is about how long a CI runner takes to come up |
-| `ci-ondemand` | EC2 On-Demand, `.xlarge` | critical jobs: a job that, cut off half-way, leaves state a person must repair (`terraform apply`) |
+| `ci-spot` | EC2 Spot (`m7i`/`m6i`/`m6a`/`m7a`) | long jobs: a job that runs well over 2 minutes, which is about how long a CI runner takes to come up |
+| `ci-ondemand` | EC2 On-Demand (the same families) | critical jobs: a job that, cut off half-way, leaves state a person must repair (`terraform apply`) |
 | (none; `ubuntu-latest`) | GitHub-hosted | everything else |
+
+A **size label** picks the vCPUs, at 4 GB of memory per vCPU, and an
+**architecture label** the CPU:
+
+| Size label | vCPUs / memory | Instance size |
+|---|---|---|
+| `ci-cpu-2` | 2 / 8 GB | `.large` |
+| `ci-cpu-4` | 4 / 16 GB | `.xlarge` |
+| `ci-cpu-8` | 8 / 32 GB | `.2xlarge` |
+| `ci-cpu-16` | 16 / 64 GB | `.4xlarge` |
+
+The architecture label is `x64`; `arm64` isn't served yet. For now both are
+optional and default to `ci-cpu-4` and `x64`, so today's `runs-on` keeps
+working. **They will become required**: add `ci-cpu-4` and `x64` (or the size
+you want) to every moved job now, so the change to the required contract
+doesn't strand it.
 
 At most 6 Spot and 2 On-Demand CI runners run at once, across all repos. A
 job over the cap waits in a queue until one finishes. If a Spot reclaim kills
@@ -35,9 +51,9 @@ it's in both.
    ```yaml
    jobs:
      tests:
-       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-spot"]') || 'ubuntu-latest' }}
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-spot","ci-cpu-8","x64"]') || 'ubuntu-latest' }}
      apply:
-       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-ondemand"]') || 'ubuntu-latest' }}
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-ondemand","ci-cpu-2","x64"]') || 'ubuntu-latest' }}
    ```
 
    While the variable is unset (the default), every job runs on `ubuntu-latest`,
@@ -55,9 +71,10 @@ it's in both.
    canary.
 
 **The label contract:** `runs-on` must include `self-hosted` and exactly one of
-`ci-spot` or `ci-ondemand`. The only other labels allowed are `linux` and `x64`.
-A job with any other label is ignored, and it waits for a runner that never
-comes.
+`ci-spot` or `ci-ondemand`. It may include at most one size label
+(`ci-cpu-2`, `ci-cpu-4`, `ci-cpu-8`, `ci-cpu-16`), `x64` and `linux`. A job
+with any other label (`arm64`, an unknown `ci-cpu-*`, two size labels) is
+ignored, and it waits for a runner that never comes.
 
 **What the job gets:** Ubuntu 24.04, the runner as user `runner` (passwordless
 sudo), Docker through the host's socket, the `docker compose` and `buildx`

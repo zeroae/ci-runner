@@ -7,7 +7,9 @@ const crypto = require('node:crypto');
 const { renderCloudConfig } = require('./cloud-config.js');
 
 const API = 'https://api.github.com';
-const TYPES = ['m7i.xlarge', 'm6i.xlarge', 'm6a.xlarge', 'm7a.xlarge'];
+// A size label's vCPUs -> the instance size, at 4 GB per vCPU, per family.
+const SIZES = { 2: 'large', 4: 'xlarge', 8: '2xlarge', 16: '4xlarge' };
+const FAMILIES = { x64: ['m7i', 'm6i', 'm6a', 'm7a'] };
 const CAPACITY = { 'ci-spot': 'spot', 'ci-ondemand': 'on-demand' };
 
 const b64u = (s) => Buffer.from(s).toString('base64url');
@@ -18,10 +20,15 @@ function appJwt(appId, pem, nowMs) {
   return `${data}.${crypto.sign('sha256', Buffer.from(data), pem).toString('base64url')}`;
 }
 
+// A message enqueued before the size labels has no vcpus or arch: it gets
+// today's shape.
+const shapeOf = (m) => ({ vcpus: m.vcpus === undefined ? 4 : m.vcpus, arch: m.arch === undefined ? 'x64' : m.arch });
+
 function valid(m, org) {
   return m && typeof m.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(m.repo) && m.repo.split('/')[0] === org
     && Number.isInteger(m.job_id) && Number.isInteger(m.installation_id) && m.label in CAPACITY
-    && Array.isArray(m.labels);
+    && Array.isArray(m.labels) && Number.isInteger(shapeOf(m).vcpus) && Object.hasOwn(SIZES, shapeOf(m).vcpus)
+    && Object.hasOwn(FAMILIES, shapeOf(m).arch);
 }
 
 function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log }) {
@@ -93,6 +100,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
     });
     const version = String(v.LaunchTemplateVersion.VersionNumber);
     const type = CAPACITY[m.label];
+    const { vcpus, arch } = shapeOf(m);
     const tag = (Key, Value) => ({ Key, Value: String(Value).slice(0, 256) });
     try {
       const fleet = await ec2.createFleet({
@@ -101,7 +109,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
         ...(type === 'spot' ? { SpotOptions: { AllocationStrategy: 'capacity-optimized' } } : { OnDemandOptions: { AllocationStrategy: 'lowest-price' } }),
         LaunchTemplateConfigs: [{
           LaunchTemplateSpecification: { LaunchTemplateId: lt, Version: version },
-          Overrides: TYPES.flatMap((InstanceType) => subnets.map((SubnetId) => ({ InstanceType, SubnetId }))),
+          Overrides: FAMILIES[arch].flatMap((f) => subnets.map((SubnetId) => ({ InstanceType: `${f}.${SIZES[vcpus]}`, SubnetId }))),
         }],
         TagSpecifications: [{
           ResourceType: 'instance',
@@ -109,6 +117,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
             tag('ci-runner:runner', name), tag('ci-runner:runner-id', runnerId), tag('ci-runner:label', m.label), tag('ci-runner:repo', m.repo),
             tag('ci-runner:job-id', m.job_id), tag('ci-runner:run-id', m.run_id), tag('ci-runner:head-sha', m.head_sha),
             tag('ci-runner:job-name', m.job_name),
+            tag('ci-runner:capacity', m.label), tag('ci-runner:vcpus', vcpus), tag('ci-runner:arch', arch),
           ],
         }],
       });
@@ -151,7 +160,7 @@ function createHandler({ secret, fetch, ec2, sqs, now, env, log = console.log })
 
     try {
       const instance = await launchInstance(m, name, r.runner.id, r.encoded_jit_config);
-      log(JSON.stringify({ ...job, launched: instance, runner: name, label: m.label }));
+      log(JSON.stringify({ ...job, launched: instance, runner: name, label: m.label, ...shapeOf(m) }));
     } catch (e) {
       // Unregister now rather than leave it to the sweeper; the retry mints anew.
       await gh('DELETE', `/orgs/${org}/actions/runners/${r.runner.id}`, token).catch(() => {});
