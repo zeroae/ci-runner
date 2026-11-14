@@ -16,7 +16,7 @@ adoption variable `ZAE_CI_RUNNER`.
 - **No dependencies.** Each function is one CommonJS file under `functions/`,
   using only Node.js 22 built-ins and the `@aws-sdk` clients the runtime
   ships. The build inlines it into the template, so every byte counts against
-  the 51,200-byte limit.
+  the 1 MB limit.
 - **A `createHandler(deps)` factory** holds the logic and takes every side
   effect (AWS clients, `fetch`, `now`, `env`, `log`) as a dependency, so the
   tests run the real code with fakes. `exports.handler` only wires the real

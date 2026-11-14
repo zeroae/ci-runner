@@ -45,17 +45,22 @@ scripts/build-template.js   template.yaml -> build/template.yaml (git-ignored)
 
 - `make test`: `node --test test/*.test.js`.
 - `make build`: writes `build/template.yaml` and prints its size against the
-  **51,200-byte** limit (the largest template `aws cloudformation deploy` sends
-  without an S3 bucket). The build fails at or over it, and
-  `test/build.test.js` checks it too. To save room, the build drops whole-line
-  `//` comments from the inlined code and whole-line `#` comments from the
-  template (outside block scalars), so comment the source freely. If it fills
-  up again, the next step is deploying through an S3 bucket (`--s3-bucket`,
-  1 MB limit).
+  **1 MB** (1,048,576-byte) limit, the largest template CloudFormation accepts
+  from S3. The build fails at or over it, and `test/build.test.js` checks it
+  too. The build drops whole-line `//` comments from the inlined code and
+  whole-line `#` comments from the template (outside block scalars), so
+  comment the source freely.
 - `make deploy`: test, build, then `cloudformation deploy` with
-  `CAPABILITY_NAMED_IAM`, then print the outputs. It creates the stack the
-  first time and updates it after. Override `STACK`, `PROFILE`, `REGION` on the
-  command line if needed.
+  `CAPABILITY_NAMED_IAM` and `--s3-bucket $(BUCKET) --s3-prefix $(STACK)`, then
+  print the outputs. It uploads the template to the deploy bucket and deploys
+  from there, since a template sent inline must be under 51,200 bytes. It
+  creates the stack the first time and updates it after. The bucket is made
+  outside the stack, once per account (see "Deploy and update the stack" in
+  the runbook); `BUCKET` defaults to `$(STACK)-deploy-<account id>`, looked up
+  with `sts get-caller-identity`. Override `STACK`, `PROFILE`, `REGION`,
+  `BUCKET` on the command line if needed.
+- `make validate`: build, upload the template to the deploy bucket as
+  `$(STACK)/validate.yaml`, and validate it from there.
 
 ## The setup function
 

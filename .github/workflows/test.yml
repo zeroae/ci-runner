@@ -17,6 +17,6 @@ jobs:
         with:
           node-version: 22
       # The unit tests and the repo conventions, then the template build,
-      # which fails at or over the 51,200-byte inline limit.
+      # which fails at or over the S3 deploy's 1 MB limit.
       - run: make test
       - run: make build
