@@ -2,8 +2,6 @@ STACK   ?= ci-runner
 PROFILE ?= zeroae-code/AWSPowerUserAccess
 REGION  ?= us-east-1
 ORG     ?= zeroae
-SIZE    ?= ci-cpu-4
-ARCH    ?= x64
 AWS      = aws --profile $(PROFILE) --region $(REGION)
 # The deploy bucket, made outside the stack (docs/runbook.md). Looked up only when used.
 BUCKET  ?= $(STACK)-deploy-$(shell $(AWS) sts get-caller-identity --query Account --output text)
@@ -36,7 +34,7 @@ outputs: ## Print the stack's outputs (setup URL, webhook URL, secret ARN)
 	@$(AWS) cloudformation describe-stacks --stack-name $(STACK) \
 	  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text
 
-hand-launch: ## Launch one CI runner by hand for one ci-spot job; SIZE=ci-cpu-8 and ARCH=arm64 pick its shape (needs gh with admin:org)
+hand-launch: ## Launch one CI runner by hand for one ci-spot job of shape SIZE and ARCH, both required, e.g. SIZE=ci-cpu-4 ARCH=x64 (needs gh with admin:org)
 	STACK=$(STACK) PROFILE=$(PROFILE) REGION=$(REGION) SIZE=$(SIZE) ARCH=$(ARCH) scripts/hand-launch.sh
 
 runners: ## List the stack's CI runner instances that are not terminated
