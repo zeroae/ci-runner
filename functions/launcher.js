@@ -30,9 +30,10 @@ function appJwt(appId, pem, nowMs) {
   return `${data}.${crypto.sign('sha256', Buffer.from(data), pem).toString('base64url')}`;
 }
 
-// A message enqueued before the size labels has no vcpus or arch: it gets
-// today's shape.
-const shapeOf = (m) => ({ vcpus: m.vcpus === undefined ? 4 : m.vcpus, arch: m.arch === undefined ? 'x64' : m.arch });
+// The shape of a message enqueued before the size labels (no vcpus or arch),
+// and of an instance or task launched before the shape tags.
+const DEFAULT_SHAPE = { vcpus: 4, arch: 'x64' };
+const shapeOf = (m) => ({ vcpus: m.vcpus === undefined ? DEFAULT_SHAPE.vcpus : m.vcpus, arch: m.arch === undefined ? DEFAULT_SHAPE.arch : m.arch });
 
 function valid(m, org) {
   return m && typeof m.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(m.repo) && m.repo.split('/')[0] === org
@@ -83,8 +84,9 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
   }
 
   // vCPUs of this stack's live instances on one capacity, from the shape tags.
-  // An instance launched before them has no tags: it is 4 vCPUs, and its
-  // capacity is Spot only with the Spot marker (On-Demand has no InstanceLifecycle).
+  // An instance launched before them has no tags: it has the default shape's
+  // vCPUs, and its capacity is Spot only with the Spot marker (On-Demand has
+  // no InstanceLifecycle).
   async function vcpusIn(type) {
     let n = 0;
     let NextToken;
@@ -100,7 +102,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
         for (const i of res.Instances || []) {
           const t = Object.fromEntries((i.Tags || []).map((x) => [x.Key, x.Value]));
           const capacity = CAPACITY[t['ci-runner:capacity']] || (i.InstanceLifecycle === 'spot' ? 'spot' : 'on-demand');
-          if (capacity === type) n += Number(t['ci-runner:vcpus']) || 4;
+          if (capacity === type) n += Number(t['ci-runner:vcpus']) || DEFAULT_SHAPE.vcpus;
         }
       }
       NextToken = r.NextToken;
@@ -166,7 +168,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
           const d = await ecs.describeTasks({ cluster: env.CLUSTER, tasks: r.taskArns, include: ['TAGS'] });
           for (const task of d.tasks || []) {
             const t = Object.fromEntries((task.tags || []).map((x) => [x.key, x.value]));
-            if (task.lastStatus !== 'STOPPED' && CAPACITY[t['ci-runner:capacity']] === type) n += Number(t['ci-runner:vcpus']) || 4;
+            if (task.lastStatus !== 'STOPPED' && CAPACITY[t['ci-runner:capacity']] === type) n += Number(t['ci-runner:vcpus']) || DEFAULT_SHAPE.vcpus;
           }
         }
         nextToken = r.nextToken;

@@ -8,6 +8,8 @@ const crypto = require('node:crypto');
 const CAPACITY = ['ci-spot', 'ci-ondemand', 'ci-fargate-spot', 'ci-fargate'];
 const SIZE = { 'ci-cpu-2': 2, 'ci-cpu-4': 4, 'ci-cpu-8': 8, 'ci-cpu-16': 16 };
 const ARCH = ['x64', 'arm64'];
+// The shape of an instance launched before the shape tags.
+const DEFAULT_SHAPE = { vcpus: 4, arch: 'x64' };
 
 function reply(statusCode, text) {
   return { statusCode, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: text + '\n' };
@@ -93,7 +95,7 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
 
     const orig = {
       repo: t.repo, job_id: Number(t['job-id']), run_id: Number(t['run-id']), head_sha: t['head-sha'],
-      job_name: t['job-name'], label: t.label, vcpus: Number(t.vcpus) || 4, arch: t.arch || 'x64',
+      job_name: t['job-name'], label: t.label, vcpus: Number(t.vcpus) || DEFAULT_SHAPE.vcpus, arch: t.arch || DEFAULT_SHAPE.arch,
       // A task's labels are space-joined: ECS refuses a comma in a tag.
       labels: t.labels ? t.labels.split(i ? ',' : ' ') : ['self-hosted', t.label],
       installation_id: p.installation && p.installation.id,
