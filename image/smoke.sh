@@ -88,6 +88,12 @@ out=$(IDLE_SECONDS=2 timeout 60 "$idle" bash -c 'echo "Listening for Jobs"; slee
 rc=$?
 expect idle-exit-stops   "stopped in time" "$( ((SECONDS - t0 < 30)) && [[ $rc != 124 ]] && echo "stopped in time" || echo "rc $rc after $((SECONDS - t0))s")"
 expect idle-exit-says    yes "$(grep -q 'no job within 2s' <<<"$out" && echo yes || echo no)"
+# Like the real runner: run-helper.sh and the listener sit in their own
+# process group, and a TERM doesn't end them. After the grace, a KILL must.
+t0=$SECONDS
+out=$(IDLE_SECONDS=2 IDLE_GRACE_SECONDS=2 timeout 60 "$idle" bash -c 'trap "" TERM; set -m; echo "Listening for Jobs"; sleep 50 & wait' 2>&1)
+rc=$?
+expect idle-exit-kills   "stopped in time" "$( ((SECONDS - t0 < 30)) && [[ $rc != 124 ]] && echo "stopped in time" || echo "rc $rc after $((SECONDS - t0))s")"
 out=$(IDLE_SECONDS=2 timeout 60 "$idle" bash -c 'echo "Running job: build"; sleep 4; echo finished; exit 3' 2>&1)
 rc=$?
 expect idle-exit-keeps   "3 finished" "$rc $(grep -x finished <<<"$out")"

@@ -9,6 +9,10 @@
 # "Running job" within IDLE_SECONDS (default 900): a runner whose job went to
 # another runner then exits, and so does its task. Exits with the runner's
 # status. A TERM or INT (ECS stopping the task) is passed on to the runner.
+# A stop is a TERM to the runner's whole session, then a KILL after
+# IDLE_GRACE_SECONDS (default 30, as docker stop gives an EC2 runner): the
+# runner's helper and listener sit in their own process group, and a TERM
+# alone doesn't end them.
 set -u
 
 idle=${IDLE_SECONDS:-900}
@@ -16,12 +20,21 @@ if [[ ! $idle =~ ^[1-9][0-9]*$ ]]; then
   echo "ci-runner: IDLE_SECONDS must be a positive integer, not '$idle'" >&2
   exit 2
 fi
+grace=${IDLE_GRACE_SECONDS:-30}
+if [[ ! $grace =~ ^[0-9]+$ ]]; then
+  echo "ci-runner: IDLE_GRACE_SECONDS must be a whole number, not '$grace'" >&2
+  exit 2
+fi
 
 log=$(mktemp /tmp/ci-runner-idle-exit.XXXXXX)
-# Its own session, so a stop reaches run.sh, its helper and the listener.
+# Its own session (its id is $pid), so a stop reaches run.sh, its helper and
+# the listener, whatever their process groups.
 setsid "$@" > >(tee -a "$log") 2>&1 &
 pid=$!
-stop() { kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; }
+stop() {
+  pkill -TERM -s "$pid" 2>/dev/null
+  ( sleep "$grace"; pkill -KILL -s "$pid" ) > /dev/null 2>&1 &
+}
 trap stop TERM INT
 
 # Its sleep goes with it, rather than hold the output open for IDLE_SECONDS.
@@ -30,7 +43,7 @@ trap stop TERM INT
   wait "$s"
   if ! grep -q 'Running job' "$log"; then
     echo "ci-runner: no job within ${idle}s, stopping"
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    stop
   fi ) &
 watcher=$!
 
