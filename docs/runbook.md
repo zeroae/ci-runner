@@ -76,6 +76,13 @@ $AWS cloudformation deploy --stack-name ci-runner \
 `FargateVcpuCap` on the Fargate On-Demand one (`L-3032A538`); each covers x64
 and arm64 runners together.
 
+A budget is **soft**: a burst can go over it. The launcher handles queue
+messages in parallel, and each one counts only the runners already running, so
+jobs that queue at the same moment all see the same headroom. Seen live on
+2026-11-13: a consumer repo queued 8 Spot jobs at once, and all 8 launched,
+putting 36 of 24 Spot vCPUs in use. The owner chose to keep it soft. Size the
+EC2 quotas for the burst, not the budget.
+
 An override **sticks**: every later `make deploy` keeps it. After lowering a
 budget for a test, restore it explicitly, as above. To see the current values:
 
@@ -499,7 +506,8 @@ types.
 | `permission denied` on `/var/run/docker.sock` | the host's `docker` group isn't gid 123 |
 | `setup-python` fails, or picks up a broken Python | `AGENT_TOOLSDIRECTORY` isn't `/opt/hostedtoolcache` |
 | A deploy waits 60 minutes, then fails on the state lock | an `apply` ran on Spot and was reclaimed; it must be `ci-ondemand` |
-| A job sits "Waiting for a runner" | its capacity's vCPU budget is full, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, at most one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), at most one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
+| A job sits "Waiting for a runner" | its capacity's vCPU budget is full, the repo isn't in the group, the App isn't installed on it, or the repo is public. Also check the label contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`/`-4`/`-8`/`-16`), exactly one of `x64`/`arm64`, and otherwise only `linux`. The launcher's log tells the first case (`deferred`) apart from the rest (no line at all). A job that queued before the repo was turned on stays waiting after the fix: cancel and re-run it |
+| A job that ran on our runners before now sits "Waiting for a runner", and the webhook's log shows no `enqueued` line for it | missing size or architecture label: its `runs-on` names only its capacity (`self-hosted`, `ci-spot`). There are no defaults; add a size and an architecture label (`ci-cpu-4` and `x64` keep the old shape), then cancel and re-run the job |
 | An `arm64` runner's instance comes up and terminates without taking its job, and its console shows `no matching manifest for linux/arm64` | `ghcr.io/zeroae/ci-runner:latest` has no arm64 entry yet: the image workflow hasn't pushed a multi-arch `:latest` since it began building arm64. Run the image workflow on `main`, then re-run the job |
 | A job's runner was launched for another job (`$RUNNER_NAME` ends in another job id), and that other job sits "Waiting for a runner" | a swap. The webhook repairs it on the job's `in_progress` (its log says `swap`), and the launcher then launches a runner for the other job. No `swap` line: check the webhook's log for errors (its role needs `ec2:DescribeInstances` and `ec2:CreateTags`); cancel and re-run the waiting job |
 | A job fails "The runner has received a shutdown signal", "lost communication" or "exit code 130", next to a failed `ci-runner / <job>` check | Spot reclaim: re-run the job |

@@ -2,15 +2,15 @@
 # Launches one CI runner by hand: mints an org JIT config for the runner group
 # (with the owner's gh, which needs admin:org), renders its #cloud-config and
 # launches one Spot instance of size SIZE from the stack's launch template for
-# ARCH (x64 or arm64). The instance takes one job labelled [self-hosted, LABEL,
-# SIZE, ARCH] (or a subset of them) and terminates; given no job, it terminates
-# after the idle exit (15 minutes; IDLE_SECONDS overrides it).
+# ARCH. The instance takes one job labelled [self-hosted, LABEL, SIZE, ARCH] and
+# terminates; given no job, it terminates after the idle exit (15 minutes;
+# IDLE_SECONDS overrides it). SIZE and ARCH are required, as in the label
+# contract: neither has a default.
 #
-#   scripts/hand-launch.sh                  # or: make hand-launch
-#   SIZE=ci-cpu-8 scripts/hand-launch.sh    # or: make hand-launch SIZE=ci-cpu-8
-#   ARCH=arm64 scripts/hand-launch.sh       # or: make hand-launch ARCH=arm64
+#   SIZE=ci-cpu-4 ARCH=x64 scripts/hand-launch.sh    # or: make hand-launch SIZE=ci-cpu-4 ARCH=x64
+#   SIZE=ci-cpu-8 ARCH=arm64 scripts/hand-launch.sh  # or: make hand-launch SIZE=ci-cpu-8 ARCH=arm64
 #
-# Prints the instance id. Overrides: STACK PROFILE REGION ORG GROUP LABEL SIZE ARCH IDLE_SECONDS
+# Prints the instance id. Overrides: STACK PROFILE REGION ORG GROUP LABEL IDLE_SECONDS
 set -euo pipefail
 
 STACK=${STACK:-ci-runner}
@@ -19,8 +19,8 @@ REGION=${REGION:-us-east-1}
 ORG=${ORG:-zeroae}
 GROUP=${GROUP:-ci-runner}
 LABEL=${LABEL:-ci-spot}
-SIZE=${SIZE:-ci-cpu-4}
-ARCH=${ARCH:-x64}
+SIZE=${SIZE:?SIZE is required: one of ci-cpu-2, ci-cpu-4, ci-cpu-8, ci-cpu-16}
+ARCH=${ARCH:?ARCH is required: one of x64, arm64}
 # The size label's instance size, at 4 GB per vCPU, as the launcher maps it.
 case $SIZE in
   ci-cpu-2) size=large ;; ci-cpu-4) size=xlarge ;; ci-cpu-8) size=2xlarge ;; ci-cpu-16) size=4xlarge ;;

@@ -4,7 +4,7 @@ Single-use EC2 and Fargate runners for the GitHub Actions jobs of zeroae's
 private repos.
 
 Each queued job labelled `ci-spot` or `ci-ondemand` gets a fresh EC2
-instance of the size it asks for (a `.xlarge` by default). The instance runs that one job in `ghcr.io/zeroae/ci-runner:latest`
+instance of the size and architecture it asks for. The instance runs that one job in `ghcr.io/zeroae/ci-runner:latest`
 (GitHub's runner image on Ubuntu 24.04, plus general tools) and then
 terminates. Each job labelled `ci-fargate-spot` or `ci-fargate` gets a fresh
 Fargate task instead, from the same image, which runs that one job and exits.
@@ -34,11 +34,10 @@ On a Fargate capacity the size label sets the task's vCPUs and memory the
 same way.
 
 The architecture label is `x64` (Intel and AMD) or `arm64` (Graviton). Both
-architectures run the same image, built natively for each. For now both are
-optional and default to `ci-cpu-4` and `x64`, so today's `runs-on` keeps
-working. **They will become required**: add `ci-cpu-4` and `x64` (or the size
-you want) to every moved job now, so the change to the required contract
-doesn't strand it.
+architectures run the same image, built natively for each. Every job names
+one size label and one architecture label: neither has a default, so a job
+without them waits for a runner that never comes. A job that used to name only
+its capacity got 4 vCPUs and `x64`; add `ci-cpu-4` and `x64` to keep that shape.
 
 The CI runners hold at most 24 Spot, 8 On-Demand, 24 Fargate Spot and 8
 Fargate On-Demand vCPUs at once, across all repos (six, two, six and two
@@ -64,9 +63,13 @@ it's in both.
    jobs:
      tests:
        runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-spot","ci-cpu-8","x64"]') || 'ubuntu-latest' }}
+     build-arm:
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-spot","ci-cpu-4","arm64"]') || 'ubuntu-latest' }}
      apply:
        runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-ondemand","ci-cpu-2","x64"]') || 'ubuntu-latest' }}
    ```
+
+   Each `runs-on` names the full shape: capacity, size and architecture.
 
    While the variable is unset (the default), every job runs on `ubuntu-latest`,
    so the change can merge before the repo is switched on. Once the variable
@@ -82,12 +85,13 @@ it's in both.
 6. Set the variable (`gh variable set ZAE_CI_RUNNER --body 1`) and watch the
    canary.
 
-**The label contract:** `runs-on` must include `self-hosted` and exactly one of
-`ci-spot`, `ci-ondemand`, `ci-fargate-spot` or `ci-fargate`. It may include at most one size label
-(`ci-cpu-2`, `ci-cpu-4`, `ci-cpu-8`, `ci-cpu-16`), at most one of `x64` or
-`arm64`, and `linux`. A job with any other label (`aarch64`, an unknown
-`ci-cpu-*`, two size labels, both `x64` and `arm64`) is
-ignored, and it waits for a runner that never comes.
+**The label contract:** `runs-on` must include `self-hosted`, exactly one of
+`ci-spot`, `ci-ondemand`, `ci-fargate-spot` or `ci-fargate`, exactly one size label (`ci-cpu-2`, `ci-cpu-4`,
+`ci-cpu-8`, `ci-cpu-16`) and exactly one of `x64` or `arm64`. It may also
+include `linux`. None of them has a default. A job missing a size or an
+architecture label, or with any other label (`aarch64`, an unknown
+`ci-cpu-*`, two size labels, both `x64` and `arm64`), is ignored, and it waits
+for a runner that never comes.
 
 **What the job gets:** Ubuntu 24.04, the runner as user `runner` (passwordless
 sudo), Docker through the host's socket, the `docker compose` and `buildx`
