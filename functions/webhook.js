@@ -140,14 +140,15 @@ function createHandler({ secret, queue, ec2, ecs, env, log = console.log }) {
     const shape = shapeOf(job.labels);
     if (!shape) return reply(200, 'ignored: labels');
 
-    // The message's `label` is the capacity label, as queued messages carry it.
-    const wire = { label: shape.capacity, vcpus: shape.vcpus, arch: shape.arch };
+    // The shape as the queue message carries it. The message's `label` is the
+    // capacity label, as queued messages carry it.
+    const queuedShape = { label: shape.capacity, vcpus: shape.vcpus, arch: shape.arch };
     const msg = {
       repo: repo.full_name, job_id: job.id, run_id: job.run_id, head_sha: job.head_sha,
-      job_name: job.name, ...wire, labels: job.labels, installation_id: p.installation && p.installation.id,
+      job_name: job.name, ...queuedShape, labels: job.labels, installation_id: p.installation && p.installation.id,
     };
     await queue.send(msg);
-    log(JSON.stringify({ enqueued: msg.repo, job_id: msg.job_id, ...wire }));
+    log(JSON.stringify({ enqueued: msg.repo, job_id: msg.job_id, ...queuedShape }));
     return reply(202, 'enqueued');
   };
 }
