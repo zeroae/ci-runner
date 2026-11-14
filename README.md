@@ -67,9 +67,17 @@ it's in both.
        runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-spot","ci-cpu-4","arm64"]') || 'ubuntu-latest' }}
      apply:
        runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-ondemand","ci-cpu-2","x64"]') || 'ubuntu-latest' }}
+     lint:
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-fargate-spot","ci-cpu-2","arm64"]') || 'ubuntu-latest' }}
+     docs:
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-fargate","ci-cpu-4","x64"]') || 'ubuntu-latest' }}
    ```
 
    Each `runs-on` names the full shape: capacity, size and architecture.
+   A job on `ci-fargate-spot` or `ci-fargate` promises not to use Docker
+   (no `services:`, `container:`, Docker actions or `docker` commands): a
+   Fargate task has no Docker daemon
+   ([ADR-0001](docs/adr/0001-fargate-capacities-have-no-docker.md)).
 
    While the variable is unset (the default), every job runs on `ubuntu-latest`,
    so the change can merge before the repo is switched on. Once the variable
