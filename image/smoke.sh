@@ -100,5 +100,25 @@ expect idle-exit-keeps   "3 finished" "$rc $(grep -x finished <<<"$out")"
 out=$(IDLE_SECONDS=0 timeout 10 "$idle" true 2>&1)
 expect idle-exit-refuses "2" "$?"
 
+echo "== cargo jobs"
+# With CI_RUNNER_VCPUS the entrypoint caps cargo's jobs in a config file, not
+# in a CARGO_* variable rust-cache would hash. cargo isn't in the image, so
+# the file is checked, not a build.
+cfg=/home/runner/.cargo/config.toml
+rm -f "$cfg"
+IDLE_SECONDS=2 timeout 10 "$idle" true >/dev/null 2>&1
+expect cargo-none        no "$([[ -e $cfg ]] && echo yes || echo no)"
+out=$(CI_RUNNER_VCPUS=4 IDLE_SECONDS=2 timeout 10 "$idle" true 2>&1)
+expect cargo-config      '[build] jobs = 4' "$(paste -sd' ' "$cfg" 2>&1)"
+expect cargo-owner       runner "$(stat -c %U "$cfg" 2>&1)"
+expect cargo-says        yes "$(grep -q 'cargo jobs = 4' <<<"$out" && echo yes || echo no)"
+printf '[net]\ngit-fetch-with-cli = true\n' > "$cfg"
+out=$(CI_RUNNER_VCPUS=8 IDLE_SECONDS=2 timeout 10 "$idle" true 2>&1)
+expect cargo-keeps       '[net] git-fetch-with-cli = true' "$(paste -sd' ' "$cfg" 2>&1)"
+expect cargo-keeps-says  yes "$(grep -q 'exists, leaving it' <<<"$out" && echo yes || echo no)"
+rm -f "$cfg"
+out=$(CI_RUNNER_VCPUS=four IDLE_SECONDS=2 timeout 10 "$idle" true 2>&1)
+expect cargo-bad-value   "0 no" "$? $([[ -e $cfg ]] && echo yes || echo no)"
+
 if (( fail )); then echo "SMOKE FAILED"; exit 1; fi
 echo "SMOKE PASSED"
