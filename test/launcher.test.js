@@ -9,7 +9,7 @@ const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLen
 const PEM = privateKey.export({ type: 'pkcs1', format: 'pem' });
 const ENV = {
   GITHUB_ORG: 'zeroae', RUNNER_GROUP: 'ci-runner', STACK_NAME: 'ci-runner',
-  LAUNCH_TEMPLATE_ID: 'lt-0abc', SUBNET_IDS: 'subnet-a,subnet-b,subnet-c',
+  LAUNCH_TEMPLATE_ID: 'lt-0abc', ARM64_LAUNCH_TEMPLATE_ID: 'lt-0arm', SUBNET_IDS: 'subnet-a,subnet-b,subnet-c',
   QUEUE_URL: 'https://sqs.example/jobs', SPOT_VCPU_CAP: '24', ONDEMAND_VCPU_CAP: '8',
 };
 const JIT = 'ZW5jb2RlZGppdA==';
@@ -163,6 +163,33 @@ test('each size launches its instance size across the four x64 families in the t
   }
 });
 
+test('an arm64 job launches from the arm64 launch template, across the three Graviton families at its size', async () => {
+  const sizes = { 2: 'large', 4: 'xlarge', 8: '2xlarge', 16: '4xlarge' };
+  for (const label of ['ci-spot', 'ci-ondemand']) {
+    for (const [vcpus, size] of Object.entries(sizes)) {
+      // Budgets wide enough for a 16-vCPU On-Demand job.
+      const { handler, ec2, logs } = setup({ env: { ...ENV, SPOT_VCPU_CAP: '64', ONDEMAND_VCPU_CAP: '64' } });
+      const m = { ...MSG, label, vcpus: Number(vcpus), arch: 'arm64', labels: ['self-hosted', label, `ci-cpu-${vcpus}`, 'arm64'] };
+      assert.deepEqual(await handler(sqsEvent(m)), { batchItemFailures: [] });
+      const [version, fleet, deleted] = ['createVersion', 'createFleet', 'deleteVersions'].map((k) => ec2.calls.find((c) => c[0] === k)[1]);
+      assert.equal(version.LaunchTemplateId, 'lt-0arm');
+      assert.deepEqual(fleet.LaunchTemplateConfigs[0].LaunchTemplateSpecification, { LaunchTemplateId: 'lt-0arm', Version: '9' });
+      assert.deepEqual(deleted, { LaunchTemplateId: 'lt-0arm', Versions: ['9'] });
+      const want = ['m7g', 'm6g', 'm8g'].flatMap((f) => ['subnet-a', 'subnet-b', 'subnet-c'].map((s) => `${f}.${size} ${s}`));
+      const overrides = fleet.LaunchTemplateConfigs[0].Overrides;
+      assert.deepEqual(overrides.map((o) => `${o.InstanceType} ${o.SubnetId}`).sort(), want.sort(), `${label} ci-cpu-${vcpus}`);
+      assert.equal(tags(fleet)['ci-runner:arch'], 'arm64');
+      assert.equal(JSON.parse(logs.find((l) => l.includes('"launched"'))).arch, 'arm64');
+    }
+  }
+});
+
+test('an x64 job never touches the arm64 launch template', async () => {
+  const { handler, ec2 } = setup();
+  await handler(sqsEvent(MSG));
+  assert.ok(!JSON.stringify(ec2.calls).includes('lt-0arm'));
+});
+
 test('an On-Demand job is tagged with its capacity', async () => {
   const { handler, ec2 } = setup();
   await handler(sqsEvent({ ...MSG, label: 'ci-ondemand', vcpus: 8, labels: ['self-hosted', 'ci-ondemand', 'ci-cpu-8'] }));
@@ -181,7 +208,7 @@ test('a message from before the size labels (no vcpus, no arch) launches a 4-vCP
 });
 
 test('a message with an unknown size or architecture is dropped as malformed', async () => {
-  for (const bad of [{ vcpus: 3 }, { vcpus: 32 }, { vcpus: '8' }, { arch: 'arm64' }, { arch: 'X64' }]) {
+  for (const bad of [{ vcpus: 3 }, { vcpus: 32 }, { vcpus: '8' }, { arch: 'X64' }, { arch: 'ARM64' }, { arch: 'aarch64' }]) {
     const { handler, gh, logs } = setup();
     assert.deepEqual(await handler(sqsEvent({ ...MSG, ...bad })), { batchItemFailures: [] }, JSON.stringify(bad));
     assert.equal(gh.calls.length, 0, JSON.stringify(bad));
