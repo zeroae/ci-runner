@@ -111,7 +111,21 @@ test('the webhook secret is read once and cached', async () => {
   assert.equal(reads(), 1);
 });
 
-test('the label contract: self-hosted, exactly one capacity label, at most one size and one x64 label, and linux', async () => {
+test('an arm64 job is enqueued with arch arm64, on either capacity and at every size', async () => {
+  for (const cap of ['ci-spot', 'ci-ondemand']) {
+    for (const size of ['ci-cpu-2', 'ci-cpu-4', 'ci-cpu-8', 'ci-cpu-16']) {
+      const labels = ['self-hosted', cap, size, 'arm64'];
+      const { handler, sent } = setup();
+      assert.equal((await handler(delivery(job({ labels })))).statusCode, 202, labels.join(','));
+      assert.equal(sent[0].arch, 'arm64', labels.join(','));
+    }
+  }
+  const { handler, sent } = setup();
+  await handler(delivery(job({ labels: ['Self-Hosted', 'CI-Spot', 'ARM64'] })));
+  assert.deepEqual([sent[0].vcpus, sent[0].arch], [4, 'arm64']);
+});
+
+test('the label contract: self-hosted, exactly one capacity label, at most one size and one architecture label, and linux', async () => {
   const accepted = [
     ['self-hosted', 'ci-spot'],
     ['self-hosted', 'ci-ondemand'],
@@ -119,19 +133,22 @@ test('the label contract: self-hosted, exactly one capacity label, at most one s
     ['Self-Hosted', 'CI-Spot'],
     ['self-hosted', 'ci-spot', 'ci-cpu-8', 'x64'],
     ['self-hosted', 'linux', 'ci-ondemand', 'ci-cpu-2'],
+    ['self-hosted', 'ci-spot', 'arm64'],
+    ['self-hosted', 'linux', 'ci-spot', 'ci-cpu-8', 'arm64'],
   ];
   const ignored = [
     ['ci-spot'],
     ['self-hosted'],
     ['self-hosted', 'ci-spot', 'ci-ondemand'],
     ['self-hosted', 'ci-spot', 'gpu'],
-    ['self-hosted', 'ci-spot', 'arm64'],
     ['self-hosted', 'ci-spot', 'ci-cpu-4', 'ci-cpu-8'],
     ['self-hosted', 'ci-spot', 'ci-cpu-8', 'ci-cpu-8'],
     ['self-hosted', 'ci-spot', 'ci-cpu-3'],
     ['self-hosted', 'ci-spot', 'ci-cpu-32'],
-    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'arm64'],
     ['self-hosted', 'ci-spot', 'x64', 'arm64'],
+    ['self-hosted', 'ci-spot', 'ci-cpu-8', 'ARM64', 'x64'],
+    ['self-hosted', 'ci-spot', 'arm64', 'arm64'],
+    ['self-hosted', 'ci-spot', 'aarch64'],
     ['self-hosted', 'ci-spot', 'x64', 'x64'],
     ['ubuntu-latest'],
     [],
