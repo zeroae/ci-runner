@@ -2,6 +2,7 @@
 
 - Changing the stack, a function or the build: read `docs/stack.md`.
 - Operating the live stack (deploy, the wizard, logs, a lost job): read `docs/runbook.md`.
+- Proving a change live (deploying a branch to the shared stack): read "Proving a change live" in `docs/runbook.md` first.
 - Reviewing or merging a change: apply `CODING_STANDARDS.md`, and gate the merge per `docs/agents/review-gate.md`.
 
 ## Agent skills

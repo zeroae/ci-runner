@@ -97,6 +97,34 @@ numbers").
 The built template must stay under 1 MB, the S3 deploy's limit (`make build`
 prints its size and fails at the limit).
 
+## Proving a change live
+
+The live stack runs whatever branch was deployed last, for every consumer
+repo. Whoever deploys a branch owns the stack until they report back.
+
+- **One prover at a time.** Agree who holds the stack before deploying.
+- **Deploy on top of the latest work.** Merge the integration branch's tip
+  (or `main`) into your branch first, so your deploy carries everyone's
+  changes, not an older stack.
+- **Review first.** Deploy a change set that has had its `/code-review`.
+- **Keep shared budgets.** Consumer jobs draw on the same budgets, so prove a
+  deferral on On-Demand at a low budget, not by lowering Spot. Restore every
+  parameter you override from the same script, with a `trap`, so a failure
+  restores it too:
+
+  ```bash
+  trap '$AWS cloudformation deploy --stack-name ci-runner \
+    --template-file build/template.yaml --s3-bucket "$B" --s3-prefix ci-runner \
+    --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset \
+    --parameter-overrides OnDemandVcpuCap=8' EXIT
+  ```
+
+- **Image changes need `main`.** A change under `image/` reaches the runners
+  only once `image.yml` publishes it from `main` (see "The runner image in
+  ECR" in [stack.md](stack.md)); a branch deploy can't prove it.
+- **Clean up** what the proof made: throwaway canary branches, runner
+  registrations and tasks made by hand.
+
 ## Push the image to ECR
 
 `image.yml` pushes the runner image, with a SOCI v2 index, to the stack's
