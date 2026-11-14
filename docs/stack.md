@@ -89,7 +89,8 @@ deleted on termination, IMDSv2 required with hop limit 1, shutdown behaviour
 **no instance profile, no instance type and no user-data**.
 
 A launch is an EC2 Fleet of type `instant` for one instance: overrides for
-`m7i`/`m6i`/`m6a`/`m7a` `.xlarge` in each of the three subnets, Spot
+`m7i`/`m6i`/`m6a`/`m7a` at the job's size (`.large`, `.xlarge`, `.2xlarge` or
+`.4xlarge` for 2, 4, 8 or 16 vCPUs) in each of the three subnets, Spot
 `capacity-optimized` for `ci-spot`. `CreateFleet` can't override user-data, so
 each launch first adds a launch template version (source `$Default`, only
 `UserData`), launches from it, and deletes that version again. The outputs
@@ -123,9 +124,11 @@ sweeper (or GitHub, for ephemeral runners) removes it.
 ## Launching one by hand
 
 `make hand-launch` (`scripts/hand-launch.sh`) mints an org JIT config for the
-`ci-runner` group with labels `self-hosted`, `ci-spot` through the owner's
-`gh`, which needs `admin:org`. It then renders the user-data and launches one
-instance as above. It prints the instance id. `IDLE_SECONDS=120` shortens the
+`ci-runner` group with labels `self-hosted`, `ci-spot`, `SIZE` (default
+`ci-cpu-4`) and `ARCH` (default `x64`) through the owner's `gh`, which needs
+`admin:org`. It then renders the user-data and launches one Spot instance of
+that size as above, tagged with its shape (`make hand-launch SIZE=ci-cpu-8`
+launches a `.2xlarge`). It prints the instance id. `IDLE_SECONDS=120` shortens the
 idle exit for a test. `make runners` lists the stack's instances that are not
 terminated.
 
@@ -178,11 +181,15 @@ App's webhook points at), for each delivery:
 3. **Fence 3:** refuses (`403`, logged) unless `repository.visibility` is
    `private` and the owner is `GITHUB_ORG`.
 4. Ignores (`200`) actions other than `queued`, and jobs outside the label
-   contract: `self-hosted`, exactly one of `ci-spot`/`ci-ondemand`, and
-   otherwise only `linux`/`x64` (case-insensitive).
-5. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, labels,
-   installation_id}` (`label` is the capacity label, lower case) and answers
-   `202`.
+   contract (case-insensitive): `self-hosted`, exactly one of
+   `ci-spot`/`ci-ondemand`, at most one size label (`ci-cpu-2`, `-4`, `-8`,
+   `-16`), at most one `x64`, and optionally `linux`. `arm64` and an unknown
+   `ci-cpu-*` are outside it. A missing size or architecture label defaults to
+   `ci-cpu-4` and `x64`: this is the expand step, and the defaults go once
+   every repo names its shape.
+5. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
+   labels, installation_id}` (`label` is the capacity label, lower case;
+   `vcpus` is 2, 4, 8 or 16; `arch` is `x64`) and answers `202`.
 
 Its role allows only `GetSecretValue` on the secret and `SendMessage` on the
 queue.
@@ -194,7 +201,9 @@ fails 5 receives goes to `${stack}-jobs-dlq` (kept 14 days). The outputs are
 **launcher** (`functions/launcher.js`, fed one message at a time, reporting
 failures per message), for each job:
 
-1. Drops a malformed message, or one whose repo isn't in `GITHUB_ORG`.
+1. Drops a malformed message, or one whose repo isn't in `GITHUB_ORG`, or
+   whose `vcpus` or `arch` isn't served. A message with neither (enqueued
+   before the size labels) gets 4 vCPUs and `x64`.
 2. Signs an App JWT and gets an installation token for the job's
    installation. The token is cached until 5 minutes before it expires.
 3. `GET /repos/{repo}/actions/jobs/{job_id}`: anything but `queued` (or a
@@ -212,10 +221,13 @@ failures per message), for each job:
    `${stack}-<UTC YYYYmmddHHMMSS>-<job id>`, as the sweeper requires.
 6. Renders the `#cloud-config` and launches one instance as in "Launching one
    by hand": Spot `capacity-optimized` for `ci-spot`, On-Demand `lowest-price`
-   for `ci-ondemand`. Tags: `ci-runner:runner`, `ci-runner:runner-id`,
-   `ci-runner:label`, `ci-runner:repo`, `ci-runner:job-id`, `ci-runner:run-id`,
-   `ci-runner:head-sha` and `ci-runner:job-name`, plus the launch template's
-   `ci-runner:stack`.
+   for `ci-ondemand`, at the job's size. Tags: `ci-runner:runner`,
+   `ci-runner:runner-id`, `ci-runner:label`, `ci-runner:repo`,
+   `ci-runner:job-id`, `ci-runner:run-id`, `ci-runner:head-sha`,
+   `ci-runner:job-name`, and the shape: `ci-runner:capacity` (the capacity
+   label), `ci-runner:vcpus` and `ci-runner:arch`; plus the launch template's
+   `ci-runner:stack`. The `launched` log line carries `label`, `vcpus` and
+   `arch`.
 7. If no instance launches, it removes the registration it just minted and
    fails the message, which comes back 120 s later.
 
