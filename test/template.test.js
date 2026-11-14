@@ -152,7 +152,7 @@ test('the launcher\'s role runs only the two task definitions in the cluster, an
 });
 
 // Tasks get the instances' lifecycle (#30).
-test('a second notifier rule matches a Fargate Spot reclaim of the cluster\'s tasks, once per task', () => {
+test('a second notifier rule matches every change of a Fargate Spot reclaim in the cluster', () => {
   const rule = resource('NotifierTaskRule');
   assert.match(rule, /^ {4}Type: AWS::Events::Rule\n/);
   assert.match(rule, /Name: !Sub "\$\{AWS::StackName\}-notifier-tasks"\n/);
@@ -162,7 +162,6 @@ test('a second notifier rule matches a Fargate Spot reclaim of the cluster\'s ta
     '        detail:',
     '          clusterArn: [!GetAtt RunnerCluster.Arn]',
     '          stopCode: [SpotInterruption]',
-    '          lastStatus: [STOPPED]',
   ].join('\n'));
   assert.match(rule, /Arn: !GetAtt NotifierFunction\.Arn\n/);
   const perm = resource('NotifierTaskRulePermission');

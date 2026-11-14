@@ -31,7 +31,8 @@ function verifyJwt(auth) {
   return JSON.parse(Buffer.from(p, 'base64url'));
 }
 
-function fakeGitHub({ checkStatus = 201, jobStatus = 200 } = {}) {
+// existing: the check runs already on the commit.
+function fakeGitHub({ checkStatus = 201, jobStatus = 200, existing = [] } = {}) {
   const calls = [];
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
@@ -49,6 +50,10 @@ function fakeGitHub({ checkStatus = 201, jobStatus = 200 } = {}) {
     }
     assert.equal(init.headers.authorization, 'Bearer ghs_install', key);
     if (key === 'POST /repos/zeroae/app/check-runs') return res(checkStatus, { id: 9 });
+    if (key === 'GET /repos/zeroae/app/commits/abc123/check-runs') {
+      const name = u.searchParams.get('check_name');
+      return res(200, { check_runs: existing.filter((c) => c.name === name) });
+    }
     if (key === 'GET /repos/zeroae/app/actions/jobs/555') return res(jobStatus, { id: 555, name: 'build (x64, a)' });
     throw new Error('unexpected ' + key);
   };
@@ -81,8 +86,11 @@ test('an interruption of one of our instances creates a failed check run on the 
   const { handler, gh, described } = setup();
   await handler(EVENT);
   assert.deepEqual(described, ['i-0123']);
-  assert.deepEqual(gh.keys(), ['GET /repos/zeroae/app/installation', 'POST /app/installations/181/access_tokens', 'POST /repos/zeroae/app/check-runs']);
-  const { body } = gh.calls[2];
+  assert.deepEqual(gh.keys(), [
+    'GET /repos/zeroae/app/installation', 'POST /app/installations/181/access_tokens',
+    'GET /repos/zeroae/app/commits/abc123/check-runs', 'POST /repos/zeroae/app/check-runs',
+  ]);
+  const { body } = gh.calls[3];
   const runUrl = 'https://github.com/zeroae/app/actions/runs/444';
   assert.equal(body.name, 'ci-runner / tests');
   assert.equal(body.head_sha, 'abc123');
@@ -104,7 +112,7 @@ test('an interruption of one of our instances creates a failed check run on the 
 test('a job name falls back to the job id when the tag is empty', async () => {
   const { handler, gh } = setup({ inst: instance({ ...TAGS, 'ci-runner:job-name': '' }) });
   await handler(EVENT);
-  assert.equal(gh.calls[2].body.name, 'ci-runner / job 555');
+  assert.equal(gh.calls.find((c) => c.key === 'POST /repos/zeroae/app/check-runs').body.name, 'ci-runner / job 555');
 });
 
 for (const [why, inst] of [
@@ -138,6 +146,23 @@ test('an event with no instance id is ignored without describing anything', asyn
   assert.deepEqual(gh.keys(), []);
 });
 
+test('a reclaim already reported on the commit is not reported again', async () => {
+  const title = 'Spot capacity reclaimed: re-run this job';
+  const gh = fakeGitHub({ existing: [
+    { name: 'ci-runner / tests', external_id: '555', output: { title } },
+  ] });
+  const { handler, logs } = setup({ gh });
+  await handler(EVENT);
+  assert.ok(!gh.keys().includes('POST /repos/zeroae/app/check-runs'));
+  assert.match(logs.join('\n'), /already reported i-0123/);
+  // Another job's check, or a check of that name that isn't ours, doesn't count.
+  for (const other of [{ name: 'ci-runner / tests', external_id: '554', output: { title } }, { name: 'ci-runner / tests', external_id: '555', output: { title: 'Lint' } }]) {
+    const g = fakeGitHub({ existing: [other] });
+    await setup({ gh: g }).handler(EVENT);
+    assert.ok(g.keys().includes('POST /repos/zeroae/app/check-runs'), JSON.stringify(other));
+  }
+});
+
 test('a GitHub failure fails the invocation, so EventBridge retries it', async () => {
   const { handler } = setup({ gh: fakeGitHub({ checkStatus: 422 }) });
   await assert.rejects(handler(EVENT), /check-runs.*422/);
@@ -152,14 +177,14 @@ test('before the App exists the invocation fails', async () => {
 const CLUSTER_ARN = 'arn:aws:ecs:us-east-1:123456789012:cluster/ci-runner';
 const TASK_ARN = 'arn:aws:ecs:us-east-1:123456789012:task/ci-runner/0f1e2d3c4b5a69788796a5b4c3d2e1f0';
 
-// The ECS Task State Change the rule matches: the reclaimed task, stopped.
-// The detail carries no tags. The shape is ECS's, as aws-emulator publishes it
-// (see test/tasks-ecs.test.js).
+// The first ECS Task State Change the rule matches: the reclaimed task, told
+// to stop. The detail carries no tags. The shape is ECS's, as aws-emulator
+// publishes it (see test/tasks-ecs.test.js).
 const TASK_EVENT = {
   version: '0', id: 'e-2', 'detail-type': 'ECS Task State Change', source: 'aws.ecs',
   account: '123456789012', time: '2026-11-12T12:00:00Z', region: 'us-east-1', resources: [TASK_ARN],
   detail: {
-    taskArn: TASK_ARN, clusterArn: CLUSTER_ARN, lastStatus: 'STOPPED', desiredStatus: 'STOPPED',
+    taskArn: TASK_ARN, clusterArn: CLUSTER_ARN, lastStatus: 'RUNNING', desiredStatus: 'STOPPED',
     capacityProviderName: 'FARGATE_SPOT', stopCode: 'SpotInterruption', stoppedReason: 'Your Spot Task was interrupted.',
   },
 };
@@ -170,7 +195,7 @@ const TASK_TAGS = {
   ...TAGS, 'ci-runner:label': 'ci-fargate-spot', 'ci-runner:job-name': 'build _x64_ a_',
   'ci-runner:labels': 'self-hosted ci-fargate-spot ci-cpu-4 x64',
 };
-const task = (tags) => ({ taskArn: TASK_ARN, lastStatus: 'STOPPED', tags: Object.entries(tags).map(([key, value]) => ({ key, value })) });
+const task = (tags) => ({ taskArn: TASK_ARN, lastStatus: 'RUNNING', tags: Object.entries(tags).map(([key, value]) => ({ key, value })) });
 
 test('a Fargate Spot reclaim creates the same check run as an EC2 one, with the job\'s real name', async () => {
   const ec2 = setup({ inst: instance({ ...TAGS, 'ci-runner:job-name': 'build (x64, a)' }) });
@@ -192,7 +217,7 @@ test('a Fargate Spot reclaim creates the same check run as an EC2 one, with the 
 test('a task\'s job name falls back to its tag when GitHub can\'t say', async () => {
   const { handler, gh } = setup({ inst: null, tasks: [task(TASK_TAGS)], gh: fakeGitHub({ jobStatus: 404 }) });
   await handler(TASK_EVENT);
-  assert.equal(gh.calls.find((c) => c.key.endsWith('/check-runs')).body.name, 'ci-runner / build _x64_ a_');
+  assert.equal(gh.calls.find((c) => c.key === 'POST /repos/zeroae/app/check-runs').body.name, 'ci-runner / build _x64_ a_');
 });
 
 for (const [why, tasks] of [
