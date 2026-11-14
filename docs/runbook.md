@@ -371,6 +371,43 @@ types.
   moving when it runs well over 2 minutes. The first job after a deploy took
   about 3½ minutes, while the stack's functions were still cold. A hand
   launch (`make hand-launch`) took about 97 s to pick up its job.
+- **Fargate Spot against EC2 Spot** (the #28 spike, 2026-11-14, with
+  `scripts/prototype-fargate-spike.sh` on the `prototype/fargate-spot`
+  branch). One job, `cargo build --locked -p ruff` (ruff 0.17.5, debug,
+  cold: no cache), at 4 vCPU / 16 GB / 50 GB, the Fargate task running the
+  ECR image with its SOCI v2 index and `./run.sh --jitconfig` as its command.
+  The EC2 runners were hand-launched (`hand-launch.sh`, the launcher's
+  templates and fleet) because other repos' jobs held the stack's Spot budget
+  at the time:
+
+  | | Fargate x64 | EC2 x64 | Fargate arm64 | EC2 arm64 |
+  |---|---|---|---|---|
+  | CPU | Xeon 8259CL (Cascade Lake) | `m6a.xlarge` (EPYC 7R13) | Graviton3 | `m8g.xlarge` (Graviton4) |
+  | Queued to started | **27 s** | 102 s | **30 s** | 92 s |
+  | `RunTask` to `pullStartedAt` (provisioning) | 19.3 s | | 20.6 s | |
+  | `pullStartedAt` to `pullStoppedAt` (820 MB image) | 2.8 s | | 2.6 s | |
+  | Task started to `Listening for Jobs` | 4 s | | 4 s | |
+  | Build step | 248 s | 171 s | 168 s | 115 s |
+  | Queued to completed | 316 s | 306 s | 227 s | 230 s |
+  | Billed time | 321 s | ~316 s | 234 s | ~234 s |
+  | Price per hour | $0.0879 | $0.0700 + $0.0055 EBS | $0.0710 | $0.0926 + $0.0055 EBS |
+  | Cost per job | $0.0078 | $0.0066 | $0.0046 | $0.0064 |
+
+  A first run (ripgrep, a 22 s build) gave Fargate 22 s and 57 s queued to
+  started: in the 57 s, the arm64 runner was listening 33 s before GitHub
+  gave it the job. The pull takes about 3 s, so SOCI lazy-loads; the
+  provisioning before it (13 to 21 s) is the bulk of a Fargate start. A
+  task reaches `STOPPED` 24 to 29 s after its job completes, and is billed
+  until then. Fargate's CPUs are
+  older than the EC2 families' (one x64 task got a Sapphire Rapids 8488C, the
+  other a Cascade Lake), so the same build ran about 45% longer on both
+  architectures. Inside 3 of the 4 tasks, `nproc` said 8 and `free` 30 GB:
+  the task's limits aren't what a job that sizes itself by `nproc` sees.
+  Fargate prices: 4 vCPU and 16 GB at the Fargate Spot rates, plus 30 GB of
+  ephemeral storage over the free 20 GB; EC2: the Spot price of that type and
+  AZ at launch, plus 50 GB of gp3. An EC2 instance's end is estimated at 15 s
+  after its job, since a self-shutdown leaves no timestamp.
+
 - **vCPU quotas** in `us-east-1`, read 2026-11-13. Each budget draws on one
   quota, shared with every other workload in the account:
 
