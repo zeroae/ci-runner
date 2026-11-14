@@ -37,6 +37,10 @@ scripts/build-template.js   template.yaml -> build/template.yaml (git-ignored)
    - its own role `PowerUserPB-${AWS::StackName}-<name>`, with
      `PermissionsBoundary: arn:aws:iam::aws:policy/PowerUserAccess` and an
      inline policy of the same name granting only what that function needs.
+     The one exception: a role that passes a role (`iam:PassRole`) takes the
+     account's `ZAEPowerUserBoundary` instead, since `PowerUserAccess`
+     allows no `iam:PassRole` (see the launcher's boundary in "Launching for
+     queued jobs"). `test/conventions.test.js` checks both.
 4. A Function URL with `AuthType: NONE` needs two permissions:
    `lambda:InvokeFunctionUrl` (`FunctionUrlAuthType: NONE`) and
    `lambda:InvokeFunction` (`InvokedViaFunctionUrl: true`).
