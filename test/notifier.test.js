@@ -127,6 +127,17 @@ test('an interruption of one of our instances creates a failed check run on the 
   }
 });
 
+// GitHub may keep a lost job in_progress after its machine is gone: a re-run is
+// then refused and a plain cancel does nothing, so the report names the
+// force-cancel, and warns that it ends the run's other running jobs too.
+test('a reclaim report tells how to unstick a lost job GitHub keeps in progress', async () => {
+  const { handler, gh } = setup();
+  await handler(EVENT);
+  const { summary } = gh.calls.find((c) => c.key === 'POST /repos/zeroae/app/check-runs').body.output;
+  assert.ok(summary.includes('gh api -X POST repos/zeroae/app/actions/runs/444/force-cancel'), summary);
+  assert.match(summary, /every job still running/);
+});
+
 // A machine is reported only for the job its CI runner is running. The tags
 // say which job it was launched for, or took in a swap (the webhook re-tags it).
 for (const [why, job] of [

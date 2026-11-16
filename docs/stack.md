@@ -502,7 +502,12 @@ For each event it:
 6. Creates a check run on the head sha: name `ci-runner / <job name>` (or
    `job <id>` with no name), `completed`, conclusion `failure`, title
    `Spot capacity reclaimed: re-run this job`, a summary naming the job and
-   the instance or task and linking the run, and `details_url` the job's page.
+   the instance or task, linking the run, and telling a person to re-run a
+   failed job or, for a job GitHub keeps in progress, to force-cancel the run
+   first (its command, with the run's id, and the warning that it ends every
+   job still running in the run; see "Read a lost job" in `docs/runbook.md`), and
+   `details_url` the job's page. The title must not change: steps 5 and 8 find
+   a report by it.
    An EC2 reclaim and a Fargate one give the same check run, but for the
    summary's machine.
 7. Reads the job once more after posting: a job that finished with `success`

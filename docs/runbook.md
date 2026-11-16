@@ -286,14 +286,30 @@ since GitHub's code search misses private repos.
 
 ## Read a lost job
 
-When AWS reclaims a Spot instance or a Fargate Spot task, GitHub marks the job failed, with *The
+When AWS reclaims a Spot instance or a Fargate Spot task, GitHub usually marks the job failed, with *The
 runner has received a shutdown signal*, *lost communication with the server*,
 or (seen in the live FIS test) just *Process completed with exit code 130*
 on the running step. On the same commit there is a failed check run from the App, named
 `ci-runner / <job name>` and titled `Spot capacity reclaimed: re-run this job`.
-Its summary names the instance (or the task's id) and links the run. That is
-the whole story: re-run the failed job. Nothing retries it automatically.
+Its summary names the instance (or the task's id) and links the run. Re-run
+the failed job. Nothing retries it automatically.
 One check run per job: the notifier skips a job whose commit has it already.
+
+GitHub does not always fail the job. On 2026-11-16 an EC2 Spot reclaim left
+a job `in_progress`, its step still running, for 15 minutes after the
+instance was gone, until the run was force-cancelled. While the job is stuck
+like that, `gh run rerun` is refused (`This workflow is already running`)
+and `gh run cancel` is accepted but ends nothing. Force-cancel the run, then
+re-run its failed jobs:
+
+```bash
+gh api -X POST repos/zeroae/<repo>/actions/runs/<run id>/force-cancel
+gh run rerun <run id> --failed --repo zeroae/<repo>
+```
+
+A force-cancel ends **every** job still running in the run, the healthy ones
+too, so let the run's other jobs finish first. The reclaim check run's
+summary gives the force-cancel command with the run's id.
 
 AWS warns 2 minutes before it takes the machine, and a job can finish inside
 that. When the job ends with `success`, the check run turns `neutral`, titled
