@@ -135,10 +135,10 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
         title: RECLAIMED_TITLE,
         // GitHub may keep the lost job in_progress after the machine is gone:
         // a re-run is then refused and a plain cancel does nothing.
-        summary: `AWS reclaimed the Spot ${machine} running \`${job}\`. Re-run the job: ${run}\n\n`
+        summary: `AWS reclaimed the Spot ${machine} running \`${job}\`. If the job failed, re-run it: ${run}\n\n`
           + 'If the job still shows in progress, the run cannot be re-run, and a plain cancel does not end it. '
           + `Force-cancel the run, then re-run its failed jobs: \`gh api -X POST repos/${repo}/actions/runs/${t['run-id']}/force-cancel\`. `
-          + 'A force-cancel ends every job still running in the run, not only this one: let the others finish first.',
+          + 'A force-cancel ends every job still running in the run: let the others finish first.',
       },
     });
     log(`reported ${id}: ${repo} job ${jobId}`);
