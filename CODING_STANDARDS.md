@@ -38,6 +38,7 @@ restricted**: it names each action it needs, never `*`, grants no IAM action
 and no `iam:PassRole`, and writes only to the stack's own resources. Adding one
 changes a security control, so it goes to the owner first. Today none exists:
 a job finds no AWS credentials, and `test/conventions.test.js` keeps it so.
-On EC2 the instance metadata service is reachable from a job's containers
-(they share the host network), so an instance profile would hand its
-credentials to any job.
+The runner container shares the instance's network, and a job can start a
+container that does too through the Docker socket, so a job reaches the
+instance metadata service; an instance profile would hand its credentials to
+any job.

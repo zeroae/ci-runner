@@ -111,11 +111,12 @@ the host's Docker daemon, so a `docker run -v` source is a path on the host.
 `/tmp` and the runner's home (`/home/runner`: `$HOME`, and the work directory
 `_work` with the checkout and `$RUNNER_TEMP`) are at the same paths on both, so
 a bind mount from any of them works as it does on a GitHub-hosted runner,
-`mktemp` files and `~/` config included. Both are on the 50 GB root disk. The job's
-containers share the instance's network, so `localhost` is the instance's: a port a
-job publishes with `docker run -p` is reachable at `localhost`, and a server it starts
-on `127.0.0.1` is reachable from `docker build --network host`, as on a GitHub-hosted runner. A mount from anywhere else (`/opt`,
-`/etc`, `/var`) gets an empty host path. Nothing is pinned: every boot pulls
+`mktemp` files and `~/` config included. Both are on the 50 GB root disk. The runner
+container shares the instance's network, so a job's `localhost` is the instance's: a
+port a job publishes with `docker run -p` is reachable at `localhost`, and a server it
+starts on `127.0.0.1` is reachable from `docker build --network host`, as on a
+GitHub-hosted runner. A mount from anywhere else (`/opt`, `/etc`, `/var`) gets an
+empty host path. Nothing is pinned: every boot pulls
 `:latest`, and the image is rebuilt weekly, for linux/amd64 and linux/arm64,
 each built and smoke-tested on its own native runner.
 
