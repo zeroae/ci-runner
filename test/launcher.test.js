@@ -33,6 +33,7 @@ function verifyJwt(auth) {
 // A fake GitHub: routes keyed "METHOD path". Records every call.
 function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }, groups = [{ id: 1, name: 'Default' }, { id: 3, name: 'ci-runner' }] } = {}) {
   const calls = [];
+  const job = { status: jobStatus }; // a test can change it, as GitHub does
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
     const key = `${init.method || 'GET'} ${u.pathname}`;
@@ -45,7 +46,7 @@ function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }
       return res(201, { token: 'ghs_install', expires_at: new Date(T0 + 3600e3).toISOString() });
     }
     assert.equal(init.headers.authorization, 'Bearer ghs_install', key);
-    if (key === 'GET /repos/zeroae/app/actions/jobs/555') return res(jobHttp, jobHttp === 200 ? { id: 555, status: jobStatus } : { message: 'x' });
+    if (key === 'GET /repos/zeroae/app/actions/jobs/555') return res(jobHttp, jobHttp === 200 ? { id: 555, status: job.status } : { message: 'x' });
     if (key === 'GET /orgs/zeroae/actions/runner-groups') return res(200, { total_count: groups.length, runner_groups: groups });
     if (key === 'POST /orgs/zeroae/actions/runners/generate-jitconfig') {
       return jit.status === 201 ? res(201, { runner: { id: 77, name: body.name }, encoded_jit_config: JIT }) : res(jit.status, { message: 'nope' });
@@ -53,7 +54,7 @@ function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }
     if (key === 'DELETE /orgs/zeroae/actions/runners/77') return res(204, null);
     throw new Error('unexpected ' + key);
   };
-  return { fetch, calls, keys: () => calls.map((c) => c.key) };
+  return { fetch, calls, job, keys: () => calls.map((c) => c.key) };
 }
 
 // `running` lists the stack's instances: { lifecycle: 'spot' | undefined, state,
@@ -604,8 +605,8 @@ test('a queued job whose launch produced no runner gets a new launch at its chec
 test('a job held behind a concurrency group keeps its runner while it is up, and is launched again once that runner has gone', async () => {
   const running = [];
   const ec2 = fakeEc2({ running });
-  const { handler, sqs } = setup({ ec2 });
-  await handler(sqsEvent(MSG));
+  const { handler, sqs, gh } = setup({ ec2 });
+  await handler(sqsEvent(MSG)); // the job is queued behind the held group
   assert.equal(fleets(ec2), 1);
   running.push({ job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot' }); // idle, group still held
   await handler(sqsEvent(again(sqs, 0)));
@@ -614,11 +615,20 @@ test('a job held behind a concurrency group keeps its runner while it is up, and
   running[0].state = 'terminated'; // idled out before the group freed
   await handler(sqsEvent(again(sqs, 1)));
   assert.equal(fleets(ec2), 2, 'with no runner left, the job is launched again');
+  // The group frees: the job is taken by that runner, so it is in progress,
+  // and the next check drops the job and schedules nothing.
+  gh.job.status = 'in_progress';
+  await handler(sqsEvent(again(sqs, 2)));
+  assert.equal(fleets(ec2), 2, 'not launched again');
+  assert.equal(sqs.length, 3, 'and no further check');
 });
 
-test('a check for a job that has started or finished launches nothing and schedules no further check', async () => {
+// GitHub reports a cancelled job as status "completed" with conclusion
+// "cancelled" (probed on zeroae/ci-runner, run 43221273888, 2026-11-20), so
+// "completed" covers the cancelled case too.
+test('a check for a job that has started, finished or was cancelled launches nothing and schedules no further check', async () => {
   for (const jobStatus of ['in_progress', 'completed']) {
-    const ec2 = fakeEc2();
+    const ec2 = fakeEc2({ running: [{ job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot' }] });
     const { handler, sqs } = setup({ gh: fakeGitHub({ jobStatus }), ec2 });
     assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] });
     assert.equal(fleets(ec2), 0, jobStatus);
