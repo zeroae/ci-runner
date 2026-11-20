@@ -62,10 +62,11 @@ function fakeEc2({ fleet = { Instances: [{ InstanceIds: ['i-0123'] }], Errors: [
   const calls = [];
   return {
     calls,
+    running,
     describeInstances: async (input) => {
       calls.push(['describe', input]);
       const all = running.map((r, i) => ({ InstanceId: `i-r${i}`, State: { Name: r.state || 'running' }, ...(r.lifecycle ? { InstanceLifecycle: r.lifecycle } : {}),
-        Tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', r.capacity], ['ci-runner:vcpus', r.vcpus], ['ci-runner:arch', r.arch]]
+        Tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', r.capacity], ['ci-runner:vcpus', r.vcpus], ['ci-runner:arch', r.arch], ['ci-runner:job-id', r.job]]
           .filter(([, v]) => v !== undefined).map(([Key, Value]) => ({ Key, Value: String(Value) })) }));
       // Two pages, to check NextToken is followed.
       if (!input.NextToken) return { Reservations: [{ Instances: all.slice(0, 1) }], NextToken: all.length > 1 ? 'p2' : undefined };
@@ -84,7 +85,7 @@ function fakeEcs({ tasks = [], run } = {}) {
   const calls = [];
   const all = tasks.map((t, i) => ({
     taskArn: `arn:aws:ecs:us-east-1:1:task/ci-runner/t${i}`, desiredStatus: t.desired || 'RUNNING', lastStatus: t.last || 'RUNNING',
-    tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', t.capacity], ['ci-runner:vcpus', t.vcpus]]
+    tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', t.capacity], ['ci-runner:vcpus', t.vcpus], ['ci-runner:job-id', t.job]]
       .filter(([, v]) => v !== undefined).map(([key, value]) => ({ key, value: String(value) })),
   }));
   return {
@@ -306,6 +307,11 @@ const OLD_SPOT = { lifecycle: 'spot' };
 const OLD_OD = {};
 const OD_MSG = { ...MSG, label: 'ci-ondemand', labels: ['self-hosted', 'ci-ondemand'] };
 const launched = (ec2) => ec2.calls.some((c) => c[0] === 'createFleet');
+// The check a queued job schedules for itself (#51): the same message, later.
+const RECHECK = 300;
+const checkLater = (m) => ({ QueueUrl: ENV.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: RECHECK });
+const fleets = (ec2) => ec2.calls.filter((c) => c[0] === 'createFleet').length;
+const again = (sqs, i) => JSON.parse(sqs[i].MessageBody);
 
 test('the budget counts the stack\'s live instances by tag', async () => {
   const { handler, ec2 } = setup();
@@ -323,7 +329,7 @@ test('under the Spot budget, mixed sizes of both architectures leave room: the j
   const { handler, sqs } = setup({ ec2 });
   await handler(sqsEvent({ ...MSG, vcpus: 8 }));
   assert.ok(launched(ec2));
-  assert.deepEqual(sqs, []);
+  assert.deepEqual(sqs, [checkLater({ ...MSG, vcpus: 8 })]);
 });
 
 test('a job that brings its capacity exactly to the budget launches', async () => {
@@ -332,7 +338,7 @@ test('a job that brings its capacity exactly to the budget launches', async () =
   const { handler, sqs } = setup({ ec2 });
   await handler(sqsEvent(MSG));
   assert.ok(launched(ec2));
-  assert.deepEqual(sqs, []);
+  assert.deepEqual(sqs, [checkLater(MSG)]);
 });
 
 test('a job that would go over the Spot budget goes back on the queue with a delay, logged in vCPUs', async () => {
@@ -571,4 +577,82 @@ test('a failed RunTask removes the registration and fails the message, as a fail
     const err = JSON.parse(logs.find((l) => l.includes('"error"'))).error;
     assert.match(err, run === failed ? /^no task launched: Capacity is unavailable at this time: FARGATE_SPOT$/ : /AccessDenied/);
   }
+});
+
+// --- a queued job keeps its check (#51) ------------------------------------
+// A launch's runner can go without taking the job (it idles out, or the job
+// waits behind a concurrency group the first job holds). So each queued job
+// checks again later, with its own message: a live runner tagged with the job
+// is served and the check repeats; none means a launch.
+
+test('a launch schedules its own check: the same message, five minutes on', async () => {
+  const { handler, sqs } = setup();
+  await handler(sqsEvent(MSG));
+  assert.deepEqual(sqs, [checkLater(MSG)]);
+});
+
+test('a queued job whose launch produced no runner gets a new launch at its check', async () => {
+  const ec2 = fakeEc2(); // the launch left no instance behind
+  const { handler, sqs } = setup({ ec2 });
+  await handler(sqsEvent(MSG));
+  assert.equal(fleets(ec2), 1);
+  assert.deepEqual(await handler(sqsEvent(again(sqs, 0))), { batchItemFailures: [] });
+  assert.equal(fleets(ec2), 2, 'launched again');
+  assert.deepEqual(sqs[1], checkLater(MSG), 'and checks again');
+});
+
+test('a job held behind a concurrency group keeps its runner while it is up, and is launched again once that runner has gone', async () => {
+  const running = [];
+  const ec2 = fakeEc2({ running });
+  const { handler, sqs } = setup({ ec2 });
+  await handler(sqsEvent(MSG));
+  assert.equal(fleets(ec2), 1);
+  running.push({ job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot' }); // idle, group still held
+  await handler(sqsEvent(again(sqs, 0)));
+  assert.equal(fleets(ec2), 1, 'a live runner for the job is not replaced');
+  assert.deepEqual(sqs[1], checkLater(MSG), 'the check goes on');
+  running[0].state = 'terminated'; // idled out before the group freed
+  await handler(sqsEvent(again(sqs, 1)));
+  assert.equal(fleets(ec2), 2, 'with no runner left, the job is launched again');
+});
+
+test('a check for a job that has started or finished launches nothing and schedules no further check', async () => {
+  for (const jobStatus of ['in_progress', 'completed']) {
+    const ec2 = fakeEc2();
+    const { handler, sqs } = setup({ gh: fakeGitHub({ jobStatus }), ec2 });
+    assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] });
+    assert.equal(fleets(ec2), 0, jobStatus);
+    assert.deepEqual(sqs, [], jobStatus);
+  }
+});
+
+test('two checks in a row launch one runner, not two', async () => {
+  const running = [];
+  const ec2 = fakeEc2({ running });
+  const { handler, sqs } = setup({ ec2 });
+  await handler(sqsEvent(MSG));
+  running.push({ job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot' }); // its runner is up
+  await handler(sqsEvent(MSG)); // a repeat delivery of the original
+  await handler(sqsEvent(again(sqs, 0)));
+  assert.equal(fleets(ec2), 1);
+});
+
+test('a check of a message from before the size labels launches the default shape, and checks again', async () => {
+  const old = { ...MSG };
+  delete old.vcpus;
+  delete old.arch;
+  const ec2 = fakeEc2();
+  const { handler, sqs } = setup({ ec2 });
+  await handler(sqsEvent(old));
+  await handler(sqsEvent(again(sqs, 0)));
+  assert.equal(fleets(ec2), 2);
+  assert.deepEqual(sqs[1], checkLater(old));
+});
+
+test('a Fargate job served by its own task is not launched again, and its check goes on', async () => {
+  const ecs = fakeEcs({ tasks: [{ capacity: 'fargate-spot', vcpus: 4, job: FG_MSG.job_id }] });
+  const { handler, sqs } = setup({ ecs });
+  assert.deepEqual(await handler(sqsEvent(FG_MSG)), { batchItemFailures: [] });
+  assert.equal(runTaskInput(ecs), undefined, 'no RunTask');
+  assert.deepEqual(sqs, [checkLater(FG_MSG)]);
 });

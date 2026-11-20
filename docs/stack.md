@@ -318,8 +318,21 @@ failures per message), for each job:
 7. If no instance or task launches, it removes the registration it just
    minted and fails the message, which comes back 120 s later.
 
-There is no de-duplication on job id. A duplicate delivery launches a second
-runner at worst, and the idle exit and the sweeper remove it.
+**The check that follows (#51).** Every launch, and every check that finds the
+job still queued and served, sends the job's own message again, delayed 300 s
+(`RECHECK_SECONDS`), once the launch is done. A check first looks at the
+machines this stack tags with the job (`ci-runner:job-id`): a `pending` or
+`running` instance, or a task not yet told to stop. If one is serving the job,
+the check sends its own message on and launches nothing (its log line says
+`served`). If none is, the job is launched as above. The checks end when GitHub
+no longer has the job queued, which drops the message. This is why a job held
+behind a concurrency group the first job holds gets a runner once the group
+frees: a runner that idled out first is replaced at the next check. The sweeper
+does not do this, since it has no list of queued jobs. Not yet checked live:
+the behaviour is covered with fakes in `test/launcher.test.js`.
+
+There is no de-duplication on job id beyond that check. A duplicate delivery
+launches a second runner at worst, and the idle exit and the sweeper remove it.
 
 `cloudformation deploy` keeps a parameter's previous value unless it's
 overridden, so after lowering a budget for a test, restore it explicitly
