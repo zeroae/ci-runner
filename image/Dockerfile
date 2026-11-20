@@ -17,7 +17,7 @@ RUN apt-get update \
       > /etc/apt/sources.list.d/github-cli.list \
  && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
  && apt-get install -y --no-install-recommends \
-      gh jq make git curl zstd zip unzip python3 python3-venv python3-pip nodejs \
+      gh jq make git curl file zstd zip unzip python3 python3-venv python3-pip nodejs \
       build-essential pkg-config \
  && rm -rf /var/lib/apt/lists/*
 

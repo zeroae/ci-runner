@@ -40,6 +40,7 @@ check c++            c++ --version
 check pkg-config     pkg-config --version
 check git            git --version
 check curl           curl --version
+check file           file --version
 check zstd           zstd --version
 check zip            zip --version
 check unzip          unzip -v
