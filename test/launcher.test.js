@@ -112,13 +112,13 @@ function fakeEcs({ tasks = [], run } = {}) {
   };
 }
 
-function setup({ gh = fakeGitHub(), ec2 = fakeEc2(), ecs = fakeEcs(), env = ENV } = {}) {
+function setup({ gh = fakeGitHub(), ec2 = fakeEc2(), ecs = fakeEcs(), env = ENV, now = () => T0 } = {}) {
   const logs = [];
   const sent = [];
   const sqs = { sendMessage: async (input) => { sent.push(input); return {}; } };
   const handler = createHandler({
     secret: { get: async () => ({ app_id: 42, private_key: PEM, webhook_secret: 'w' }) },
-    fetch: gh.fetch, ec2, ecs, sqs, now: () => T0, env, log: (l) => logs.push(l),
+    fetch: gh.fetch, ec2, ecs, sqs, now, env, log: (l) => logs.push(l),
   });
   return { handler, gh, ec2, ecs, sqs: sent, logs };
 }
@@ -313,6 +313,9 @@ const RECHECK = 300;
 const checkLater = (m) => ({ QueueUrl: ENV.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: RECHECK });
 const fleets = (ec2) => ec2.calls.filter((c) => c[0] === 'createFleet').length;
 const again = (sqs, i) => JSON.parse(sqs[i].MessageBody);
+// A message after a launch: the count and the time of the job's last launch.
+const stamped = (m, launches = 1, at = T0) => ({ ...m, launches, launched_at: at });
+const MIN = 60e3;
 
 test('the budget counts the stack\'s live instances by tag', async () => {
   const { handler, ec2 } = setup();
@@ -330,7 +333,7 @@ test('under the Spot budget, mixed sizes of both architectures leave room: the j
   const { handler, sqs } = setup({ ec2 });
   await handler(sqsEvent({ ...MSG, vcpus: 8 }));
   assert.ok(launched(ec2));
-  assert.deepEqual(sqs, [checkLater({ ...MSG, vcpus: 8 })]);
+  assert.deepEqual(sqs, [checkLater(stamped({ ...MSG, vcpus: 8 }))]);
 });
 
 test('a job that brings its capacity exactly to the budget launches', async () => {
@@ -339,7 +342,7 @@ test('a job that brings its capacity exactly to the budget launches', async () =
   const { handler, sqs } = setup({ ec2 });
   await handler(sqsEvent(MSG));
   assert.ok(launched(ec2));
-  assert.deepEqual(sqs, [checkLater(MSG)]);
+  assert.deepEqual(sqs, [checkLater(stamped(MSG))]);
 });
 
 test('a job that would go over the Spot budget goes back on the queue with a delay, logged in vCPUs', async () => {
@@ -586,33 +589,38 @@ test('a failed RunTask removes the registration and fails the message, as a fail
 // checks again later, with its own message: a live runner tagged with the job
 // is served and the check repeats; none means a launch.
 
-test('a launch schedules its own check: the same message, five minutes on', async () => {
+test('a launch schedules its own check: its message, with the launch counted, five minutes on', async () => {
   const { handler, sqs } = setup();
   await handler(sqsEvent(MSG));
-  assert.deepEqual(sqs, [checkLater(MSG)]);
+  assert.deepEqual(sqs, [checkLater(stamped(MSG))]);
 });
 
 test('a queued job whose launch produced no runner gets a new launch at its check', async () => {
+  let t = T0;
   const ec2 = fakeEc2(); // the launch left no instance behind
-  const { handler, sqs } = setup({ ec2 });
+  const { handler, sqs } = setup({ ec2, now: () => t });
   await handler(sqsEvent(MSG));
   assert.equal(fleets(ec2), 1);
+  t = T0 + 15 * MIN; // a runner's idle exit later
   assert.deepEqual(await handler(sqsEvent(again(sqs, 0))), { batchItemFailures: [] });
   assert.equal(fleets(ec2), 2, 'launched again');
-  assert.deepEqual(sqs[1], checkLater(MSG), 'and checks again');
+  assert.deepEqual(sqs[1], checkLater(stamped(MSG, 2, t)), 'and checks again');
 });
 
 test('a job held behind a concurrency group keeps its runner while it is up, and is launched again once that runner has gone', async () => {
+  let t = T0;
   const running = [];
   const ec2 = fakeEc2({ running });
-  const { handler, sqs, gh } = setup({ ec2 });
+  const { handler, sqs, gh } = setup({ ec2, now: () => t });
   await handler(sqsEvent(MSG)); // the job is queued behind the held group
   assert.equal(fleets(ec2), 1);
   running.push({ job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot' }); // idle, group still held
+  t = T0 + 5 * MIN;
   await handler(sqsEvent(again(sqs, 0)));
   assert.equal(fleets(ec2), 1, 'a live runner for the job is not replaced');
-  assert.deepEqual(sqs[1], checkLater(MSG), 'the check goes on');
+  assert.deepEqual(sqs[1], checkLater(stamped(MSG)), 'the check goes on');
   running[0].state = 'terminated'; // idled out before the group freed
+  t = T0 + 20 * MIN;
   await handler(sqsEvent(again(sqs, 1)));
   assert.equal(fleets(ec2), 2, 'with no runner left, the job is launched again');
   // The group frees: the job is taken by that runner, so it is in progress,
@@ -651,12 +659,14 @@ test('a check of a message from before the size labels launches the default shap
   const old = { ...MSG };
   delete old.vcpus;
   delete old.arch;
+  let t = T0;
   const ec2 = fakeEc2();
-  const { handler, sqs } = setup({ ec2 });
-  await handler(sqsEvent(old));
+  const { handler, sqs } = setup({ ec2, now: () => t });
+  await handler(sqsEvent(old)); // no launch count: it launches at once
+  t = T0 + 15 * MIN;
   await handler(sqsEvent(again(sqs, 0)));
   assert.equal(fleets(ec2), 2);
-  assert.deepEqual(sqs[1], checkLater(old));
+  assert.deepEqual(sqs[1], checkLater(stamped(old, 2, t)));
 });
 
 test('a Fargate job served by its own task is not launched again, and its check goes on', async () => {
@@ -665,4 +675,32 @@ test('a Fargate job served by its own task is not launched again, and its check 
   assert.deepEqual(await handler(sqsEvent(FG_MSG)), { batchItemFailures: [] });
   assert.equal(runTaskInput(ecs), undefined, 'no RunTask');
   assert.deepEqual(sqs, [checkLater(FG_MSG)]);
+});
+
+// --- relaunches back off (#51, widened) ------------------------------------
+// A job whose runners never take it (the repo left the group, labels nothing
+// matches) is relaunched no sooner than 15 minutes after its last launch,
+// doubling for each launch after that, up to 60 minutes.
+
+test('a job whose runners never take it is relaunched with a growing gap: 15, then 30, then 60 minutes at most', async () => {
+  let t = T0;
+  const ec2 = fakeEc2(); // no runner ever stays up
+  const { handler, sqs } = setup({ ec2, now: () => t });
+  const checkAt = async (minutes) => { t = T0 + minutes * 60e3; await handler(sqsEvent(again(sqs, sqs.length - 1))); };
+  await handler(sqsEvent(MSG));
+  assert.equal(fleets(ec2), 1, 'the first launch, at 0');
+  await checkAt(5);
+  assert.equal(fleets(ec2), 1, 'too soon at 5');
+  await checkAt(15);
+  assert.equal(fleets(ec2), 2, 'the second launch, 15 minutes on');
+  await checkAt(40);
+  assert.equal(fleets(ec2), 2, 'too soon, 25 minutes after the second');
+  await checkAt(45);
+  assert.equal(fleets(ec2), 3, 'the third launch, 30 minutes after the second');
+  await checkAt(100);
+  assert.equal(fleets(ec2), 3, 'too soon, 55 minutes after the third');
+  await checkAt(105);
+  assert.equal(fleets(ec2), 4, 'the fourth launch, 60 minutes after the third');
+  await checkAt(165);
+  assert.equal(fleets(ec2), 5, 'the gap stays at 60 minutes');
 });

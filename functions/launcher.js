@@ -30,6 +30,13 @@ const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x
 // runner that idled out, or never got the job, is replaced by the next check.
 // SQS allows a delay of up to 900 seconds.
 const RECHECK_SECONDS = 300;
+// A job whose runners never take it (the repo left the group, labels nothing
+// matches) is relaunched no sooner than this after its last launch: 15 minutes,
+// a runner's idle exit, for the first relaunch, doubling for each after, up to
+// 60 minutes. A held concurrency group still frees into a runner within the
+// hour. The message carries the count and the time of the job's last launch;
+// one without them (the webhook's, a swap's re-queue) has had none.
+const relaunchGapMs = (launches) => Math.min(15 * 2 ** (launches - 1), 60) * 60e3;
 
 const b64u = (s) => Buffer.from(s).toString('base64url');
 
@@ -249,6 +256,13 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
       return log(JSON.stringify({ ...job, served: served.id }));
     }
 
+    // Launched before and not served now: wait out the gap before a relaunch.
+    const launches = Number.isInteger(m.launches) && m.launches > 0 ? m.launches : 0;
+    if (launches && now() - m.launched_at < relaunchGapMs(launches)) {
+      await sqs.sendMessage(checkLater(m));
+      return log(JSON.stringify({ ...job, waiting: `relaunch ${launches + 1} from ${new Date(m.launched_at + relaunchGapMs(launches)).toISOString()}` }));
+    }
+
     // A soft budget: launches checked at the same moment may overshoot it. A
     // job that would go over it goes back on the queue as a new message, so
     // retries don't pile up towards the dead-letter queue.
@@ -279,7 +293,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     }
     // After the launch, so a failed send here never removes a live runner: the
     // retry then finds it served and sends the check.
-    await sqs.sendMessage(checkLater(m));
+    await sqs.sendMessage(checkLater({ ...m, launches: launches + 1, launched_at: now() }));
   }
 
   return async (event) => {
