@@ -686,11 +686,18 @@ test('a job whose runners never take it is relaunched with a growing gap: 15, th
   let t = T0;
   const ec2 = fakeEc2(); // no runner ever stays up
   const { handler, sqs } = setup({ ec2, now: () => t });
-  const checkAt = async (minutes) => { t = T0 + minutes * 60e3; await handler(sqsEvent(again(sqs, sqs.length - 1))); };
+  // Every check, too soon or not, must send the next one, or the job is lost.
+  const checkAt = async (minutes) => {
+    t = T0 + minutes * 60e3;
+    const before = sqs.length;
+    await handler(sqsEvent(again(sqs, sqs.length - 1)));
+    assert.equal(sqs.length, before + 1, `the check at ${minutes} sends the next check`);
+  };
   await handler(sqsEvent(MSG));
   assert.equal(fleets(ec2), 1, 'the first launch, at 0');
   await checkAt(5);
   assert.equal(fleets(ec2), 1, 'too soon at 5');
+  assert.deepEqual(sqs.at(-1), checkLater(stamped(MSG)), 'a check too soon keeps the launch count and time');
   await checkAt(15);
   assert.equal(fleets(ec2), 2, 'the second launch, 15 minutes on');
   await checkAt(40);
