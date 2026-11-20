@@ -30,6 +30,14 @@ test('a job sees /tmp and its home at the same paths as the host docker daemon',
   assert.match(out, /ghcr\.io\/zeroae\/ci-runner:latest \.\/run\.sh --jitconfig /);
 });
 
+test('the runner container shares the instance network, so a job reaches its localhost', () => {
+  // A port a job publishes with `docker run -p`, and a server it starts on
+  // 127.0.0.1 for `docker build --network host`, are on the instance's loopback.
+  const out = renderCloudConfig({ jitConfig: JIT });
+  const run = out.slice(out.indexOf('docker run -d'), out.indexOf('./run.sh'));
+  assert.match(run, / --network host /);
+});
+
 test('the host home is seeded from the image before it is mounted over the runner', () => {
   // The image keeps the runner itself in /home/runner; an empty host dir
   // mounted there would hide run.sh.

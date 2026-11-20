@@ -43,7 +43,7 @@ docker run --rm --user 0 --entrypoint cp -v ${HOME_DIR}:/seed ${image} -a ${HOME
 install -d -m 1777 /var/tmp/ci-runner
 mount --bind /var/tmp/ci-runner /tmp || exit 1
 
-docker run -d --init --name ci-runner \\
+docker run -d --init --name ci-runner --network host \\
   -v /var/run/docker.sock:/var/run/docker.sock \\
   -v /tmp:/tmp \\
   -v ${HOME_DIR}:${HOME_DIR} \\
