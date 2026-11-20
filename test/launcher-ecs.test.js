@@ -73,12 +73,15 @@ const job = (label, vcpus, arch, extra = {}) => ({ Records: [{ messageId: 'm0', 
 }) }] });
 
 test('ECS accepts the launcher\'s RunTask for every Fargate capacity, size and architecture', { skip }, async () => {
+  // One job id per launch: a task still serving a job is not launched again (#51),
+  // and the emulator keeps the tasks of earlier launches.
+  let jobId = 1000;
   for (const [label, provider] of [['ci-fargate-spot', 'FARGATE_SPOT'], ['ci-fargate', 'FARGATE']]) {
     for (const vcpus of [2, 4, 8, 16]) {
       for (const arch of ['x64', 'arm64']) {
         const what = `${label} ${vcpus} ${arch}`;
         const { handler, logs } = launcher(fakeFetch());
-        assert.deepEqual(await handler(job(label, vcpus, arch)), { batchItemFailures: [] }, `${what}: ${logs.join('\n')}`);
+        assert.deepEqual(await handler(job(label, vcpus, arch, { job_id: jobId++ })), { batchItemFailures: [] }, `${what}: ${logs.join('\n')}`);
         const arn = JSON.parse(logs.find((l) => l.includes('"launched"'))).launched;
         const [task] = (await ecs.describeTasks({ cluster: 'ci-runner', tasks: [arn], include: ['TAGS'] })).tasks;
         assert.equal(task.capacityProviderName, provider, what);

@@ -118,7 +118,7 @@ function fakeGitHub(runners = [], job = {}) {
 async function launch() {
   const logs = [];
   const h = launcher.createHandler({
-    secret, fetch: fakeGitHub().fetch, ecs, ec2: {}, sqs: {}, now: Date.now, env, log: (l) => logs.push(l),
+    secret, fetch: fakeGitHub().fetch, ecs, ec2: {}, sqs: { sendMessage: async () => ({}) }, now: Date.now, env, log: (l) => logs.push(l),
   });
   const body = JSON.stringify({
     repo: 'zeroae/lib', job_id: 999, run_id: 888, head_sha: 'fff000', job_name: JOB_NAMES[999],

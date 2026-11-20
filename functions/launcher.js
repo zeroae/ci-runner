@@ -26,6 +26,18 @@ const ecsTag = ([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_'
 // without the ci-runner: prefix. The webhook and the notifier carry copies.
 const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x.key).replace(/^ci-runner:/, ''), x.Value ?? x.value]));
 
+// A queued job is checked again this many seconds after each check (#51): a
+// runner that idled out, or never got the job, is replaced by the next check.
+// SQS allows a delay of up to 900 seconds.
+const RECHECK_SECONDS = 300;
+// A job whose runners never take it (the repo left the group, labels nothing
+// matches) is relaunched no sooner than this after its last launch: 15 minutes,
+// a runner's idle exit, for the first relaunch, doubling for each after, up to
+// 60 minutes. A held concurrency group still frees into a runner within the
+// hour. The message carries the count and the time of the job's last launch;
+// one without them (the webhook's, a swap's re-queue) has had none.
+const relaunchGapMs = (launches) => Math.min(15 * 2 ** (launches - 1), 60) * 60e3;
+
 const b64u = (s) => Buffer.from(s).toString('base64url');
 
 function appJwt(appId, pem, nowMs) {
@@ -50,6 +62,8 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
   const org = env.GITHUB_ORG;
   const subnets = env.SUBNET_IDS.split(',');
   const budgets = { spot: env.SPOT_VCPU_CAP, 'on-demand': env.ONDEMAND_VCPU_CAP, 'fargate-spot': env.FARGATE_SPOT_VCPU_CAP, fargate: env.FARGATE_VCPU_CAP };
+  // The job's own message, delayed: its next check (#51).
+  const checkLater = (m) => ({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: RECHECK_SECONDS });
   const tokens = new Map(); // installation id -> { token, until }
   let app;
   let groupId;
@@ -87,12 +101,13 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     }
   }
 
-  // vCPUs of this stack's live instances on one capacity, from the shape tags.
-  // An instance launched before them has no tags: it has the default shape's
-  // vCPUs, and its capacity is Spot only with the Spot marker (On-Demand has
-  // no InstanceLifecycle).
-  async function vcpusIn(type) {
-    let n = 0;
+  // This stack's instances that are not terminated, one record each: its job
+  // (the ci-runner:job-id tag), its shape from the shape tags, and whether it
+  // is still serving that job (pending or running). An instance launched before
+  // the shape tags has the default shape, and its capacity is Spot only with
+  // the Spot marker (On-Demand has no InstanceLifecycle).
+  async function instancesLive() {
+    const out = [];
     let NextToken;
     do {
       const r = await ec2.describeInstances({
@@ -106,12 +121,12 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
         for (const i of res.Instances || []) {
           const t = tagsOf(i.Tags);
           const capacity = CAPACITY[t.capacity] || (i.InstanceLifecycle === 'spot' ? 'spot' : 'on-demand');
-          if (capacity === type) n += Number(t.vcpus) || DEFAULT_SHAPE.vcpus;
+          out.push({ id: i.InstanceId, job: t['job-id'], capacity, vcpus: Number(t.vcpus) || DEFAULT_SHAPE.vcpus, serving: ['pending', 'running'].includes(i.State.Name) });
         }
       }
       NextToken = r.NextToken;
     } while (NextToken);
-    return n;
+    return out;
   }
 
   // The tags a runner's instance or task carries: the job, for the swap
@@ -162,11 +177,11 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     return arn;
   }
 
-  // vCPUs of the cluster's tasks on one Fargate capacity, from the shape
-  // tags. A task counts until it is STOPPED: one told to stop (desired
-  // STOPPED) still holds its vCPUs while it deprovisions.
-  async function taskVcpusIn(type) {
-    let n = 0;
+  // The cluster's tasks, one record each, as instancesLive. A task holds its
+  // vCPUs until it is STOPPED: one told to stop (desired STOPPED) still holds
+  // them while it deprovisions, but is no longer serving its job.
+  async function tasksLive() {
+    const out = [];
     for (const desiredStatus of ['RUNNING', 'STOPPED']) {
       let nextToken;
       do {
@@ -175,13 +190,14 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
           const d = await ecs.describeTasks({ cluster: env.CLUSTER, tasks: r.taskArns, include: ['TAGS'] });
           for (const task of d.tasks || []) {
             const t = tagsOf(task.tags);
-            if (task.lastStatus !== 'STOPPED' && CAPACITY[t.capacity] === type) n += Number(t.vcpus) || DEFAULT_SHAPE.vcpus;
+            if (task.lastStatus === 'STOPPED') continue;
+            out.push({ id: task.taskArn, job: t['job-id'], capacity: CAPACITY[t.capacity], vcpus: Number(t.vcpus) || DEFAULT_SHAPE.vcpus, serving: desiredStatus === 'RUNNING' });
           }
         }
         nextToken = r.nextToken;
       } while (nextToken);
     }
-    return n;
+    return out;
   }
 
   async function launchInstance(m, name, runnerId, jitConfig) {
@@ -229,12 +245,29 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     if (!j) return log(JSON.stringify({ ...job, dropped: 'job not found' }));
     if (j.status !== 'queued') return log(JSON.stringify({ ...job, dropped: j.status }));
 
+    // One listing serves both checks. A job whose runner is still serving it is
+    // not launched again: its check goes on, so a runner that idles out without
+    // the job is replaced by a later check (#51).
+    const type = CAPACITY[m.label];
+    const machines = await (PROVIDER[m.label] ? tasksLive() : instancesLive());
+    const served = machines.find((x) => x.serving && x.job === String(m.job_id));
+    if (served) {
+      await sqs.sendMessage(checkLater(m));
+      return log(JSON.stringify({ ...job, served: served.id }));
+    }
+
+    // Launched before and not served now: wait out the gap before a relaunch.
+    const launches = Number.isInteger(m.launches) && m.launches > 0 ? m.launches : 0;
+    if (launches && now() - m.launched_at < relaunchGapMs(launches)) {
+      await sqs.sendMessage(checkLater(m));
+      return log(JSON.stringify({ ...job, waiting: `relaunch ${launches + 1} from ${new Date(m.launched_at + relaunchGapMs(launches)).toISOString()}` }));
+    }
+
     // A soft budget: launches checked at the same moment may overshoot it. A
     // job that would go over it goes back on the queue as a new message, so
     // retries don't pile up towards the dead-letter queue.
-    const type = CAPACITY[m.label];
     const budget = Number(budgets[type]);
-    const held = await (PROVIDER[m.label] ? taskVcpusIn(type) : vcpusIn(type));
+    const held = machines.filter((x) => x.capacity === type).reduce((n, x) => n + x.vcpus, 0);
     const { vcpus } = shapeOf(m);
     if (held + vcpus > budget) {
       await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
@@ -258,6 +291,9 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
       await gh('DELETE', `/orgs/${org}/actions/runners/${r.runner.id}`, token).catch(() => {});
       throw e;
     }
+    // After the launch, so a failed send here never removes a live runner: the
+    // retry then finds it served and sends the check.
+    await sqs.sendMessage(checkLater({ ...m, launches: launches + 1, launched_at: now() }));
   }
 
   return async (event) => {
