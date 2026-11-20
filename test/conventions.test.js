@@ -38,6 +38,18 @@ test('every IAM role and policy is PowerUserPB-${AWS::StackName}-*, and every ro
   assert.match(read('Makefile'), /--capabilities CAPABILITY_NAMED_IAM/);
 });
 
+test('no runner has a role a job can reach (CODING_STANDARDS.md, IAM)', () => {
+  // A job's containers share the instance's network, so IMDS would hand an
+  // instance profile to any job; a task role reaches a job the same way. Adding
+  // one is a security-control change for the owner first, so this fails until it is made.
+  const runners = resources.filter((r) => ['AWS::ECS::TaskDefinition', 'AWS::EC2::LaunchTemplate'].includes(r.type));
+  assert.ok(runners.length >= 3, 'the runner task definitions and launch templates');
+  for (const r of runners) {
+    assert.doesNotMatch(r.body, /TaskRoleArn|IamInstanceProfile/, `${r.name} gives a job a role (see CODING_STANDARDS.md, IAM)`);
+  }
+  assert.ok(!resources.some((r) => r.type === 'AWS::IAM::InstanceProfile'), 'an instance profile (see CODING_STANDARDS.md, IAM)');
+});
+
 // Read but deliberately not set by the template: a test or hand-run override.
 const OPTIONAL_ENV = new Set(['IDLE_SECONDS']);
 
