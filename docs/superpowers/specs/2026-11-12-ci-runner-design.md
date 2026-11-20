@@ -210,8 +210,9 @@ IPv4 address.
   overrides or `CreateFleet` of type `instant`; whatever launches one instance
   with that spread.
 - 50 GB gp3 root volume, deleted on termination.
-- **IMDSv2 required, hop limit 1**, so the Docker containers a job starts
-  can't reach the instance metadata service.
+- **IMDSv2 required, hop limit 1**: a Docker container a job starts on the
+  default bridge can't reach the instance metadata service. One started with
+  `--network host` shares the instance's network, and can.
 - `InstanceInitiatedShutdownBehavior: terminate`.
 - **Caps:** at most **6 Spot and 2 On-Demand** CI runners at once, across all
   repos, counted by tag. It is a soft cap: two launches at the same moment may

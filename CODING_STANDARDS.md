@@ -32,3 +32,13 @@ Grant the least the function does, scoped by the stack's tag
 (`ci-runner:stack`) or its own resources, never `*` on a write action
 without a condition. A new condition is checked live: some EC2 calls don't
 carry the keys their docs suggest (see `docs/traps.md`).
+
+A role a job can reach, a task role or an instance profile, is **very
+restricted**: it names each action it needs, never `*`, grants no IAM action
+and no `iam:PassRole`, and writes only to the stack's own resources. Adding one
+changes a security control, so it goes to the owner first. Today none exists:
+a job finds no AWS credentials, and `test/conventions.test.js` keeps it so.
+The runner container shares the instance's network, and a job can start a
+container that does too through the Docker socket, so a job reaches the
+instance metadata service; an instance profile would hand its credentials to
+any job.

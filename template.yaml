@@ -739,7 +739,11 @@ Resources:
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs: { VolumeSize: 50, VolumeType: gp3, DeleteOnTermination: true, Encrypted: true }
-        # IMDSv2 only, one hop: a job's containers can't reach the metadata service.
+        # IMDSv2 only, one hop. It still stops a container on another network from
+        # reaching IMDS. The runner container shares the instance's network, and so
+        # does any container a job starts with --network host through the Docker
+        # socket: they reach IMDS, and the user-data (the JIT config) with it. The
+        # instance has no profile, so IMDS holds no credentials (CODING_STANDARDS.md, IAM).
         MetadataOptions:
           HttpEndpoint: enabled
           HttpTokens: required
@@ -766,7 +770,11 @@ Resources:
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs: { VolumeSize: 50, VolumeType: gp3, DeleteOnTermination: true, Encrypted: true }
-        # IMDSv2 only, one hop: a job's containers can't reach the metadata service.
+        # IMDSv2 only, one hop. It still stops a container on another network from
+        # reaching IMDS. The runner container shares the instance's network, and so
+        # does any container a job starts with --network host through the Docker
+        # socket: they reach IMDS, and the user-data (the JIT config) with it. The
+        # instance has no profile, so IMDS holds no credentials (CODING_STANDARDS.md, IAM).
         MetadataOptions:
           HttpEndpoint: enabled
           HttpTokens: required
