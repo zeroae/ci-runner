@@ -211,7 +211,8 @@ IPv4 address.
   with that spread.
 - 50 GB gp3 root volume, deleted on termination.
 - **IMDSv2 required, hop limit 1**, so the Docker containers a job starts
-  can't reach the instance metadata service.
+  can't reach the instance metadata service, unless it is started with
+  `--network host`: that shares the instance's network, and reaches it.
 - `InstanceInitiatedShutdownBehavior: terminate`.
 - **Caps:** at most **6 Spot and 2 On-Demand** CI runners at once, across all
   repos, counted by tag. It is a soft cap: two launches at the same moment may
