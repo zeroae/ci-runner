@@ -739,8 +739,10 @@ Resources:
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs: { VolumeSize: 50, VolumeType: gp3, DeleteOnTermination: true, Encrypted: true }
-        # IMDSv2 only, one hop. The runner container shares the instance's network
-        # (--network host), so the hop limit no longer keeps a job's containers off the metadata service.
+        # IMDSv2 only, one hop. It still stops a container on another network from
+        # reaching the metadata service. The runner container shares the instance's
+        # network (--network host), so a job's containers can reach it; the instance
+        # has no profile, so IMDS holds no credentials (CODING_STANDARDS.md, IAM).
         MetadataOptions:
           HttpEndpoint: enabled
           HttpTokens: required
@@ -767,8 +769,10 @@ Resources:
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs: { VolumeSize: 50, VolumeType: gp3, DeleteOnTermination: true, Encrypted: true }
-        # IMDSv2 only, one hop. The runner container shares the instance's network
-        # (--network host), so the hop limit no longer keeps a job's containers off the metadata service.
+        # IMDSv2 only, one hop. It still stops a container on another network from
+        # reaching the metadata service. The runner container shares the instance's
+        # network (--network host), so a job's containers can reach it; the instance
+        # has no profile, so IMDS holds no credentials (CODING_STANDARDS.md, IAM).
         MetadataOptions:
           HttpEndpoint: enabled
           HttpTokens: required
