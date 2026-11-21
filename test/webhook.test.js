@@ -61,7 +61,7 @@ function job({ action = 'queued', labels = ['self-hosted', 'ci-spot', 'ci-cpu-4'
   return {
     action,
     workflow_job: {
-      id: 555, run_id: 444, head_sha: 'abc123', name: 'tests', labels,
+      id: 555, run_id: 444, run_attempt: 2, head_sha: 'abc123', name: 'tests', labels,
       ...(runner && { runner_name: runner, runner_id: 77 }),
       ...(conclusion && { conclusion }),
     },
@@ -439,4 +439,50 @@ test('a swap on an instance looks up no task', async () => {
   const { handler, described } = setup({ instances: [instance()], tasks: [fargateTask()] });
   assert.equal((await handler(delivery(job({ action: 'in_progress', runner: RUNNER })))).statusCode, 202);
   assert.ok(described.every((d) => d.Filters), 'only DescribeInstances');
+});
+
+// The job label: ci-job-<run_id>-<run_attempt>-<job key>-<matrix index>, here
+// for run 444, attempt 2 (the payload's).
+const SHAPE = ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'];
+
+test('a queued job with the job label of its own run and attempt is enqueued with the label', async () => {
+  const labels = [...SHAPE, 'ci-job-444-2-tests-0'];
+  const { handler, sent, logs } = setup();
+  assert.equal((await handler(delivery(job({ labels })))).statusCode, 202);
+  assert.deepEqual(sent.map((m) => [m.label, m.vcpus, m.arch, m.labels]), [['ci-spot', 4, 'x64', labels]]);
+  assert.equal(logs[0].enqueued, 'zeroae/app');
+});
+
+for (const [label, why] of [
+  ['ci-job-443-2-tests-0', 'job label of another run'],
+  ['ci-job-444-1-tests-0', 'job label of another attempt'],
+]) {
+  test(`a job whose job label names ${why.slice(13)} is ignored, and the log says why`, async () => {
+    const { handler, sent, logs } = setup();
+    const res = await handler(delivery(job({ labels: [...SHAPE, label] })));
+    assert.deepEqual([res.statusCode, res.body], [200, 'ignored: job label\n']);
+    assert.equal(sent.length, 0);
+    assert.deepEqual(logs, [{ ignored: 'zeroae/app', job_id: 555, label, why }]);
+  });
+}
+
+test('a job with two job labels is ignored, and the log says why', async () => {
+  const { handler, sent, logs } = setup();
+  const res = await handler(delivery(job({ labels: [...SHAPE, 'ci-job-444-2-tests-0', 'ci-job-444-2-lint-0'] })));
+  assert.deepEqual([res.statusCode, res.body, sent.length], [200, 'ignored: job label\n', 0]);
+  assert.deepEqual(logs, [{ ignored: 'zeroae/app', job_id: 555, label: 'ci-job-444-2-tests-0,ci-job-444-2-lint-0', why: 'two job labels' }]);
+});
+
+test('a job label with nothing after its run and attempt is ignored, and the log says why', async () => {
+  const { handler, sent, logs } = setup();
+  const res = await handler(delivery(job({ labels: [...SHAPE, 'ci-job-444-2-'] })));
+  assert.deepEqual([res.statusCode, res.body, sent.length], [200, 'ignored: job label\n', 0]);
+  assert.deepEqual(logs, [{ ignored: 'zeroae/app', job_id: 555, label: 'ci-job-444-2-', why: 'job label names no job' }]);
+});
+
+test('the job label is read case-insensitively', async () => {
+  const labels = [...SHAPE, 'CI-Job-444-2-Tests-0'];
+  const { handler, sent } = setup();
+  assert.equal((await handler(delivery(job({ labels })))).statusCode, 202);
+  assert.deepEqual(sent[0].labels, labels);
 });

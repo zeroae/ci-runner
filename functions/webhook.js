@@ -1,7 +1,8 @@
 'use strict';
 // webhook: GitHub workflow_job receiver behind a Function URL. Verifies the
-// delivery, applies the label contract and fence 3, and enqueues the job for
-// the launcher. It launches nothing itself, but repairs swaps (ADR-0003) and
+// delivery, applies the label contract, the job label (ADR-0004) and fence 3,
+// and enqueues the job for the launcher. It launches nothing itself, but
+// repairs swaps of jobs without the job label (ADR-0003) and
 // tells the notifier when a job of this stack's runners succeeds.
 // Inlined into the template; keep it one dependency-free CommonJS file.
 const crypto = require('node:crypto');
@@ -9,6 +10,7 @@ const crypto = require('node:crypto');
 const CAPACITY = ['ci-spot', 'ci-ondemand', 'ci-fargate-spot', 'ci-fargate'];
 const SIZE = { 'ci-cpu-2': 2, 'ci-cpu-4': 4, 'ci-cpu-8': 8, 'ci-cpu-16': 16 };
 const ARCH = ['x64', 'arm64'];
+const JOB_LABEL = 'ci-job-';
 // The shape of an instance or task launched before the shape tags, which
 // swap repair re-queues with it. The launcher carries a copy.
 const DEFAULT_SHAPE = { vcpus: 4, arch: 'x64' };
@@ -32,10 +34,11 @@ function signatureOk(key, raw, sig) {
 
 // The label contract: `self-hosted`, exactly one capacity label, exactly one
 // size label, exactly one architecture label, and optionally `linux`. None has
-// a default, so a swap only happens between runners of the same shape.
+// a default, so a swap only happens between runners of the same shape. A job
+// label, checked by jobLabelFault first, is no part of the shape.
 // Returns the job's shape, or null outside it.
 function shapeOf(labels) {
-  const ls = (labels || []).map((l) => String(l).toLowerCase());
+  const ls = (labels || []).map((l) => String(l).toLowerCase()).filter((l) => !l.startsWith(JOB_LABEL));
   const of = (set) => ls.filter((l) => set.includes(l));
   const capacities = of(CAPACITY);
   const sizes = of(Object.keys(SIZE));
@@ -44,6 +47,22 @@ function shapeOf(labels) {
   const known = ['self-hosted', 'linux', ...CAPACITY, ...Object.keys(SIZE), ...ARCH];
   if (!ls.every((l) => known.includes(l))) return null;
   return { capacity: capacities[0], vcpus: SIZE[sizes[0]], arch: archs[0] };
+}
+
+// The job label (ADR-0004), `ci-job-<run_id>-<run_attempt>-<job key>-<matrix
+// index>`: unique to one job, so the runner launched for the job, which
+// registers with the job's labels, can take no other. Optional for now: a job
+// without it is served as before. Returns why a job's labels break it, as
+// { label, why }, or null.
+function jobLabelFault(labels, job) {
+  const ls = (labels || []).map(String).filter((l) => l.toLowerCase().startsWith(JOB_LABEL));
+  if (!ls.length) return null;
+  if (ls.length > 1) return { label: ls.join(','), why: 'two job labels' };
+  const [, run, attempt, rest] = ls[0].toLowerCase().match(/^ci-job-(\d+)-(\d+)-(.*)$/) || [];
+  if (run !== String(job.run_id)) return { label: ls[0], why: 'job label of another run' };
+  if (attempt !== String(job.run_attempt)) return { label: ls[0], why: 'job label of another attempt' };
+  if (!rest) return { label: ls[0], why: 'job label names no job' };
+  return null;
 }
 
 // The job fields the instance or task carries, as tags.
@@ -158,6 +177,11 @@ function createHandler({ secret, queue, notifier, ec2, ecs, env, log = console.l
     if (p.action === 'in_progress') return repairSwap(p, repo, job);
     if (p.action === 'completed') return reportSuccess(p, repo, job);
     if (p.action !== 'queued') return reply(200, 'ignored: action');
+    const fault = jobLabelFault(job.labels, job);
+    if (fault) {
+      log(JSON.stringify({ ignored: repo.full_name, job_id: job.id, ...fault }));
+      return reply(200, 'ignored: job label');
+    }
     const shape = shapeOf(job.labels);
     if (!shape) return reply(200, 'ignored: labels');
 
