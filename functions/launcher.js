@@ -120,7 +120,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
         for (const i of res.Instances || []) {
           const t = tagsOf(i.Tags);
           const capacity = CAPACITY[t.capacity] || (i.InstanceLifecycle === 'spot' ? 'spot' : 'on-demand');
-          out.push({ id: i.InstanceId, job: t['job-id'], capacity, vcpus: Number(t.vcpus) || DEFAULT_SHAPE.vcpus, serving: ['pending', 'running'].includes(i.State.Name) });
+          out.push({ id: i.InstanceId, job: t['job-id'], runner: t['runner-id'], capacity, vcpus: Number(t.vcpus) || DEFAULT_SHAPE.vcpus, serving: ['pending', 'running'].includes(i.State.Name) });
         }
       }
       NextToken = r.NextToken;
@@ -190,7 +190,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
           for (const task of d.tasks || []) {
             const t = tagsOf(task.tags);
             if (task.lastStatus === 'STOPPED') continue;
-            out.push({ id: task.taskArn, job: t['job-id'], capacity: CAPACITY[t.capacity], vcpus: Number(t.vcpus) || DEFAULT_SHAPE.vcpus, serving: desiredStatus === 'RUNNING' });
+            out.push({ id: task.taskArn, job: t['job-id'], runner: t['runner-id'], capacity: CAPACITY[t.capacity], vcpus: Number(t.vcpus) || DEFAULT_SHAPE.vcpus, serving: desiredStatus === 'RUNNING' });
           }
         }
         nextToken = r.nextToken;
@@ -237,27 +237,50 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     }
   }
 
+  // Whether a machine's runner is busy on GitHub. A machine with no runner-id
+  // tag, or whose runner GitHub no longer has, is taken as not busy.
+  async function runnerBusy(x, token) {
+    if (!x.runner) return false;
+    const r = await gh('GET', `/orgs/${org}/actions/runners/${x.runner}`, token).catch((e) => { if (e.status !== 404) throw e; });
+    return Boolean(r && r.busy);
+  }
+
   async function handle(m) {
     const job = { repo: m.repo, job_id: m.job_id };
     const token = await installationToken(m.installation_id);
-    const j = await gh('GET', `/repos/${m.repo}/actions/jobs/${m.job_id}`, token).catch((e) => { if (e.status !== 404) throw e; });
-    if (!j) return log(JSON.stringify({ ...job, dropped: 'job not found' }));
-    if (j.status !== 'queued') return log(JSON.stringify({ ...job, dropped: j.status }));
+    // Whether GitHub still has the job queued; a job it hasn't is dropped, logged.
+    const queued = async () => {
+      const j = await gh('GET', `/repos/${m.repo}/actions/jobs/${m.job_id}`, token).catch((e) => { if (e.status !== 404) throw e; });
+      const dropped = !j ? 'job not found' : j.status !== 'queued' && j.status;
+      if (dropped) log(JSON.stringify({ ...job, dropped }));
+      return !dropped;
+    };
+    if (!(await queued())) return;
 
     // One listing serves both checks. A job whose runner is still serving it is
     // not launched again: its check goes on, so a runner that idles out without
-    // the job is replaced by a later check (#51).
+    // the job is replaced by a later check (#51). A runner busy while its job is
+    // still queued runs another job (a swap, which only a job without a job
+    // label can cause: ADR-0004), and so serves this one no more.
     const type = CAPACITY[m.label];
     const machines = await (PROVIDER[m.label] ? tasksLive() : instancesLive());
-    const served = machines.find((x) => x.serving && x.job === String(m.job_id));
-    if (served) {
-      await sqs.sendMessage(checkLater(m));
-      return log(JSON.stringify({ ...job, served: served.id }));
+    const serving = machines.filter((x) => x.serving && x.job === String(m.job_id));
+    const swapped = [];
+    for (const x of serving) {
+      if (!(await runnerBusy(x, token))) {
+        await sqs.sendMessage(checkLater(m));
+        return log(JSON.stringify({ ...job, served: x.id }));
+      }
+      swapped.push(x.id);
     }
+    // Every runner of the job is busy: one may have just taken the job itself.
+    if (swapped.length && !(await queued())) return;
 
     // Launched before and not served now: wait out the gap before a relaunch.
+    // A swapped job doesn't wait: its runner took another job, and it gets a
+    // runner now, as it did when the webhook re-queued it.
     const launches = Number.isInteger(m.launches) && m.launches > 0 ? m.launches : 0;
-    if (launches && now() - m.launched_at < relaunchGapMs(launches)) {
+    if (launches && !swapped.length && now() - m.launched_at < relaunchGapMs(launches)) {
       await sqs.sendMessage(checkLater(m));
       return log(JSON.stringify({ ...job, waiting: `relaunch ${launches + 1} from ${new Date(m.launched_at + relaunchGapMs(launches)).toISOString()}` }));
     }
@@ -270,7 +293,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     const { vcpus } = shapeOf(m);
     if (held + vcpus > budget) {
       await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
-      return log(JSON.stringify({ ...job, deferred: `${held}+${vcpus} of ${budget} ${type} vCPUs` }));
+      return log(JSON.stringify({ ...job, deferred: `${held}+${vcpus} of ${budget} ${type} vCPUs`, ...(swapped.length && { swapped }) }));
     }
 
     // The sweeper reads the UTC mint stamp in the name as the registration's
@@ -284,7 +307,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     try {
       const launch = PROVIDER[m.label] ? launchTask : launchInstance;
       const machine = await launch(m, name, r.runner.id, r.encoded_jit_config);
-      log(JSON.stringify({ ...job, launched: machine, runner: name, label: m.label, ...shapeOf(m) }));
+      log(JSON.stringify({ ...job, launched: machine, runner: name, label: m.label, ...shapeOf(m), ...(swapped.length && { swapped }) }));
     } catch (e) {
       // Unregister now rather than leave it to the sweeper; the retry mints anew.
       await gh('DELETE', `/orgs/${org}/actions/runners/${r.runner.id}`, token).catch(() => {});

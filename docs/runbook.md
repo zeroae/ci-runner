@@ -364,7 +364,9 @@ of:
 
 | Field | Meaning |
 |---|---|
-| `"launched": "i-..."`, `"runner"`, `"label"` | an instance is up for the job |
+| `"launched": "i-..."`, `"runner"`, `"label"` | an instance is up for the job; with `"swapped": [...]`, because the machines launched for it ran other jobs (a swap, see `docs/traps.md`) |
+| `"served": "i-..."` | a machine launched for the job is still up and its runner idle; the job is checked again in 5 minutes |
+| `"waiting": "relaunch <n> from <time>"` | the job's runners never took it; it is relaunched no sooner than that |
 | `"deferred": "20+8 of 24 spot vCPUs"` | the job's 8 vCPUs would take the capacity's 20 over its budget of 24; the job is back on the queue in 60 s |
 | `"dropped": "completed"` (or another status) | the job no longer waits (cancelled, or taken by another runner); nothing launched |
 | `"dropped": "job not found"` | GitHub answered 404 for the job |

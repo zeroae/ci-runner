@@ -82,9 +82,9 @@ function createHandler({ secret, queue, notifier, env, log = console.log }) {
 
   // A job on a runner of this stack launched for another job: a swap. Once
   // every job of our shape carries its job label none can happen (ADR-0004),
-  // so it is logged, not repaired. The runner's own job waits: the launcher's
-  // re-check (#51) sees the machine tagged with it serving, and launches it
-  // another runner only once that machine is gone.
+  // so it is logged, not repaired. The runner's own job is not stranded: the
+  // launcher's next check (#51) finds its runner busy while it is still
+  // queued, and launches it another runner.
   function logSwap(repo, job) {
     const launchedFor = launchJobOf(job.runner_name);
     if (launchedFor === null || launchedFor === job.id) return reply(200, 'ignored: no swap');

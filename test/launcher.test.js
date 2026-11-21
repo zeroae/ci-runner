@@ -30,8 +30,10 @@ function verifyJwt(auth) {
   return JSON.parse(Buffer.from(p, 'base64url'));
 }
 
-// A fake GitHub: routes keyed "METHOD path". Records every call.
-function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }, groups = [{ id: 1, name: 'Default' }, { id: 3, name: 'ci-runner' }] } = {}) {
+// A fake GitHub: routes keyed "METHOD path". Records every call. `runners`
+// maps a runner id to what GET /orgs/zeroae/actions/runners/<id> answers, or
+// to a function that returns it (it may change the job, as GitHub would).
+function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }, groups = [{ id: 1, name: 'Default' }, { id: 3, name: 'ci-runner' }], runners = {} } = {}) {
   const calls = [];
   const job = { status: jobStatus }; // a test can change it, as GitHub does
   const fetch = async (url, init = {}) => {
@@ -52,13 +54,20 @@ function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }
       return jit.status === 201 ? res(201, { runner: { id: 77, name: body.name }, encoded_jit_config: JIT }) : res(jit.status, { message: 'nope' });
     }
     if (key === 'DELETE /orgs/zeroae/actions/runners/77') return res(204, null);
+    const runner = key.match(/^GET \/orgs\/zeroae\/actions\/runners\/(\d+)$/);
+    if (runner && runners[runner[1]]) {
+      const r = runners[runner[1]];
+      return res(200, { id: Number(runner[1]), status: 'online', ...(typeof r === 'function' ? r() : r) });
+    }
+    if (runner) return res(404, { message: 'Not Found' });
     throw new Error('unexpected ' + key);
   };
   return { fetch, calls, job, keys: () => calls.map((c) => c.key) };
 }
 
 // `running` lists the stack's instances: { lifecycle: 'spot' | undefined, state,
-// and the shape tags capacity, vcpus, arch, each left off when undefined }.
+// and the tags capacity, vcpus, arch, job and runner (the runner id), each
+// left off when undefined }.
 function fakeEc2({ fleet = { Instances: [{ InstanceIds: ['i-0123'] }], Errors: [] }, running = [] } = {}) {
   const calls = [];
   return {
@@ -67,7 +76,7 @@ function fakeEc2({ fleet = { Instances: [{ InstanceIds: ['i-0123'] }], Errors: [
     describeInstances: async (input) => {
       calls.push(['describe', input]);
       const all = running.map((r, i) => ({ InstanceId: `i-r${i}`, State: { Name: r.state || 'running' }, ...(r.lifecycle ? { InstanceLifecycle: r.lifecycle } : {}),
-        Tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', r.capacity], ['ci-runner:vcpus', r.vcpus], ['ci-runner:arch', r.arch], ['ci-runner:job-id', r.job]]
+        Tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', r.capacity], ['ci-runner:vcpus', r.vcpus], ['ci-runner:arch', r.arch], ['ci-runner:job-id', r.job], ['ci-runner:runner-id', r.runner]]
           .filter(([, v]) => v !== undefined).map(([Key, Value]) => ({ Key, Value: String(Value) })) }));
       // Two pages, to check NextToken is followed.
       if (!input.NextToken) return { Reservations: [{ Instances: all.slice(0, 1) }], NextToken: all.length > 1 ? 'p2' : undefined };
@@ -86,7 +95,7 @@ function fakeEcs({ tasks = [], run } = {}) {
   const calls = [];
   const all = tasks.map((t, i) => ({
     taskArn: `arn:aws:ecs:us-east-1:1:task/ci-runner/t${i}`, desiredStatus: t.desired || 'RUNNING', lastStatus: t.last || 'RUNNING',
-    tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', t.capacity], ['ci-runner:vcpus', t.vcpus], ['ci-runner:job-id', t.job]]
+    tags: [['ci-runner:stack', 'ci-runner'], ['ci-runner:capacity', t.capacity], ['ci-runner:vcpus', t.vcpus], ['ci-runner:job-id', t.job], ['ci-runner:runner-id', t.runner]]
       .filter(([, v]) => v !== undefined).map(([key, value]) => ({ key, value: String(value) })),
   }));
   return {
@@ -683,6 +692,60 @@ test('a Fargate job served by its own task is not launched again, and its check 
   assert.deepEqual(await handler(sqsEvent(FG_MSG)), { batchItemFailures: [] });
   assert.equal(runTaskInput(ecs), undefined, 'no RunTask');
   assert.deepEqual(sqs, [checkLater(FG_MSG)]);
+});
+
+// --- a swap: the job's runner took another job (#56, widened) --------------
+// A runner registers with its job's labels, so only a job without a job label
+// can take it. Busy on GitHub while its own job is still queued, it runs that
+// other job, and serves this one no more: the job is launched again at once.
+
+for (const kind of ['instance', 'task']) {
+  const fargate = kind === 'task';
+  const msg = fargate ? FG_MSG : MSG;
+  const machines = (runner) => (fargate
+    ? { ecs: fakeEcs({ tasks: [{ capacity: 'fargate-spot', vcpus: 4, job: msg.job_id, runner }] }) }
+    : { ec2: fakeEc2({ running: [{ job: msg.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot', runner }] }) });
+  const a = fargate ? 'a task' : 'an instance';
+  const launched = (m) => (fargate ? (runTaskInput(m.ecs) ? 1 : 0) : fleets(m.ec2));
+
+  test(`${a} whose runner is busy while its job is still queued is a swap: the job is launched again at once`, async () => {
+    const m = machines(77);
+    const t = T0 + 5 * MIN; // well inside the relaunch gap
+    const { handler, sqs, logs } = setup({ ...m, gh: fakeGitHub({ runners: { 77: { busy: true } } }), now: () => t });
+    assert.deepEqual(await handler(sqsEvent(stamped(msg))), { batchItemFailures: [] });
+    assert.equal(launched(m), 1, 'launched, though the gap has not passed');
+    assert.deepEqual(sqs, [checkLater(stamped(msg, 2, t))], 'and checks again, the launch counted');
+    assert.deepEqual(JSON.parse(logs.find((l) => l.includes('"launched"'))).swapped, [fargate ? 'arn:aws:ecs:us-east-1:1:task/ci-runner/t0' : 'i-r0']);
+  });
+
+  test(`${a} whose runner is idle still serves its job`, async () => {
+    const m = machines(77);
+    const { handler, sqs } = setup({ ...m, gh: fakeGitHub({ runners: { 77: { busy: false } } }) });
+    await handler(sqsEvent(stamped(msg)));
+    assert.equal(launched(m), 0);
+    assert.deepEqual(sqs, [checkLater(stamped(msg))]);
+  });
+
+  test(`${a} whose runner is busy because it just took its own job launches nothing`, async () => {
+    const m = machines(77);
+    const gh = fakeGitHub({ runners: { 77: () => { gh.job.status = 'in_progress'; return { busy: true }; } } });
+    const { handler, sqs, logs } = setup({ ...m, gh });
+    assert.deepEqual(await handler(sqsEvent(stamped(msg))), { batchItemFailures: [] });
+    assert.equal(launched(m), 0);
+    assert.deepEqual(sqs, [], 'the job has started: no further check');
+    assert.match(logs.join('\n'), /"dropped":"in_progress"/);
+  });
+}
+
+test('a job is served while any one of its runners is idle, though another is busy', async () => {
+  const ec2 = fakeEc2({ running: [
+    { job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot', runner: 77 },
+    { job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot', runner: 78 },
+  ] });
+  const { handler, sqs } = setup({ ec2, gh: fakeGitHub({ runners: { 77: { busy: true }, 78: { busy: false } } }) });
+  await handler(sqsEvent(stamped(MSG)));
+  assert.equal(fleets(ec2), 0);
+  assert.deepEqual(sqs, [checkLater(stamped(MSG))]);
 });
 
 // --- relaunches back off (#51, widened) ------------------------------------

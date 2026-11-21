@@ -311,12 +311,11 @@ stamp>-<job id>` (a hand launch, a GitHub-hosted runner, another stack), or
 whose job id is the event's, is ignored (`200`, `ignored: no swap`).
 Otherwise it logs `{"anomaly": "runner of another job", "runner",
 "launched_for": <job id>, "took": {repo, job_id}}` and answers `200`. It
-re-queues and re-tags nothing. The machine's tags still name the job it was
-launched for, so the launcher's checks (#51) count that job as served (its
-log says `served`) and launch it another runner only once the machine is
-gone, at the end of the job it took; and a reclaim of the machine is not
-reported (the notifier finds its launch job not running on it). Until ADR-0004 the webhook repaired swaps instead
-(ADR-0003).
+re-queues and re-tags nothing. The job the runner was launched for is not
+stranded: the launcher's next check finds that runner busy while the job is
+still queued, and launches it another runner at once (below). A reclaim of
+the swapped machine is not reported (the notifier finds its launch job not
+running on it). Until ADR-0004 the webhook repaired swaps instead (ADR-0003).
 
 Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue and
 `lambda:InvokeFunction` on the notifier, and nothing on EC2 or ECS.
@@ -373,7 +372,15 @@ job still queued and served, sends the job's own message again, delayed 300 s
 machines this stack tags with the job (`ci-runner:job-id`): a `pending` or
 `running` instance, or a task not yet told to stop. If one is serving the job,
 the check sends its own message on and launches nothing (its log line says
-`served`). If none is, the job is launched as above, but no sooner than 15
+`served`). A machine whose runner is busy on GitHub (`GET
+/orgs/{org}/actions/runners/{ci-runner:runner-id}`) while the job is still
+queued is not serving it: its runner took another job, a swap (ADR-0004). When
+every machine of the job is so, the check reads the job again (the runner may
+have just taken it, which drops the message) and, still queued, launches it at
+once, with no gap, its log line carrying `swapped` (the machines' ids). A
+machine with no `ci-runner:runner-id` tag, or whose runner GitHub no longer
+has (404), counts as serving. If none is serving, the job is launched as
+above, but no sooner than 15
 minutes after its last launch, a gap that doubles for each launch after that, up
 to 60 minutes (its log line says `waiting` until then). So a job whose runners
 never take it (the repo left the group, labels nothing matches) costs about one
