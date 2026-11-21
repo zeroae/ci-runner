@@ -217,11 +217,13 @@ App's webhook points at), for each delivery:
    `-16`), exactly one of `x64`/`arm64`, and optionally `linux`. None has a
    default: a missing size or architecture label, an unknown `ci-cpu-*`, or
    both `x64` and `arm64`, are outside it. A job label (below) is allowed on
-   top, and checked first: a job with two, or one that names another run or
-   attempt or nothing after them, is ignored (`200`, `ignored: job label`)
+   top, and checked once the rest passes: a job with two, or one that leaves
+   out its run and attempt, names another run or attempt, has nothing after
+   them, or is over 255 characters, is ignored (`200`, `ignored: job label`)
    and logged as `{"ignored": <repo>, "job_id", "label", "why"}`, `why` being
-   `two job labels`, `job label of another run`, `job label of another
-   attempt` or `job label names no job`.
+   `two job labels`, `job label without its run and attempt`, `job label of
+   another run`, `job label of another attempt`, `job label names no job` or
+   `job label over 255 characters`.
 7. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
    labels, installation_id}` (`label` is the capacity label, lower case;
    `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
@@ -279,7 +281,8 @@ jobs:
 A caller with a matrix passes `${{ strategy.job-index }}` in the input too.
 GitHub refuses a runner label of 257 characters or more and silently cuts a
 256-character one to 255, so the runner would not carry the job's label
-(measured 2026-11-20 with `generate-jitconfig`). A 98-character job key is
+(measured 2026-11-20 with `generate-jitconfig`); the webhook ignores a job
+label over 255 characters. A 98-character job key is
 accepted and a 100-character one is a workflow file error, so with an 11-digit
 run id and a 3-digit matrix index a label stays under 130 characters, plus the
 input.

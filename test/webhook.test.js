@@ -453,11 +453,14 @@ test('a queued job with the job label of its own run and attempt is enqueued wit
   assert.equal(logs[0].enqueued, 'zeroae/app');
 });
 
-for (const [label, why] of [
-  ['ci-job-443-2-tests-0', 'job label of another run'],
-  ['ci-job-444-1-tests-0', 'job label of another attempt'],
+for (const [label, why, what] of [
+  ['ci-job-443-2-tests-0', 'job label of another run', 'names another run'],
+  ['ci-job-444-1-tests-0', 'job label of another attempt', 'names another attempt'],
+  ['ci-job-444-tests-0', 'job label without its run and attempt', 'leaves out the attempt'],
+  ['ci-job-444-2', 'job label without its run and attempt', 'stops at the attempt'],
+  [`ci-job-444-2-${'k'.repeat(243)}`, 'job label over 255 characters', 'is 256 characters long'],
 ]) {
-  test(`a job whose job label names ${why.slice(13)} is ignored, and the log says why`, async () => {
+  test(`a job whose job label ${what} is ignored, and the log says why`, async () => {
     const { handler, sent, logs } = setup();
     const res = await handler(delivery(job({ labels: [...SHAPE, label] })));
     assert.deepEqual([res.statusCode, res.body], [200, 'ignored: job label\n']);
@@ -485,4 +488,17 @@ test('the job label is read case-insensitively', async () => {
   const { handler, sent } = setup();
   assert.equal((await handler(delivery(job({ labels })))).statusCode, 202);
   assert.deepEqual(sent[0].labels, labels);
+});
+
+test('a job label just under GitHub\'s 255-character limit is accepted', async () => {
+  const labels = [...SHAPE, `ci-job-444-2-${'k'.repeat(242)}`];
+  const { handler, sent } = setup();
+  assert.equal((await handler(delivery(job({ labels })))).statusCode, 202);
+  assert.deepEqual(sent[0].labels, labels);
+});
+
+test('a job outside the label contract is ignored without a log line, whatever its job label', async () => {
+  const { handler, sent, logs } = setup();
+  const res = await handler(delivery(job({ labels: ['ubuntu-latest', 'ci-job-1-1-tests-0'] })));
+  assert.deepEqual([res.statusCode, res.body, sent.length, logs.length], [200, 'ignored: labels\n', 0, 0]);
 });
