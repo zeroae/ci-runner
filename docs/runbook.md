@@ -352,10 +352,12 @@ $AWS logs tail /aws/lambda/ci-runner-notifier --since 1d
 
 **The webhook** logs one JSON line per accepted job, `{"enqueued": "<repo>",
 "job_id": ..., "label": ...}`, and `{"refused": "<repo>", "visibility": ...}`
-for a job from any repo but a private `zeroae` one (fence 3), and `{"swap":
-"<runner>", "instance": "i-...", "took": {...}, "requeued": {...}}` (with
-`"task": "<task ARN>"` for a Fargate runner) for each swap it repairs: the runner launched for the `requeued` job started the `took`
-job instead. Everything else it ignores without a log line.
+for a job from any repo but a private `zeroae` one (fence 3), `{"ignored":
+"<repo>", "job_id": ..., "why": ...}` for a job of our shape with no job label,
+or a bad one (see "The job label" in `stack.md`), and `{"anomaly": "runner of
+another job", "runner": ..., "launched_for": <job id>, "took": {...}}` if a
+runner ever starts a job other than its own, which the job label should make
+impossible (`docs/traps.md`). Everything else it ignores without a log line.
 
 **The launcher** logs one JSON line per job, carrying the job's fields plus one
 of:

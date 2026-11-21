@@ -208,7 +208,8 @@ App's webhook points at), for each delivery:
 2. Ignores (`200`) any event but `workflow_job`.
 3. **Fence 3:** refuses (`403`, logged) unless `repository.visibility` is
    `private` and the owner is `GITHUB_ORG`.
-4. On `in_progress`, repairs a swap (below) and answers.
+4. On `in_progress`, logs a runner running another job than its own (below)
+   and answers.
 5. On `completed`, tells the notifier when the job succeeded on a runner of
    this stack (below) and answers.
 6. Ignores (`200`) actions other than `queued`, and jobs outside the label
@@ -216,8 +217,10 @@ App's webhook points at), for each delivery:
    `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`, `-4`, `-8`,
    `-16`), exactly one of `x64`/`arm64`, and optionally `linux`. None has a
    default: a missing size or architecture label, an unknown `ci-cpu-*`, or
-   both `x64` and `arm64`, are outside it. A job label (below) is allowed on
-   top, and checked once the rest passes: a job with two, or one that leaves
+   both `x64` and `arm64`, are outside it. A job label (below) is required on
+   top, and checked once the rest passes: a job with none is ignored (`200`,
+   `ignored: labels`) and logged as `{"ignored": <repo>, "job_id", "why": "no
+   job label"}`. A job with two, or one that leaves
    out its run and attempt, names another run or attempt, has nothing after
    them, or is over 255 characters, is ignored (`200`, `ignored: job label`)
    and logged as `{"ignored": <repo>, "job_id", "label", "why"}`, `why` being
@@ -228,16 +231,15 @@ App's webhook points at), for each delivery:
    labels, installation_id}` (`label` is the capacity label, lower case;
    `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
 
-**The job label** (ADR-0004). A job may carry one label unique to it,
+**The job label** (ADR-0004). A job must carry one label unique to it,
 `ci-job-<run_id>-<run_attempt>-<job key>-<matrix index>`, compared
 case-insensitively. The webhook accepts it only when it starts with
 `ci-job-<run_id>-<run_attempt>-` of the event's `workflow_job` and has
 something after that. It goes into the message's `labels` with the rest, the
 launcher mints the runner's JIT config with those labels, and so the runner
 launched for the job can take no job with another job label. GitHub gives a
-job to a runner whose labels include all of the job's, so that runner can
-still take a job of its shape that has no job label. It is optional for now:
-a job without it is served as before, and swaps are still repaired (below).
+job to a runner whose labels include all of the job's, so a job without one
+could take any runner of its shape: that is why the label is required.
 
 A workflow writes it in `runs-on`, with the job key typed by hand: inside
 `runs-on`, `github.job` evaluates to an empty string. `strategy.job-index` is
@@ -297,47 +299,22 @@ ignored, `200`), the webhook invokes the notifier asynchronously
 (about 3 deliveries per job: `queued`, `in_progress`, `completed`), so nothing
 about the App changes. The webhook does no GitHub call itself.
 
-**Swap repair** (ADR-0003, superseded by ADR-0004 once the job label is
-required). GitHub gives a queued job to any idle runner whose labels cover it,
-so a runner launched for job Y may take job X, unless X carries a job label. Left alone,
-X's own message is later dropped as not queued, and Y never gets a runner.
-On `workflow_job` `in_progress` the webhook reads `runner_name`:
+**A runner running another job** (ADR-0004). A runner can take only a job
+whose labels it carries, and each carries its own job's label, so a runner
+of this stack never runs another job. On `workflow_job` `in_progress` the
+webhook still reads `runner_name`: a name that isn't `${stack}-<14-digit
+stamp>-<job id>` (a hand launch, a GitHub-hosted runner, another stack), or
+whose job id is the event's, is ignored (`200`, `ignored: no swap`).
+Otherwise it logs `{"anomaly": "runner of another job", "runner",
+"launched_for": <job id>, "took": {repo, job_id}}` and answers `200`. It
+re-queues and re-tags nothing: the job the runner was launched for is
+relaunched by the launcher's next check (#51), and the machine's tags still
+name that job, so a reclaim of it is not reported (the notifier finds that
+job not running on it). Until ADR-0004 the webhook repaired swaps instead
+(ADR-0003).
 
-- a name that isn't `${stack}-<14-digit stamp>-<job id>` (a hand launch, a
-  GitHub-hosted runner, another stack), or whose job id is the event's, is
-  ignored (`200`) with no AWS call;
-- otherwise it describes the stack's `pending`/`running` instance tagged
-  `ci-runner:runner=<name>`, and if there is none, the cluster's task tagged
-  so among those whose desired status is `RUNNING` (`ListTasks`, then
-  `DescribeTasks` with their tags). No instance or task, or a
-  `ci-runner:job-id` tag already equal to the event's job (a repeated
-  delivery), is ignored too;
-- otherwise it **re-queues** the machine's job, rebuilt from its tags
-  (`repo`, `job-id`, `run-id`, `head-sha`, `job-name`, `label`, `vcpus`,
-  `arch`, `labels`; the event's installation id), so the launcher's "still
-  queued?" check launches it a runner or drops it. A task's `labels` are
-  split on spaces, an instance's on commas. A task's `job-name` is the
-  sanitized one (see "The Fargate capacities"); only tags read it, and the
-  notifier fetches the real name. An instance launched before those tags
-  existed re-queues as `ci-cpu-4`/`x64` with `self-hosted` and its capacity
-  label;
-- then **re-tags** the instance (`CreateTags`) or task (`TagResource`) with
-  the event's job (`ci-runner:repo`, `job-id`, `run-id`, `head-sha`,
-  `job-name`), so the notifier reports a reclaim on the commit of the job it
-  really ran. A task's values are sanitized as the launcher's are. It logs
-  `{"swap": <runner>, "instance" or "task", "took": {repo, job_id},
-  "requeued": {repo, job_id}}`, answering `202`.
-
-It queues before it tags: if the tag fails, a redelivery still sees the old
-tags and repairs again. Re-queueing a job that another runner already took is
-harmless: the launcher drops it.
-
-Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue,
-`lambda:InvokeFunction` on the notifier, `ec2:DescribeInstances`, and `ec2:CreateTags` only on instances tagged
-`ci-runner:stack=<stack>` and only for the five job tag keys. On ECS:
-`ecs:ListTasks` with the condition `ecs:cluster` = the cluster, and
-`ecs:DescribeTasks` and `ecs:TagResource` only on the cluster's tasks, the
-latter only for the five job tag keys (`aws:TagKeys`).
+Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue and
+`lambda:InvokeFunction` on the notifier, and nothing on EC2 or ECS.
 
 **The queue** `${stack}-jobs` has a 120 s visibility timeout. A message that
 fails 5 receives goes to `${stack}-jobs-dlq` (kept 14 days). The outputs are
@@ -377,8 +354,8 @@ failures per message), for each job:
    families of the job's architecture. Tags: `ci-runner:runner`,
    `ci-runner:runner-id`, `ci-runner:label`, `ci-runner:repo`,
    `ci-runner:job-id`, `ci-runner:run-id`, `ci-runner:head-sha`,
-   `ci-runner:job-name`, `ci-runner:labels` (the job's labels, comma-joined,
-   for the swap repair), and the shape: `ci-runner:capacity` (the capacity
+   `ci-runner:job-name`, `ci-runner:labels` (the job's labels, comma-joined),
+   and the shape: `ci-runner:capacity` (the capacity
    label), `ci-runner:vcpus` and `ci-runner:arch`; plus the launch template's
    `ci-runner:stack`. The `launched` log line carries `label`, `vcpus` and
    `arch`.
@@ -396,7 +373,7 @@ minutes after its last launch, a gap that doubles for each launch after that, up
 to 60 minutes (its log line says `waiting` until then). So a job whose runners
 never take it (the repo left the group, labels nothing matches) costs about one
 launch an hour, not one every check. The message carries `launches` and
-`launched_at` for this; one without them (the webhook's, a swap's re-queue) has
+`launched_at` for this; one without them (the webhook's) has
 had no launch and launches at once. The checks end when GitHub
 no longer has the job queued, which drops the message. This is why a job held
 behind a concurrency group the first job holds gets a runner once the group
@@ -538,8 +515,8 @@ vCPU tag counts as 4. EC2 instances and tasks never count towards each
 other's budgets.
 
 **A task's lifecycle** is an instance's: the sweeper stops it 2 hours after
-launch and keeps its runner's registration while it lives, the swap repair
-re-tags it, and the notifier reports a Fargate Spot reclaim (below).
+launch and keeps its runner's registration while it lives, and the notifier
+reports a Fargate Spot reclaim (below).
 
 ## Reporting a Spot reclaim: the notifier
 
@@ -569,16 +546,14 @@ For each event it:
 2. Signs an App JWT, finds the repo's installation
    (`GET /repos/{repo}/installation`) and gets its token.
 3. Reads the job from GitHub (`GET /repos/{repo}/actions/jobs/{job_id}`), the
-   job the tags name: the one the machine was launched for, or the one it took
-   in a swap (the webhook re-tags it). It **reports only a job the machine's CI
+   job the tags name: the one the machine was launched for, the only one its
+   runner can take (ADR-0004). It **reports only a job the machine's CI
    runner is running**: `status` `in_progress` and `runner_name` equal to the
    machine's `ci-runner:runner` tag. Otherwise it logs `ignored <id>: its runner
    is not running job <id> (...)` and posts nothing: the job is `queued`, or
    `completed`, or another CI runner runs it. The usual case is an idle CI
-   runner: another CI runner took the job it was launched for, it took none,
-   and so its tags are still the launch tags. A swapped job that the webhook
-   has not yet re-tagged, in the moments after it started, is missed the same
-   way.
+   runner: its job was cancelled, or another launch's runner for the same job
+   (a relaunch, #51) took it.
 4. Takes the job's real name from that job, falling back to the tag: a tag is
    cut at 256 characters, and a task's has `_` for brackets and commas. The
    webhook's word (step 8) carries GitHub's name too, so the two meet.
