@@ -1,9 +1,8 @@
 'use strict';
 // A task's lifecycle against real ECS shapes, from aws/aws-emulator
-// (./aws-emulator.js): the launcher runs a task, the webhook repairs a swap
-// on it (TagResource validates the characters, as ECS does), the sweeper
-// stops it, and the notifier reports a reclaim from the ECS Task State Change
-// the emulator publishes to EventBridge, matched by template.yaml's own rule.
+// (./aws-emulator.js): the launcher runs a task, the sweeper stops it, and
+// the notifier reports a reclaim from the ECS Task State Change the emulator
+// publishes to EventBridge, matched by template.yaml's own rule.
 // The emulator drops a task's tags once it is told to stop (AWS keeps them
 // readable through DescribeTasks, measured live); the tests rely on that only
 // where they say so.
@@ -14,7 +13,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { skip, startEmulator, network, taskDefinition } = require('./aws-emulator.js');
 const launcher = require('../functions/launcher.js');
-const webhook = require('../functions/webhook.js');
 const sweeper = require('../functions/sweeper.js');
 const notifier = require('../functions/notifier.js');
 
@@ -39,7 +37,6 @@ const ecs = {
     return r;
   },
   stopTask: op('StopTask'),
-  tagResource: op('TagResource'),
 };
 
 // template.yaml's NotifierTaskRule pattern, with the cluster's ARN for its
@@ -89,7 +86,7 @@ const secret = { get: async () => ({ app_id: 42, private_key: privateKey.export(
 // GitHub, faked: every job is queued and keeps its real name, the group
 // exists, JIT configs mint, and runners and check runs are recorded (and a
 // commit's check runs listed).
-const JOB_NAMES = { 999: 'build (x64, a)', 555: 'test (x64, b)' };
+const JOB_NAMES = { 999: 'build (x64, a)' };
 function fakeGitHub(runners = [], job = {}) {
   const calls = [];
   const fetch = async (url, init = {}) => {
@@ -128,43 +125,6 @@ async function launch() {
   const l = JSON.parse(logs.find((x) => x.includes('"launched"')));
   return { arn: l.launched, runner: l.runner };
 }
-
-const tagsOf = async (arn) => Object.fromEntries((await ecs.describeTasks({ cluster: 'ci-runner', tasks: [arn], include: ['TAGS'] }))
-  .tasks[0].tags.map((t) => [t.key, t.value]));
-
-test('a swap on a task: the job is re-queued from the task\'s tags, and ECS takes the re-tag', { skip }, async () => {
-  const { arn, runner } = await launch();
-  const sent = [];
-  const logs = [];
-  const h = webhook.createHandler({
-    secret, queue: { send: async (m) => sent.push(m) },
-    ec2: { describeInstances: async () => ({ Reservations: [] }), createTags: assert.fail },
-    ecs, env, log: (l) => logs.push(l),
-  });
-  const raw = JSON.stringify({
-    action: 'in_progress',
-    workflow_job: { id: 555, run_id: 444, head_sha: 'abc123', name: JOB_NAMES[555], labels: ['self-hosted', 'ci-fargate-spot', 'ci-cpu-4', 'x64'], runner_name: runner },
-    repository: { full_name: 'zeroae/app', visibility: 'private', owner: { login: 'zeroae' } },
-    installation: { id: 181 },
-  });
-  const sig = 'sha256=' + crypto.createHmac('sha256', 'whsec').update(raw).digest('hex');
-  const res = await h({ headers: { 'x-github-event': 'workflow_job', 'x-hub-signature-256': sig }, body: raw });
-  assert.equal(res.statusCode, 202, logs.join('\n'));
-
-  assert.equal(sent.length, 1);
-  assert.deepEqual(
-    { ...sent[0], job_name: undefined },
-    { repo: 'zeroae/lib', job_id: 999, run_id: 888, head_sha: 'fff000', job_name: undefined, label: 'ci-fargate-spot',
-      vcpus: 4, arch: 'x64', labels: ['self-hosted', 'ci-fargate-spot', 'ci-cpu-4', 'x64', 'linux'], installation_id: 181 },
-  );
-  const tags = await tagsOf(arn);
-  assert.deepEqual(
-    ['repo', 'job-id', 'run-id', 'head-sha', 'job-name'].map((k) => tags[`ci-runner:${k}`]),
-    ['zeroae/app', '555', '444', 'abc123', 'test _x64_ b_'],
-  );
-  assert.equal(tags['ci-runner:runner'], runner, 'the other tags stay');
-  await ecs.stopTask({ cluster: 'ci-runner', task: arn });
-});
 
 test('the sweeper keeps a live task\'s registration, stops the task after 2 hours, then removes the registration', { skip }, async () => {
   const { arn, runner } = await launch();

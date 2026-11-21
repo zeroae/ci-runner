@@ -35,7 +35,7 @@ const RECHECK_SECONDS = 300;
 // a runner's idle exit, for the first relaunch, doubling for each after, up to
 // 60 minutes. A held concurrency group still frees into a runner within the
 // hour. The message carries the count and the time of the job's last launch;
-// one without them (the webhook's, a swap's re-queue) has had none.
+// one without them (the webhook's) has had none.
 const relaunchGapMs = (launches) => Math.min(15 * 2 ** (launches - 1), 60) * 60e3;
 
 const b64u = (s) => Buffer.from(s).toString('base64url');
@@ -129,8 +129,8 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     return out;
   }
 
-  // The tags a runner's instance or task carries: the job, for the swap
-  // repair and the notifier, and the shape, for the budgets.
+  // The tags a runner's instance or task carries: the job, for the notifier
+  // and the re-check (#51), and the shape, for the budgets.
   function jobTags(m, name, runnerId, labelsSep) {
     const { vcpus, arch } = shapeOf(m);
     return [

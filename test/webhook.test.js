@@ -6,62 +6,33 @@ const { createHandler } = require('../functions/webhook.js');
 
 const SECRET = 'whsec-test';
 
-// instances: what DescribeInstances knows, as { InstanceId, Tags: { key: value } }.
-// The fake applies the tag filters the way EC2 does.
-// tasks: the cluster's tasks, as { taskArn, desiredStatus, tags: { key: value } }.
-function setup({ secretValue = { webhook_secret: SECRET }, instances = [], tasks = [] } = {}) {
+function setup({ secretValue = { webhook_secret: SECRET } } = {}) {
   const sent = [];
   const notified = [];
-  const described = [];
-  const tagged = [];
-  const taskTagged = [];
   const logs = [];
   let reads = 0;
   const handler = createHandler({
     secret: { get: async () => { reads++; return secretValue; } },
     queue: { send: async (msg) => { sent.push(msg); } },
     notifier: { send: async (msg) => { notified.push(msg); } },
-    ec2: {
-      describeInstances: async (input) => {
-        described.push(input);
-        const match = (i) => input.Filters.every((f) => !f.Name.startsWith('tag:') || f.Values.includes(i.Tags[f.Name.slice(4)]));
-        const Instances = instances.filter(match).map((i) => ({
-          InstanceId: i.InstanceId, State: { Name: 'running' },
-          Tags: Object.entries(i.Tags).map(([Key, Value]) => ({ Key, Value })),
-        }));
-        return { Reservations: Instances.length ? [{ Instances }] : [] };
-      },
-      createTags: async (input) => { tagged.push(input); },
-    },
-    ecs: {
-      listTasks: async (input) => {
-        described.push(input);
-        assert.equal(input.cluster, 'ci-runner');
-        return { taskArns: tasks.filter((t) => t.desiredStatus === (input.desiredStatus || 'RUNNING')).map((t) => t.taskArn) };
-      },
-      describeTasks: async (input) => {
-        assert.deepEqual([input.cluster, input.include], ['ci-runner', ['TAGS']]);
-        return {
-          tasks: tasks.filter((t) => input.tasks.includes(t.taskArn)).map((t) => ({
-            taskArn: t.taskArn, desiredStatus: t.desiredStatus, lastStatus: 'RUNNING',
-            tags: Object.entries(t.tags).map(([key, value]) => ({ key, value })),
-          })),
-        };
-      },
-      tagResource: async (input) => { taskTagged.push(input); return {}; },
-    },
-    env: { GITHUB_ORG: 'zeroae', STACK_NAME: 'ci-runner', CLUSTER: 'ci-runner' },
+    env: { GITHUB_ORG: 'zeroae', STACK_NAME: 'ci-runner' },
     log: (line) => logs.push(JSON.parse(line)),
   });
-  return { handler, sent, notified, described, tagged, taskTagged, logs, reads: () => reads };
+  return { handler, sent, notified, logs, reads: () => reads };
 }
 
+// The job label of the payload's job: run 444, attempt 2, key tests, index 0.
+const JOB_LABEL = 'ci-job-444-2-tests-0';
+
 // A workflow_job payload as GitHub sends it (only the fields that matter).
-function job({ action = 'queued', labels = ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'], visibility = 'private', owner = 'zeroae', runner, conclusion } = {}) {
+// The job carries JOB_LABEL after `labels`, unless `labels` has a job label of
+// its own or jobLabel is false.
+function job({ action = 'queued', labels = ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'], jobLabel = true, visibility = 'private', owner = 'zeroae', runner, conclusion } = {}) {
+  const all = jobLabel && !labels.some((l) => /^ci-job-/i.test(l)) ? [...labels, JOB_LABEL] : labels;
   return {
     action,
     workflow_job: {
-      id: 555, run_id: 444, run_attempt: 2, head_sha: 'abc123', name: 'tests', labels,
+      id: 555, run_id: 444, run_attempt: 2, head_sha: 'abc123', name: 'tests', labels: all,
       ...(runner && { runner_name: runner, runner_id: 77 }),
       ...(conclusion && { conclusion }),
     },
@@ -87,7 +58,7 @@ test('an accepted ci-spot job is enqueued with every field', async () => {
   assert.equal(res.statusCode, 202);
   assert.deepEqual(sent, [{
     repo: 'zeroae/app', job_id: 555, run_id: 444, head_sha: 'abc123', job_name: 'tests',
-    label: 'ci-spot', vcpus: 4, arch: 'x64', labels: ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64'], installation_id: 181,
+    label: 'ci-spot', vcpus: 4, arch: 'x64', labels: ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64', JOB_LABEL], installation_id: 181,
   }]);
 });
 
@@ -99,7 +70,7 @@ test('every size label is enqueued with its vCPUs and the architecture', async (
       assert.equal((await handler(delivery(job({ labels })))).statusCode, 202, labels.join(','));
       assert.deepEqual(
         { label: sent[0].label, vcpus: sent[0].vcpus, arch: sent[0].arch, labels: sent[0].labels },
-        { label: cap, vcpus, arch: 'x64', labels },
+        { label: cap, vcpus, arch: 'x64', labels: [...labels, JOB_LABEL] },
       );
     }
   }
@@ -242,7 +213,7 @@ test('other actions and other events are ignored', async () => {
   }
 });
 
-// A runner the launcher started for job 999 of run 888, and its instance.
+// A runner the launcher started for job 999 of run 888.
 const RUNNER = 'ci-runner-20261113120000-999';
 
 // The notifier is told when a job of this stack's runners finishes with
@@ -268,80 +239,35 @@ for (const [why, opts] of [
     assert.deepEqual(notified, []);
   });
 }
-const instance = (tags = {}) => ({
-  InstanceId: 'i-0abc',
-  Tags: {
-    'ci-runner:stack': 'ci-runner', 'ci-runner:runner': RUNNER, 'ci-runner:runner-id': '77',
-    'ci-runner:label': 'ci-spot', 'ci-runner:labels': 'self-hosted,ci-spot,ci-cpu-8,arm64,linux',
-    'ci-runner:capacity': 'ci-spot', 'ci-runner:vcpus': '8', 'ci-runner:arch': 'arm64',
-    'ci-runner:repo': 'zeroae/lib', 'ci-runner:job-id': '999', 'ci-runner:run-id': '888',
-    'ci-runner:head-sha': 'fff000', 'ci-runner:job-name': 'build',
-    ...tags,
-  },
-});
-
-test('a swap: the runner\'s own job is re-queued from its tags, and the instance is re-tagged with the job it runs', async () => {
-  const { handler, sent, tagged, logs } = setup({ instances: [instance()] });
+// A runner of this stack is named `${stack}-<14-digit stamp>-<job id>`, for
+// the job it was launched for. The job label means it takes no other job, so
+// one that does is logged and left alone (ADR-0004).
+test('a job in progress on a runner launched for another job is logged, and nothing is re-queued', async () => {
+  const { handler, sent, logs } = setup();
   const res = await handler(delivery(job({ action: 'in_progress', runner: RUNNER })));
-  assert.equal(res.statusCode, 202);
-  assert.deepEqual(sent, [{
-    repo: 'zeroae/lib', job_id: 999, run_id: 888, head_sha: 'fff000', job_name: 'build',
-    label: 'ci-spot', vcpus: 8, arch: 'arm64', labels: ['self-hosted', 'ci-spot', 'ci-cpu-8', 'arm64', 'linux'], installation_id: 181,
-  }]);
-  assert.deepEqual(tagged, [{
-    Resources: ['i-0abc'],
-    Tags: [
-      { Key: 'ci-runner:repo', Value: 'zeroae/app' }, { Key: 'ci-runner:job-id', Value: '555' },
-      { Key: 'ci-runner:run-id', Value: '444' }, { Key: 'ci-runner:head-sha', Value: 'abc123' },
-      { Key: 'ci-runner:job-name', Value: 'tests' },
-    ],
-  }]);
-  assert.deepEqual(logs, [{
-    swap: RUNNER, instance: 'i-0abc', took: { repo: 'zeroae/app', job_id: 555 }, requeued: { repo: 'zeroae/lib', job_id: 999 },
-  }]);
+  assert.deepEqual([res.statusCode, res.body], [200, 'logged: runner of another job\n']);
+  assert.deepEqual(sent, []);
+  assert.deepEqual(logs, [{ anomaly: 'runner of another job', runner: RUNNER, launched_for: 999, took: { repo: 'zeroae/app', job_id: 555 } }]);
 });
 
 test('in_progress on a runner running its own job does nothing', async () => {
-  const own = 'ci-runner-20261113120000-555';
-  const { handler, sent, described, tagged, logs } = setup({ instances: [instance({ 'ci-runner:runner': own, 'ci-runner:job-id': '555' })] });
-  assert.equal((await handler(delivery(job({ action: 'in_progress', runner: own })))).statusCode, 200);
-  assert.deepEqual([sent, described, tagged, logs], [[], [], [], []]);
+  const { handler, sent, logs } = setup();
+  const res = await handler(delivery(job({ action: 'in_progress', runner: 'ci-runner-20261113120000-555' })));
+  assert.deepEqual([res.statusCode, res.body, sent, logs], [200, 'ignored: no swap\n', [], []]);
 });
 
 test('in_progress on a runner that isn\'t the stack\'s is ignored', async () => {
-  const others = [
-    'GitHub Actions 2', 'other-stack-20261113120000-999', 'ci-runner-hand-20261113120000',
-    'ci-runner-2026111312-999', undefined,
-  ];
-  for (const runner of others) {
-    const { handler, sent, tagged } = setup({ instances: [instance({ 'ci-runner:runner': runner })] });
-    assert.equal((await handler(delivery(job({ action: 'in_progress', runner })))).statusCode, 200, String(runner));
-    assert.deepEqual([sent, tagged], [[], []], String(runner));
+  for (const runner of ['GitHub Actions 2', 'other-stack-20261113120000-999', 'ci-runner-hand-20261113120000', 'ci-runner-2026111312-999', undefined]) {
+    const { handler, sent, logs } = setup();
+    const res = await handler(delivery(job({ action: 'in_progress', runner })));
+    assert.deepEqual([res.statusCode, res.body, sent, logs], [200, 'ignored: no swap\n', [], []], String(runner));
   }
-  // The stack's name, but no instance of the stack carries it.
-  const { handler, sent, tagged } = setup({ instances: [instance({ 'ci-runner:stack': 'other' })] });
-  assert.equal((await handler(delivery(job({ action: 'in_progress', runner: RUNNER })))).statusCode, 200);
-  assert.deepEqual([sent, tagged], [[], []]);
 });
 
-test('a repeated in_progress after the re-tag does nothing more', async () => {
-  const { handler, sent, tagged } = setup({ instances: [instance({ 'ci-runner:job-id': '555' })] });
-  assert.equal((await handler(delivery(job({ action: 'in_progress', runner: RUNNER })))).statusCode, 200);
-  assert.deepEqual([sent, tagged], [[], []]);
-});
-
-test('a swap on an instance launched before the labels and shape tags re-queues a ci-cpu-4 x64 job with self-hosted and its capacity label', async () => {
-  const old = instance();
-  for (const k of ['labels', 'capacity', 'vcpus', 'arch']) delete old.Tags[`ci-runner:${k}`];
-  const { handler, sent } = setup({ instances: [old] });
-  await handler(delivery(job({ action: 'in_progress', runner: RUNNER })));
-  assert.deepEqual([sent[0].labels, sent[0].vcpus, sent[0].arch], [['self-hosted', 'ci-spot'], 4, 'x64']);
-});
-
-test('in_progress from outside the fence is refused before any lookup', async () => {
-  const { handler, sent, described } = setup({ instances: [instance()] });
+test('in_progress from outside the fence is refused', async () => {
+  const { handler, sent } = setup();
   assert.equal((await handler(delivery(job({ action: 'in_progress', runner: RUNNER, visibility: 'public' })))).statusCode, 403);
-  assert.deepEqual([sent, described], [[], []]);
+  assert.deepEqual(sent, []);
 });
 
 // The Fargate capacities (#29): Docker-free jobs, ADR-0001.
@@ -354,7 +280,7 @@ test('both Fargate capacities are enqueued with every size and architecture', as
         assert.equal((await handler(delivery(job({ labels })))).statusCode, 202, labels.join(','));
         assert.deepEqual(
           { label: sent[0].label, vcpus: sent[0].vcpus, arch: sent[0].arch, labels: sent[0].labels },
-          { label: cap, vcpus, arch, labels },
+          { label: cap, vcpus, arch, labels: [...labels, JOB_LABEL] },
         );
       }
     }
@@ -379,66 +305,6 @@ test('a Fargate job follows the same contract: no default size or architecture, 
     assert.equal((await handler(delivery(job({ labels })))).statusCode, 200, labels.join(','));
     assert.equal(sent.length, 0);
   }
-});
-
-// A runner the launcher started on Fargate Spot for job 999, and its task. ECS
-// refuses commas and brackets in a tag: the labels are space-joined and the
-// job name's brackets and commas are `_`.
-const TASK_ARN = 'arn:aws:ecs:us-east-1:123456789012:task/ci-runner/0f1e2d3c4b5a69788796a5b4c3d2e1f0';
-const fargateTask = (tags = {}, desiredStatus = 'RUNNING') => ({
-  taskArn: TASK_ARN, desiredStatus,
-  tags: {
-    ...instance().Tags, 'ci-runner:label': 'ci-fargate-spot', 'ci-runner:capacity': 'ci-fargate-spot',
-    'ci-runner:labels': 'self-hosted ci-fargate-spot ci-cpu-8 arm64 linux', 'ci-runner:job-name': 'build _x64_ a_',
-    ...tags,
-  },
-});
-const fargateJob = () => {
-  const p = job({ action: 'in_progress', runner: RUNNER, labels: ['self-hosted', 'ci-fargate-spot', 'ci-cpu-8', 'arm64', 'linux'] });
-  p.workflow_job.name = 'test (arm64, b)';
-  return p;
-};
-
-test('a swap on a task: the runner\'s own job is re-queued from the task\'s tags, and the task is re-tagged with the job it runs', async () => {
-  const { handler, sent, tagged, taskTagged, logs } = setup({ tasks: [fargateTask()] });
-  const res = await handler(delivery(fargateJob()));
-  assert.equal(res.statusCode, 202);
-  assert.deepEqual(sent, [{
-    repo: 'zeroae/lib', job_id: 999, run_id: 888, head_sha: 'fff000', job_name: 'build _x64_ a_',
-    label: 'ci-fargate-spot', vcpus: 8, arch: 'arm64', labels: ['self-hosted', 'ci-fargate-spot', 'ci-cpu-8', 'arm64', 'linux'], installation_id: 181,
-  }]);
-  assert.deepEqual(tagged, []);
-  assert.deepEqual(taskTagged, [{
-    resourceArn: TASK_ARN,
-    tags: [
-      { key: 'ci-runner:repo', value: 'zeroae/app' }, { key: 'ci-runner:job-id', value: '555' },
-      { key: 'ci-runner:run-id', value: '444' }, { key: 'ci-runner:head-sha', value: 'abc123' },
-      { key: 'ci-runner:job-name', value: 'test _arm64_ b_' },
-    ],
-  }]);
-  assert.deepEqual(logs, [{
-    swap: RUNNER, task: TASK_ARN, took: { repo: 'zeroae/app', job_id: 555 }, requeued: { repo: 'zeroae/lib', job_id: 999 },
-  }]);
-});
-
-test('a repeated in_progress after a task\'s re-tag does nothing more', async () => {
-  const { handler, sent, taskTagged } = setup({ tasks: [fargateTask({ 'ci-runner:job-id': '555' })] });
-  assert.equal((await handler(delivery(fargateJob()))).statusCode, 200);
-  assert.deepEqual([sent, taskTagged], [[], []]);
-});
-
-test('a task told to stop, or another runner\'s task, is no swap to repair', async () => {
-  for (const t of [fargateTask({}, 'STOPPED'), fargateTask({ 'ci-runner:runner': 'ci-runner-20261113120000-998' })]) {
-    const { handler, sent, taskTagged } = setup({ tasks: [t] });
-    assert.equal((await handler(delivery(fargateJob()))).statusCode, 200);
-    assert.deepEqual([sent, taskTagged], [[], []]);
-  }
-});
-
-test('a swap on an instance looks up no task', async () => {
-  const { handler, described } = setup({ instances: [instance()], tasks: [fargateTask()] });
-  assert.equal((await handler(delivery(job({ action: 'in_progress', runner: RUNNER })))).statusCode, 202);
-  assert.ok(described.every((d) => d.Filters), 'only DescribeInstances');
 });
 
 // The job label: ci-job-<run_id>-<run_attempt>-<job key>-<matrix index>, here
@@ -501,4 +367,11 @@ test('a job outside the label contract is ignored without a log line, whatever i
   const { handler, sent, logs } = setup();
   const res = await handler(delivery(job({ labels: ['ubuntu-latest', 'ci-job-1-1-tests-0'] })));
   assert.deepEqual([res.statusCode, res.body, sent.length, logs.length], [200, 'ignored: labels\n', 0, 0]);
+});
+
+test('a queued job without a job label is ignored, and the log says why', async () => {
+  const { handler, sent, logs } = setup();
+  const res = await handler(delivery(job({ labels: SHAPE, jobLabel: false })));
+  assert.deepEqual([res.statusCode, res.body, sent.length], [200, 'ignored: labels\n', 0]);
+  assert.deepEqual(logs, [{ ignored: 'zeroae/app', job_id: 555, why: 'no job label' }]);
 });

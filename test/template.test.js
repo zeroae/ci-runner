@@ -183,15 +183,9 @@ test('the notifier may describe only the cluster\'s tasks, and nothing else on E
   ]);
 });
 
-test('the webhook may find and re-tag only the cluster\'s tasks, and only with the job tags', () => {
-  const ecs = statements(resource('WebhookRole')).filter((s) => /ecs:/.test(s));
-  const tasks = 'Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"';
-  const at = (n) => '\n' + ' '.repeat(n);
-  assert.deepEqual(ecs, [
-    `Allow${at(16)}Action: ecs:ListTasks${at(16)}Resource: "*"${at(16)}Condition:${at(18)}ArnEquals:${at(20)}ecs:cluster: !GetAtt RunnerCluster.Arn`,
-    `Allow${at(16)}Action: ecs:DescribeTasks${at(16)}${tasks}`,
-    `Allow${at(16)}Action: ecs:TagResource${at(16)}${tasks}${at(16)}Condition:${at(18)}ForAllValues:StringEquals:${at(20)}`
-      + 'aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]\n',
-  ]);
-  assert.match(resource('WebhookFunction'), /CLUSTER: !Ref RunnerCluster\n/);
+test('the webhook touches no instance and no task, and knows no cluster', () => {
+  // The job label ended swaps, and with them the swap repair, the only user
+  // of these (ADR-0004).
+  assert.deepEqual(statements(resource('WebhookRole')).filter((s) => /ec2:|ecs:/.test(s)), []);
+  assert.doesNotMatch(resource('WebhookFunction'), /CLUSTER:/);
 });
