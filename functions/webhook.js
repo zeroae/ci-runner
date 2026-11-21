@@ -2,8 +2,7 @@
 // webhook: GitHub workflow_job receiver behind a Function URL. Verifies the
 // delivery, applies the label contract, the job label (ADR-0004) and fence 3,
 // and enqueues the job for the launcher. It launches nothing itself, but
-// logs a runner that runs another job than its own, which the job label
-// should make impossible, and tells the notifier when a job of this stack's
+// logs a runner that runs another job than its own (a swap), and tells the notifier when a job of this stack's
 // runners succeeds.
 // Inlined into the template; keep it one dependency-free CommonJS file.
 const crypto = require('node:crypto');
@@ -50,12 +49,13 @@ function shapeOf(labels) {
 // index>`: unique to one job, so the runner launched for the job, which
 // registers with the job's labels, can take no other. Required: GitHub gives
 // a job to any runner whose labels include all of the job's, so a job without
-// one could take any runner of its shape (a swap). Returns why a job's job
-// label breaks it, as { label, why }, or null; the handler checks first that
-// it has one.
+// one, though it gets no runner of its own, could take any runner of its shape
+// (a swap). Returns why a job's labels break it, as { label, why }, or null.
+const NO_JOB_LABEL = 'no job label';
 const isJobLabel = (l) => String(l).toLowerCase().startsWith('ci-job-');
 function jobLabelFault(labels, job) {
   const ls = (labels || []).filter(isJobLabel).map(String);
+  if (!ls.length) return { why: NO_JOB_LABEL };
   if (ls.length > 1) return { label: ls.join(','), why: 'two job labels' };
   const label = ls[0];
   const m = label.toLowerCase().match(/^ci-job-(\d+)-(\d+)-(.*)$/);
@@ -80,11 +80,12 @@ function createHandler({ secret, queue, notifier, env, log = console.log }) {
     return m && m[1] === env.STACK_NAME ? Number(m[2]) : null;
   }
 
-  // A job on a runner of this stack launched for another job: a swap, which
-  // the job label should make impossible (ADR-0004). It is logged, not
-  // repaired; if the runner's own job is stranded, the launcher's re-check
-  // (#51) launches it another runner.
-  function checkRunner(repo, job) {
+  // A job on a runner of this stack launched for another job: a swap. Once
+  // every job of our shape carries its job label none can happen (ADR-0004),
+  // so it is logged, not repaired. The runner's own job waits: the launcher's
+  // re-check (#51) sees the machine tagged with it serving, and launches it
+  // another runner only once that machine is gone.
+  function logSwap(repo, job) {
     const launchedFor = launchJobOf(job.runner_name);
     if (launchedFor === null || launchedFor === job.id) return reply(200, 'ignored: no swap');
     log(JSON.stringify({
@@ -124,21 +125,17 @@ function createHandler({ secret, queue, notifier, env, log = console.log }) {
       log(JSON.stringify({ refused: repo.full_name, visibility: repo.visibility, job_id: job.id }));
       return reply(403, 'refused: only private repos of ' + env.GITHUB_ORG);
     }
-    if (p.action === 'in_progress') return checkRunner(repo, job);
+    if (p.action === 'in_progress') return logSwap(repo, job);
     if (p.action === 'completed') return reportSuccess(p, repo, job);
     if (p.action !== 'queued') return reply(200, 'ignored: action');
     const shape = shapeOf(job.labels);
     if (!shape) return reply(200, 'ignored: labels');
     // A job with no job label breaks the label contract, as one with no size
-    // does, but its own repo's workflow is waiting on it: say so in the log.
-    if (!job.labels.some(isJobLabel)) {
-      log(JSON.stringify({ ignored: repo.full_name, job_id: job.id, why: 'no job label' }));
-      return reply(200, 'ignored: labels');
-    }
+    // does, but unlike a job outside our shape it is ours: the log says why.
     const fault = jobLabelFault(job.labels, job);
     if (fault) {
       log(JSON.stringify({ ignored: repo.full_name, job_id: job.id, ...fault }));
-      return reply(200, 'ignored: job label');
+      return reply(200, fault.why === NO_JOB_LABEL ? 'ignored: labels' : 'ignored: job label');
     }
 
     // The shape as the queue message carries it. The message's `label` is the

@@ -356,8 +356,8 @@ for a job from any repo but a private `zeroae` one (fence 3), `{"ignored":
 "<repo>", "job_id": ..., "why": ...}` for a job of our shape with no job label,
 or a bad one (see "The job label" in `stack.md`), and `{"anomaly": "runner of
 another job", "runner": ..., "launched_for": <job id>, "took": {...}}` if a
-runner ever starts a job other than its own, which the job label should make
-impossible (`docs/traps.md`). Everything else it ignores without a log line.
+runner starts a job other than its own, which only a job without a job label
+can make it do (`docs/traps.md`). Everything else it ignores without a log line.
 
 **The launcher** logs one JSON line per job, carrying the job's fields plus one
 of:

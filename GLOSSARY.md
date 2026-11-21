@@ -33,7 +33,7 @@ The `runs-on` label unique to one job: `ci-job-<run_id>-<run_attempt>-<job key>-
 _Avoid_: run label (that names a run, shared by its jobs)
 
 **Swap**:
-A CI runner taking a queued job other than the one it was launched for. Swaps can no longer happen: GitHub gives a job only to a runner whose labels include all of the job's, every job must carry its own job label, and each runner carries only its own job's. The webhook logs one as an anomaly if it ever sees it, and repairs nothing.
+A CI runner taking a queued job other than the one it was launched for. GitHub gives a job only to a runner whose labels include all of the job's, and each runner carries its own job's job label, so no job that carries one can swap. A job of our shape without one gets no runner of its own but can still take another job's, so swaps end only once every such job carries its label. The webhook logs a swap as an anomaly, and repairs nothing.
 
 **Fargate capacity**:
 Fargate Spot or Fargate On-Demand, the two capacities with no Docker daemon. A job that picks one promises not to use Docker.

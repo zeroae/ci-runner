@@ -17,13 +17,12 @@ const CAPACITY = { 'ci-spot': 'spot', 'ci-ondemand': 'on-demand', 'ci-fargate-sp
 const PROVIDER = { 'ci-fargate-spot': 'FARGATE_SPOT', 'ci-fargate': 'FARGATE' };
 // Fargate offers no arm64 in this AZ, so arm64 tasks skip a subnet there.
 const NO_ARM64_AZ = 'use1-az3';
-// ECS allows only these characters in a tag (EC2 allows any). The webhook's
-// re-tag carries a copy.
+// ECS allows only these characters in a tag (EC2 allows any).
 const ECS_TAG_CHARS = /[^\p{L}\p{Z}\p{N}_.:/=+\-@]/gu;
 const ecsTag = ([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_').slice(0, 256) });
 
 // An EC2 (Key, Value) or ECS (key, value) tag list as an object, keyed
-// without the ci-runner: prefix. The webhook and the notifier carry copies.
+// without the ci-runner: prefix. The notifier carries a copy.
 const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x.key).replace(/^ci-runner:/, ''), x.Value ?? x.value]));
 
 // A queued job is checked again this many seconds after each check (#51): a

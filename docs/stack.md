@@ -239,7 +239,8 @@ something after that. It goes into the message's `labels` with the rest, the
 launcher mints the runner's JIT config with those labels, and so the runner
 launched for the job can take no job with another job label. GitHub gives a
 job to a runner whose labels include all of the job's, so a job without one
-could take any runner of its shape: that is why the label is required.
+could take any runner of its shape: that is why the label is required, and
+why a job without one, though ignored, can still swap while it waits.
 
 A workflow writes it in `runs-on`, with the job key typed by hand: inside
 `runs-on`, `github.job` evaluates to an empty string. `strategy.job-index` is
@@ -300,17 +301,21 @@ ignored, `200`), the webhook invokes the notifier asynchronously
 about the App changes. The webhook does no GitHub call itself.
 
 **A runner running another job** (ADR-0004). A runner can take only a job
-whose labels it carries, and each carries its own job's label, so a runner
-of this stack never runs another job. On `workflow_job` `in_progress` the
+whose labels it carries, and each carries its own job's label, so no job
+with a job label can take another job's runner. A job of our shape without
+one gets no runner of its own, but can still take one launched for another
+job: swaps end only once every such job carries its label. On
+`workflow_job` `in_progress` the
 webhook still reads `runner_name`: a name that isn't `${stack}-<14-digit
 stamp>-<job id>` (a hand launch, a GitHub-hosted runner, another stack), or
 whose job id is the event's, is ignored (`200`, `ignored: no swap`).
 Otherwise it logs `{"anomaly": "runner of another job", "runner",
 "launched_for": <job id>, "took": {repo, job_id}}` and answers `200`. It
-re-queues and re-tags nothing: the job the runner was launched for is
-relaunched by the launcher's next check (#51), and the machine's tags still
-name that job, so a reclaim of it is not reported (the notifier finds that
-job not running on it). Until ADR-0004 the webhook repaired swaps instead
+re-queues and re-tags nothing. The machine's tags still name the job it was
+launched for, so the launcher's checks (#51) count that job as served (its
+log says `served`) and launch it another runner only once the machine is
+gone, at the end of the job it took; and a reclaim of the machine is not
+reported (the notifier finds its launch job not running on it). Until ADR-0004 the webhook repaired swaps instead
 (ADR-0003).
 
 Its role allows `GetSecretValue` on the secret, `SendMessage` on the queue and
