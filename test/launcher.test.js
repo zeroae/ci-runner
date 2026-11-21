@@ -714,8 +714,9 @@ for (const kind of ['instance', 'task']) {
     const { handler, sqs, logs } = setup({ ...m, gh: fakeGitHub({ runners: { 77: { busy: true } } }), now: () => t });
     assert.deepEqual(await handler(sqsEvent(stamped(msg))), { batchItemFailures: [] });
     assert.equal(launched(m), 1, 'launched, though the gap has not passed');
-    assert.deepEqual(sqs, [checkLater(stamped(msg, 2, t))], 'and checks again, the launch counted');
-    assert.deepEqual(JSON.parse(logs.find((l) => l.includes('"launched"'))).swapped, [fargate ? 'arn:aws:ecs:us-east-1:1:task/ci-runner/t0' : 'i-r0']);
+    const id = fargate ? 'arn:aws:ecs:us-east-1:1:task/ci-runner/t0' : 'i-r0';
+    assert.deepEqual(sqs, [checkLater({ ...stamped(msg, 2, t), swapped: [id] })], 'and checks again, the launch counted, the swap remembered');
+    assert.deepEqual(JSON.parse(logs.find((l) => l.includes('"launched"'))).swapped, [id]);
   });
 
   test(`${a} whose runner is idle still serves its job`, async () => {
@@ -736,6 +737,32 @@ for (const kind of ['instance', 'task']) {
     assert.match(logs.join('\n'), /"dropped":"in_progress"/);
   });
 }
+
+test('a swap waives the relaunch gap once: a later check that finds only the same busy machine waits it out', async () => {
+  let t = T0;
+  const running = [{ job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot', runner: 77 }];
+  const ec2 = fakeEc2({ running });
+  const { handler, sqs } = setup({ ec2, gh: fakeGitHub({ runners: { 77: { busy: true } } }), now: () => t });
+  t = T0 + 5 * MIN;
+  await handler(sqsEvent(stamped(MSG)));
+  assert.equal(fleets(ec2), 1, 'the swap relaunches at once');
+  // The new runner idles out (the job is held); the swapped one is still busy.
+  t = T0 + 25 * MIN;
+  await handler(sqsEvent(again(sqs, 0)));
+  assert.equal(fleets(ec2), 1, 'too soon: 20 of the 30 minutes after the second launch');
+  t = T0 + 35 * MIN;
+  await handler(sqsEvent(again(sqs, 1)));
+  assert.equal(fleets(ec2), 2, 'the gap passed');
+});
+
+test('a machine whose runner GitHub no longer has (404) still serves its job', async () => {
+  const ec2 = fakeEc2({ running: [{ job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot', runner: 79 }] });
+  const { handler, sqs, gh } = setup({ ec2 });
+  await handler(sqsEvent(stamped(MSG)));
+  assert.ok(gh.keys().includes('GET /orgs/zeroae/actions/runners/79'));
+  assert.equal(fleets(ec2), 0);
+  assert.deepEqual(sqs, [checkLater(stamped(MSG))]);
+});
 
 test('a job is served while any one of its runners is idle, though another is busy', async () => {
   const ec2 = fakeEc2({ running: [

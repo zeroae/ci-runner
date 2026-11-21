@@ -377,7 +377,10 @@ the check sends its own message on and launches nothing (its log line says
 queued is not serving it: its runner took another job, a swap (ADR-0004). When
 every machine of the job is so, the check reads the job again (the runner may
 have just taken it, which drops the message) and, still queued, launches it at
-once, with no gap, its log line carrying `swapped` (the machines' ids). A
+once, with no gap, its log line carrying `swapped` (the machines' ids). The
+next check's message remembers those ids as `swapped`, so a machine still busy
+on a later check (the relaunch's runner gone, the job still held) waives the
+gap only the first time. A
 machine with no `ci-runner:runner-id` tag, or whose runner GitHub no longer
 has (404), counts as serving. If none is serving, the job is launched as
 above, but no sooner than 15

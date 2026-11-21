@@ -277,10 +277,14 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     if (swapped.length && !(await queued())) return;
 
     // Launched before and not served now: wait out the gap before a relaunch.
-    // A swapped job doesn't wait: its runner took another job, and it gets a
-    // runner now, as it did when the webhook re-queued it.
+    // A newly swapped job doesn't wait: its runner took another job, and it
+    // gets a runner now, as it did when the webhook re-queued it. The message
+    // remembers the swapped machines, so one still busy on a later check (the
+    // relaunch's runner gone, the job still held) waives the gap only once.
     const launches = Number.isInteger(m.launches) && m.launches > 0 ? m.launches : 0;
-    if (launches && !swapped.length && now() - m.launched_at < relaunchGapMs(launches)) {
+    const known = Array.isArray(m.swapped) ? m.swapped : [];
+    const newlySwapped = swapped.some((id) => !known.includes(id));
+    if (launches && !newlySwapped && now() - m.launched_at < relaunchGapMs(launches)) {
       await sqs.sendMessage(checkLater(m));
       return log(JSON.stringify({ ...job, waiting: `relaunch ${launches + 1} from ${new Date(m.launched_at + relaunchGapMs(launches)).toISOString()}` }));
     }
@@ -315,7 +319,8 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     }
     // After the launch, so a failed send here never removes a live runner: the
     // retry then finds it served and sends the check.
-    await sqs.sendMessage(checkLater({ ...m, launches: launches + 1, launched_at: now() }));
+    const remembered = [...new Set([...known, ...swapped])];
+    await sqs.sendMessage(checkLater({ ...m, launches: launches + 1, launched_at: now(), ...(remembered.length && { swapped: remembered }) }));
   }
 
   return async (event) => {
