@@ -458,10 +458,7 @@ are what a hand-run task needs.
 - the instances' `ci-runner:*` tags, plus `ci-runner:stack`. ECS allows only
   letters, digits, spaces and `_ . : / = + - @` in a tag, so on a task
   `ci-runner:labels` is joined by spaces, not commas, and any other character
-  (a job name's brackets or commas) becomes `_`. The webhook's re-tag
-  sanitizes the same way, with a copy of the launcher's `ECS_TAG_CHARS` and
-  `ecsTag` (bundling one costs more bytes than the copy);
-  `test/conventions.test.js` fails if the copies differ.
+  (a job name's brackets or commas) becomes `_`.
 
 The launch is logged as `launched: <task ARN>`. A `RunTask` that returns no
 task fails the message with `no task launched: <reason>: <detail>`.
