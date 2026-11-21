@@ -216,10 +216,73 @@ App's webhook points at), for each delivery:
    `ci-spot`/`ci-ondemand`/`ci-fargate-spot`/`ci-fargate`, exactly one size label (`ci-cpu-2`, `-4`, `-8`,
    `-16`), exactly one of `x64`/`arm64`, and optionally `linux`. None has a
    default: a missing size or architecture label, an unknown `ci-cpu-*`, or
-   both `x64` and `arm64`, are outside it.
+   both `x64` and `arm64`, are outside it. A job label (below) is allowed on
+   top, and checked first: a job with two, or one that names another run or
+   attempt or nothing after them, is ignored (`200`, `ignored: job label`)
+   and logged as `{"ignored": <repo>, "job_id", "label", "why"}`, `why` being
+   `two job labels`, `job label of another run`, `job label of another
+   attempt` or `job label names no job`.
 7. Enqueues `{repo, job_id, run_id, head_sha, job_name, label, vcpus, arch,
    labels, installation_id}` (`label` is the capacity label, lower case;
    `vcpus` is 2, 4, 8 or 16; `arch` is `x64` or `arm64`) and answers `202`.
+
+**The job label** (ADR-0004). A job may carry one label unique to it,
+`ci-job-<run_id>-<run_attempt>-<job key>-<matrix index>`, compared
+case-insensitively. The webhook accepts it only when it starts with
+`ci-job-<run_id>-<run_attempt>-` of the event's `workflow_job` and has
+something after that. It goes into the message's `labels` with the rest, the
+launcher mints the runner's JIT config with those labels, and so the runner
+launched for the job can take no job with another job label. GitHub gives a
+job to a runner whose labels include all of the job's, so that runner can
+still take a job of its shape that has no job label. It is optional for now:
+a job without it is served as before, and swaps are still repaired (below).
+
+A workflow writes it in `runs-on`, with the job key typed by hand: inside
+`runs-on`, `github.job` evaluates to an empty string. `strategy.job-index` is
+`0` in a job with no matrix. Measured on 2026-11-20 in a scratch repo, by
+reading the queued jobs' labels back from the API:
+
+```yaml
+jobs:
+  tests:
+    runs-on: [self-hosted, ci-spot, ci-cpu-4, x64, "ci-job-${{ github.run_id }}-${{ github.run_attempt }}-tests-${{ strategy.job-index }}"]
+```
+
+A `runs-on` built by an expression (the adoption variable's fallback to a
+GitHub-hosted runner) builds the label with `format`:
+
+```yaml
+    runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON(format('["self-hosted","ci-spot","ci-cpu-4","x64","ci-job-{0}-{1}-tests-{2}"]', github.run_id, github.run_attempt, strategy.job-index)) || 'ubuntu-latest' }}
+```
+
+A reusable workflow (`workflow_call`) sees only its own job keys and its own
+`strategy`, so a run that calls it twice, or from a matrix, gives both calls
+the same label. Give it an input the caller makes unique, and put it in the
+label:
+
+```yaml
+# the called workflow
+on:
+  workflow_call:
+    inputs:
+      call: { type: string, required: true }
+jobs:
+  e2e:
+    runs-on: ${{ fromJSON(format('["self-hosted","ci-spot","ci-cpu-4","x64","ci-job-{0}-{1}-e2e-{2}-{3}"]', github.run_id, github.run_attempt, strategy.job-index, inputs.call)) }}
+# the caller
+jobs:
+  e2e-a:
+    uses: ./.github/workflows/e2e.yml
+    with: { call: e2e-a }
+```
+
+A caller with a matrix passes `${{ strategy.job-index }}` in the input too.
+GitHub refuses a runner label of 257 characters or more and silently cuts a
+256-character one to 255, so the runner would not carry the job's label
+(measured 2026-11-20 with `generate-jitconfig`). A 98-character job key is
+accepted and a 100-character one is a workflow file error, so with an 11-digit
+run id and a 3-digit matrix index a label stays under 130 characters, plus the
+input.
 
 **Telling the notifier a job succeeded.** On `workflow_job` `completed` with
 conclusion `success`, and a `runner_name` that is `${stack}-<14-digit
@@ -231,8 +294,9 @@ ignored, `200`), the webhook invokes the notifier asynchronously
 (about 3 deliveries per job: `queued`, `in_progress`, `completed`), so nothing
 about the App changes. The webhook does no GitHub call itself.
 
-**Swap repair** (ADR-0003). GitHub gives a queued job to any idle runner whose
-labels cover it, so a runner launched for job Y may take job X. Left alone,
+**Swap repair** (ADR-0003, superseded by ADR-0004 once the job label is
+required). GitHub gives a queued job to any idle runner whose labels cover it,
+so a runner launched for job Y may take job X, unless X carries a job label. Left alone,
 X's own message is later dropped as not queued, and Y never gets a runner.
 On `workflow_job` `in_progress` the webhook reads `runner_name`:
 

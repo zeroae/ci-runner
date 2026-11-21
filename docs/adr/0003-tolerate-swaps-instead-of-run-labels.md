@@ -1,5 +1,7 @@
 # Tolerate swaps instead of requiring a run label
 
+Superseded by [ADR 0004](0004-a-job-label-pins-each-runner-to-its-job.md).
+
 GitHub gives a queued job to any idle runner whose labels cover the job's, so a CI runner often runs a job other than the one it was launched for: a swap. We don't prevent swaps. The label contract requires a capacity, a size and an architecture label, so a swap only ever happens between runners of the same shape. The system repairs the bookkeeping instead. When the webhook gets `workflow_job` `in_progress`, it reads `runner_name`. If that runner was launched for another job, the webhook re-queues that other job, so it isn't stranded, and re-tags the runner's instance or task with the job it actually runs, so a Spot reclaim is reported on the right commit.
 
 ## Considered Options
