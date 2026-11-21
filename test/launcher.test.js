@@ -153,6 +153,14 @@ test('a queued job mints a JIT config in the ci-runner group with its labels', a
   assert.deepEqual(mint.body, { name: 'ci-runner-20261112120000-555', runner_group_id: 3, labels: ['self-hosted', 'ci-spot'], work_folder: '_work' });
 });
 
+test('the runner for a job with a job label registers with that label, so it can take no other job', async () => {
+  const labels = ['self-hosted', 'ci-spot', 'ci-cpu-4', 'x64', 'ci-job-444-2-tests-0'];
+  const { handler, gh } = setup();
+  await handler(sqsEvent({ ...MSG, labels }));
+  const mint = gh.calls.find((c) => c.key === 'POST /orgs/zeroae/actions/runners/generate-jitconfig');
+  assert.deepEqual(mint.body.labels, labels);
+});
+
 test('a queued job launches one Spot instance from the launch template, tagged with the job', async () => {
   const { handler, ec2, logs } = setup();
   assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] });
