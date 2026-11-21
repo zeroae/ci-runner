@@ -2,17 +2,14 @@
 // webhook: GitHub workflow_job receiver behind a Function URL. Verifies the
 // delivery, applies the label contract, the job label (ADR-0004) and fence 3,
 // and enqueues the job for the launcher. It launches nothing itself, but
-// repairs swaps of jobs without the job label (ADR-0003) and
-// tells the notifier when a job of this stack's runners succeeds.
+// logs a runner that runs another job than its own (a swap), and tells the notifier when a job of this stack's
+// runners succeeds.
 // Inlined into the template; keep it one dependency-free CommonJS file.
 const crypto = require('node:crypto');
 
 const CAPACITY = ['ci-spot', 'ci-ondemand', 'ci-fargate-spot', 'ci-fargate'];
 const SIZE = { 'ci-cpu-2': 2, 'ci-cpu-4': 4, 'ci-cpu-8': 8, 'ci-cpu-16': 16 };
 const ARCH = ['x64', 'arm64'];
-// The shape of an instance or task launched before the shape tags, which
-// swap repair re-queues with it. The launcher carries a copy.
-const DEFAULT_SHAPE = { vcpus: 4, arch: 'x64' };
 
 function reply(statusCode, text) {
   return { statusCode, headers: { 'content-type': 'text/plain; charset=utf-8' }, body: text + '\n' };
@@ -33,8 +30,8 @@ function signatureOk(key, raw, sig) {
 
 // The label contract: `self-hosted`, exactly one capacity label, exactly one
 // size label, exactly one architecture label, and optionally `linux`. None has
-// a default, so a swap only happens between runners of the same shape. A job
-// label, checked by jobLabelFault after, is no part of the shape.
+// a default. The job label, checked by jobLabelFault after, is no part of the
+// shape.
 // Returns the job's shape, or null outside it.
 function shapeOf(labels) {
   const ls = (labels || []).filter((l) => !isJobLabel(l)).map((l) => String(l).toLowerCase());
@@ -50,13 +47,15 @@ function shapeOf(labels) {
 
 // The job label (ADR-0004), `ci-job-<run_id>-<run_attempt>-<job key>-<matrix
 // index>`: unique to one job, so the runner launched for the job, which
-// registers with the job's labels, can take no other. Optional for now: a job
-// without it is served as before. Returns why a job's labels break it, as
-// { label, why }, or null.
+// registers with the job's labels, can take no other. Required: GitHub gives
+// a job to any runner whose labels include all of the job's, so a job without
+// one, though it gets no runner of its own, could take any runner of its shape
+// (a swap). Returns why a job's labels break it, as { label, why }, or null.
+const NO_JOB_LABEL = 'no job label';
 const isJobLabel = (l) => String(l).toLowerCase().startsWith('ci-job-');
 function jobLabelFault(labels, job) {
   const ls = (labels || []).filter(isJobLabel).map(String);
-  if (!ls.length) return null;
+  if (!ls.length) return { why: NO_JOB_LABEL };
   if (ls.length > 1) return { label: ls.join(','), why: 'two job labels' };
   const label = ls[0];
   const m = label.toLowerCase().match(/^ci-job-(\d+)-(\d+)-(.*)$/);
@@ -71,33 +70,7 @@ function jobLabelFault(labels, job) {
   return null;
 }
 
-// The job fields the instance or task carries, as tags.
-const JOB_TAGS = { repo: 'repo', job_id: 'job-id', run_id: 'run-id', head_sha: 'head-sha', job_name: 'job-name' };
-// ECS allows only these characters in a tag (EC2 allows any). A copy of the
-// launcher's, so a re-tag reads as the launch did.
-const ECS_TAG_CHARS = /[^\p{L}\p{Z}\p{N}_.:/=+\-@]/gu;
-const ecsTag = ([key, v]) => ({ key, value: String(v).replace(ECS_TAG_CHARS, '_').slice(0, 256) });
-
-// An EC2 (Key, Value) or ECS (key, value) tag list as an object,
-// keyed without the ci-runner: prefix.
-const tagsOf = (tags) => Object.fromEntries((tags || []).map((x) => [(x.Key ?? x.key).replace(/^ci-runner:/, ''), x.Value ?? x.value]));
-
-function createHandler({ secret, queue, notifier, ec2, ecs, env, log = console.log }) {
-  // The runner's task in the cluster, not yet told to stop, with its tags.
-  async function findTask(name) {
-    let nextToken;
-    do {
-      const r = await ecs.listTasks({ cluster: env.CLUSTER, desiredStatus: 'RUNNING', nextToken });
-      if ((r.taskArns || []).length) {
-        const d = await ecs.describeTasks({ cluster: env.CLUSTER, tasks: r.taskArns, include: ['TAGS'] });
-        const t = (d.tasks || []).find((x) => (x.tags || []).some((g) => g.key === 'ci-runner:runner' && g.value === name));
-        if (t) return t;
-      }
-      nextToken = r.nextToken;
-    } while (nextToken);
-    return undefined;
-  }
-
+function createHandler({ secret, queue, notifier, env, log = console.log }) {
   let key; // the webhook secret, cached once the App exists
 
   // The job id a runner of this stack was launched for, from its name
@@ -107,47 +80,19 @@ function createHandler({ secret, queue, notifier, ec2, ecs, env, log = console.l
     return m && m[1] === env.STACK_NAME ? Number(m[2]) : null;
   }
 
-  // A swap: a runner of this stack, named `${stack}-<stamp>-<job id>`, started
-  // a job other than the one it was launched for. Re-queue that one, so the
-  // launcher's "still queued?" check launches it a runner or drops it, and
-  // re-tag the instance or task so the notifier names the job it runs.
-  async function repairSwap(p, repo, job) {
-    const name = String(job.runner_name || '');
-    const launchJob = launchJobOf(name);
-    if (launchJob === null || launchJob === job.id) return reply(200, 'ignored: no swap');
-    const r = await ec2.describeInstances({
-      Filters: [
-        { Name: 'tag:ci-runner:stack', Values: [env.STACK_NAME] },
-        { Name: 'tag:ci-runner:runner', Values: [name] },
-        { Name: 'instance-state-name', Values: ['pending', 'running'] },
-      ],
-    });
-    const i = (r.Reservations || []).flatMap((x) => x.Instances || [])[0];
-    const task = !i && (await findTask(name));
-    if (!i && !task) return reply(200, 'ignored: no instance or task');
-    const t = tagsOf(i ? i.Tags : task.tags);
-    // Already re-tagged for this job: a duplicate delivery.
-    if (!t['job-id'] || Number(t['job-id']) === job.id) return reply(200, 'ignored: no swap');
-
-    const orig = {
-      repo: t.repo, job_id: Number(t['job-id']), run_id: Number(t['run-id']), head_sha: t['head-sha'],
-      job_name: t['job-name'], label: t.label, vcpus: Number(t.vcpus) || DEFAULT_SHAPE.vcpus, arch: t.arch || DEFAULT_SHAPE.arch,
-      // A task's labels are space-joined: ECS refuses a comma in a tag.
-      labels: t.labels ? t.labels.split(i ? ',' : ' ') : ['self-hosted', t.label],
-      installation_id: p.installation && p.installation.id,
-    };
-    // Queue first: if the re-tag then fails, a redelivery still finds the
-    // old tags and repairs again, rather than skip a job never re-queued.
-    await queue.send(orig);
-    const ran = { repo: repo.full_name, job_id: job.id, run_id: job.run_id, head_sha: job.head_sha, job_name: job.name };
-    const tags = Object.entries(JOB_TAGS).map(([f, k]) => [`ci-runner:${k}`, ran[f]]);
-    if (i) await ec2.createTags({ Resources: [i.InstanceId], Tags: tags.map(([Key, v]) => ({ Key, Value: String(v).slice(0, 256) })) });
-    else await ecs.tagResource({ resourceArn: task.taskArn, tags: tags.map(ecsTag) });
+  // A job on a runner of this stack launched for another job: a swap. Once
+  // every job of our shape carries its job label none can happen (ADR-0004),
+  // so it is logged, not repaired. The runner's own job is not stranded: the
+  // launcher's next check (#51) finds its runner busy while it is still
+  // queued, and launches it another runner.
+  function logSwap(repo, job) {
+    const launchedFor = launchJobOf(job.runner_name);
+    if (launchedFor === null || launchedFor === job.id) return reply(200, 'ignored: no swap');
     log(JSON.stringify({
-      swap: name, ...(i ? { instance: i.InstanceId } : { task: task.taskArn }),
-      took: { repo: ran.repo, job_id: ran.job_id }, requeued: { repo: orig.repo, job_id: orig.job_id },
+      anomaly: 'runner of another job', runner: job.runner_name, launched_for: launchedFor,
+      took: { repo: repo.full_name, job_id: job.id },
     }));
-    return reply(202, 'swap repaired');
+    return reply(200, 'logged: runner of another job');
   }
 
   // A job that finished with success on a runner of this stack. The notifier
@@ -180,15 +125,17 @@ function createHandler({ secret, queue, notifier, ec2, ecs, env, log = console.l
       log(JSON.stringify({ refused: repo.full_name, visibility: repo.visibility, job_id: job.id }));
       return reply(403, 'refused: only private repos of ' + env.GITHUB_ORG);
     }
-    if (p.action === 'in_progress') return repairSwap(p, repo, job);
+    if (p.action === 'in_progress') return logSwap(repo, job);
     if (p.action === 'completed') return reportSuccess(p, repo, job);
     if (p.action !== 'queued') return reply(200, 'ignored: action');
     const shape = shapeOf(job.labels);
     if (!shape) return reply(200, 'ignored: labels');
+    // A job with no job label breaks the label contract, as one with no size
+    // does, but unlike a job outside our shape it is ours: the log says why.
     const fault = jobLabelFault(job.labels, job);
     if (fault) {
       log(JSON.stringify({ ignored: repo.full_name, job_id: job.id, ...fault }));
-      return reply(200, 'ignored: job label');
+      return reply(200, fault.why === NO_JOB_LABEL ? 'ignored: labels' : 'ignored: job label');
     }
 
     // The shape as the queue message carries it. The message's `label` is the
@@ -212,27 +159,14 @@ module.exports.handler = async (event) => {
     const sm = require('@aws-sdk/client-secrets-manager');
     const sqs = require('@aws-sdk/client-sqs');
     const LAMBDA = require('@aws-sdk/client-lambda');
-    const EC2 = require('@aws-sdk/client-ec2');
     const smc = new sm.SecretsManagerClient({});
     const sqsc = new sqs.SQSClient({});
     const lambdac = new LAMBDA.LambdaClient({});
-    const ECS = require('@aws-sdk/client-ecs');
-    const ec2c = new EC2.EC2Client({});
-    const ecsc = new ECS.ECSClient({});
     live = createHandler({
       secret: { get: async () => JSON.parse((await smc.send(new sm.GetSecretValueCommand({ SecretId: process.env.SECRET_ARN }))).SecretString) },
       queue: { send: async (m) => { await sqsc.send(new sqs.SendMessageCommand({ QueueUrl: process.env.QUEUE_URL, MessageBody: JSON.stringify(m) })); } },
       notifier: {
         send: async (m) => { await lambdac.send(new LAMBDA.InvokeCommand({ FunctionName: process.env.NOTIFIER_FUNCTION, InvocationType: 'Event', Payload: JSON.stringify(m) })); },
-      },
-      ec2: {
-        describeInstances: (i) => ec2c.send(new EC2.DescribeInstancesCommand(i)),
-        createTags: (i) => ec2c.send(new EC2.CreateTagsCommand(i)),
-      },
-      ecs: {
-        listTasks: (i) => ecsc.send(new ECS.ListTasksCommand(i)),
-        describeTasks: (i) => ecsc.send(new ECS.DescribeTasksCommand(i)),
-        tagResource: (i) => ecsc.send(new ECS.TagResourceCommand(i)),
       },
       env: process.env,
     });

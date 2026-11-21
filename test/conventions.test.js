@@ -84,29 +84,10 @@ test('the launcher, notifier and sweeper carry identical copies of the GitHub he
   }
 });
 
-test('the launcher and the webhook sanitize an ECS tag the same way', () => {
-  // The webhook re-tags a task the launcher tagged; bundling one rule would
-  // cost more template bytes than the two-line copy.
-  for (const re of [/^const ECS_TAG_CHARS = .*$/m, /^const ecsTag = .*$/m]) {
-    const [launcher, webhook] = ['launcher', 'webhook'].map((f) => (read(`functions/${f}.js`).match(re) || [])[0]);
-    assert.ok(launcher, `the launcher has no ${re}`);
-    assert.equal(webhook, launcher, `the webhook's ${re} differs from the launcher's`);
-  }
-});
-
-test('the launcher, webhook and notifier read tags the same way', () => {
+test('the launcher and the notifier read tags the same way', () => {
   // Each strips the ci-runner: prefix, so t.capacity means the same everywhere.
   const re = /^const tagsOf = .*$/m;
-  const [launcher, ...rest] = ['launcher', 'webhook', 'notifier'].map((f) => ({ f, code: (read(`functions/${f}.js`).match(re) || [])[0] }));
+  const [launcher, ...rest] = ['launcher', 'notifier'].map((f) => ({ f, code: (read(`functions/${f}.js`).match(re) || [])[0] }));
   assert.ok(launcher.code, 'the launcher has no tagsOf');
   for (const o of rest) assert.equal(o.code, launcher.code, `${o.f}'s tagsOf differs from the launcher's`);
-});
-
-test('the launcher and the webhook carry the same DEFAULT_SHAPE', () => {
-  // Swap repair re-queues a runner launched before the shape tags with the
-  // shape the launcher gave it, so the two defaults must agree.
-  const re = /^const DEFAULT_SHAPE = .*$/m;
-  const [launcher, webhook] = ['launcher', 'webhook'].map((f) => (read(`functions/${f}.js`).match(re) || [])[0]);
-  assert.ok(launcher, 'the launcher has no DEFAULT_SHAPE');
-  assert.equal(webhook, launcher, "the webhook's DEFAULT_SHAPE differs from the launcher's");
 });

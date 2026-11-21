@@ -139,7 +139,7 @@ test('a reclaim report tells how to unstick a lost job GitHub keeps in progress'
 });
 
 // A machine is reported only for the job its CI runner is running. The tags
-// say which job it was launched for, or took in a swap (the webhook re-tags it).
+// say which job it was launched for, the only one its runner can take (ADR-0004).
 for (const [why, job] of [
   ['an idle CI runner, whose launch job another CI runner took', { ...RUNNING, runner_name: 'ci-runner-20261112115400-777' }],
   ['a CI runner whose job is still queued', { ...RUNNING, status: 'queued', runner_name: null }],
@@ -152,17 +152,6 @@ for (const [why, job] of [
     assert.match(logs.join('\n'), /not running job 555/);
   });
 }
-
-test('a swapped CI runner is reported for the job it took, not the one it was launched for', async () => {
-  // The webhook re-tagged the instance with job 555; its runner is still named for job 999.
-  const runner = 'ci-runner-20261112115400-999';
-  const inst = instance({ ...TAGS, 'ci-runner:runner': runner });
-  const { handler, gh } = setup({ inst, gh: fakeGitHub({ jobs: [{ ...RUNNING, runner_name: runner }] }) });
-  await handler(EVENT);
-  const { body } = gh.calls.find((c) => c.key === 'POST /repos/zeroae/app/check-runs');
-  assert.equal(body.external_id, '555');
-  assert.equal(body.name, 'ci-runner / tests');
-});
 
 // AWS gives a 2-minute warning, and a job can finish inside it. The webhook
 // tells the notifier when a job succeeds. If that word came before the report
@@ -357,8 +346,7 @@ for (const [why, tasks] of [
   });
 }
 
-// A task's runner is named for its launch job too, and the webhook re-tags a
-// swapped task the same way, so the same rules hold.
+// A task's runner is named for its launch job too, so the same rules hold.
 
 for (const [why, job] of [
   ['an idle Fargate CI runner', { ...RUNNING, runner_name: 'ci-runner-20261112115400-777' }],
@@ -372,14 +360,6 @@ for (const [why, job] of [
     assert.match(logs.join('\n'), /not running job 555/);
   });
 }
-
-test('a swapped Fargate CI runner is reported for the job it took', async () => {
-  const runner = 'ci-runner-20261112115400-999';
-  const tags = { ...TASK_TAGS, 'ci-runner:runner': runner };
-  const { handler, gh } = setup({ inst: null, tasks: [task(tags)], gh: fakeGitHub({ jobs: [{ ...RUNNING, runner_name: runner }] }) });
-  await handler(TASK_EVENT);
-  assert.equal(gh.calls.find((c) => c.key === 'POST /repos/zeroae/app/check-runs').body.external_id, '555');
-});
 
 test('a Fargate job that has finished with success by the time the report is posted turns its check run neutral', async () => {
   const gh = fakeGitHub({ jobs: [TASK_JOB, { ...TASK_JOB, status: 'completed', conclusion: 'success' }] });

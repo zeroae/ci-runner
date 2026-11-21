@@ -62,18 +62,24 @@ it's in both.
    ```yaml
    jobs:
      tests:
-       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-spot","ci-cpu-8","x64"]') || 'ubuntu-latest' }}
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON(format('["self-hosted","ci-spot","ci-cpu-8","x64","ci-job-{0}-{1}-tests-{2}"]', github.run_id, github.run_attempt, strategy.job-index)) || 'ubuntu-latest' }}
      build-arm:
-       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-spot","ci-cpu-4","arm64"]') || 'ubuntu-latest' }}
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON(format('["self-hosted","ci-spot","ci-cpu-4","arm64","ci-job-{0}-{1}-build-arm-{2}"]', github.run_id, github.run_attempt, strategy.job-index)) || 'ubuntu-latest' }}
      apply:
-       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-ondemand","ci-cpu-2","x64"]') || 'ubuntu-latest' }}
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON(format('["self-hosted","ci-ondemand","ci-cpu-2","x64","ci-job-{0}-{1}-apply-{2}"]', github.run_id, github.run_attempt, strategy.job-index)) || 'ubuntu-latest' }}
      lint:
-       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-fargate-spot","ci-cpu-2","arm64"]') || 'ubuntu-latest' }}
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON(format('["self-hosted","ci-fargate-spot","ci-cpu-2","arm64","ci-job-{0}-{1}-lint-{2}"]', github.run_id, github.run_attempt, strategy.job-index)) || 'ubuntu-latest' }}
      docs:
-       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON('["self-hosted","ci-fargate","ci-cpu-4","x64"]') || 'ubuntu-latest' }}
+       runs-on: ${{ vars.ZAE_CI_RUNNER && fromJSON(format('["self-hosted","ci-fargate","ci-cpu-4","x64","ci-job-{0}-{1}-docs-{2}"]', github.run_id, github.run_attempt, strategy.job-index)) || 'ubuntu-latest' }}
    ```
 
-   Each `runs-on` names the full shape: capacity, size and architecture.
+   Each `runs-on` names the full shape: capacity, size and architecture, and
+   the job label, `ci-job-<run id>-<attempt>-<job key>-<matrix index>`, with
+   the job key typed by hand (`github.job` is empty inside `runs-on`). The
+   label pins the runner launched for the job to that job
+   ([ADR-0004](docs/adr/0004-a-job-label-pins-each-runner-to-its-job.md));
+   a reusable workflow needs an input in it too (see "The job label" in
+   [docs/stack.md](docs/stack.md)).
    A job on `ci-fargate-spot` or `ci-fargate` promises not to use Docker
    (no `services:`, `container:`, Docker actions or `docker` commands): a
    Fargate task has no Docker daemon
@@ -95,11 +101,11 @@ it's in both.
 
 **The label contract:** `runs-on` must include `self-hosted`, exactly one of
 `ci-spot`, `ci-ondemand`, `ci-fargate-spot` or `ci-fargate`, exactly one size label (`ci-cpu-2`, `ci-cpu-4`,
-`ci-cpu-8`, `ci-cpu-16`) and exactly one of `x64` or `arm64`. It may also
-include `linux`. None of them has a default. A job missing a size or an
-architecture label, or with any other label (`aarch64`, an unknown
-`ci-cpu-*`, two size labels, both `x64` and `arm64`), is ignored, and it waits
-for a runner that never comes. Before changing the contract, `make consumers`
+`ci-cpu-8`, `ci-cpu-16`), exactly one of `x64` or `arm64`, and exactly one
+job label of its own run and attempt. It may also include `linux`. None of
+them has a default. A job missing a size, an architecture or a job label, or
+with any other label (`aarch64`, an unknown `ci-cpu-*`, two size labels, both
+`x64` and `arm64`), is ignored, and it waits for a runner that never comes. Before changing the contract, `make consumers`
 lists every job it affects.
 
 **What the job gets:** Ubuntu 24.04, the runner as user `runner` (passwordless

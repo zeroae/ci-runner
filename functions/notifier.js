@@ -121,9 +121,9 @@ function createHandler({ secret, fetch, ec2, ecs, now, env, log = console.log })
       return log(`already reported ${id}: ${repo} job ${jobId}`);
     }
     // Only a job this machine's CI runner is running can be lost with it. The
-    // tags name the job the machine was launched for, or took in a swap (the
-    // webhook re-tags it); a CI runner that took no job (another one served
-    // its launch job) is idle, and a completed job is no loss.
+    // tags name the job the machine was launched for, the only one its runner
+    // can take (ADR-0004); a CI runner that took no job is idle, and a
+    // completed job is no loss.
     if (ghJob.status !== 'in_progress' || ghJob.runner_name !== t.runner) {
       return log(`ignored ${id}: its runner is not running job ${jobId} (${ghJob.status}, runner ${ghJob.runner_name || 'none'})`);
     }

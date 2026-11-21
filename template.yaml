@@ -160,7 +160,7 @@ Resources:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
-  # --- webhook: verify, label contract, fence 3, enqueue, swap repair ---------
+  # --- webhook: verify, label contract, fence 3, enqueue ----------------------
   WebhookLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -196,36 +196,6 @@ Resources:
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !GetAtt NotifierFunction.Arn
-              # Swap repair: find a runner's instance, and re-tag it with the
-              # job it really runs. Only the job tags, only the stack's instances.
-              - Effect: Allow
-                Action: ec2:DescribeInstances
-                Resource: "*"
-              - Effect: Allow
-                Action: ec2:CreateTags
-                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
-                Condition:
-                  StringEquals:
-                    aws:ResourceTag/ci-runner:stack: !Ref AWS::StackName
-                  ForAllValues:StringEquals:
-                    aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
-              # The same for a runner's task: only the cluster's tasks, only
-              # the job tags.
-              - Effect: Allow
-                Action: ecs:ListTasks
-                Resource: "*"
-                Condition:
-                  ArnEquals:
-                    ecs:cluster: !GetAtt RunnerCluster.Arn
-              - Effect: Allow
-                Action: ecs:DescribeTasks
-                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
-              - Effect: Allow
-                Action: ecs:TagResource
-                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RunnerCluster}/*"
-                Condition:
-                  ForAllValues:StringEquals:
-                    aws:TagKeys: [ci-runner:repo, ci-runner:job-id, ci-runner:run-id, ci-runner:head-sha, ci-runner:job-name]
 
   WebhookFunction:
     Type: AWS::Lambda::Function
@@ -246,7 +216,6 @@ Resources:
           NOTIFIER_FUNCTION: !Ref NotifierFunction
           GITHUB_ORG: !Ref GitHubOrg
           STACK_NAME: !Ref AWS::StackName
-          CLUSTER: !Ref RunnerCluster
       Code:
         ZipFile: |
           //@inline functions/webhook.js

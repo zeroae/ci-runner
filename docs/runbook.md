@@ -352,17 +352,21 @@ $AWS logs tail /aws/lambda/ci-runner-notifier --since 1d
 
 **The webhook** logs one JSON line per accepted job, `{"enqueued": "<repo>",
 "job_id": ..., "label": ...}`, and `{"refused": "<repo>", "visibility": ...}`
-for a job from any repo but a private `zeroae` one (fence 3), and `{"swap":
-"<runner>", "instance": "i-...", "took": {...}, "requeued": {...}}` (with
-`"task": "<task ARN>"` for a Fargate runner) for each swap it repairs: the runner launched for the `requeued` job started the `took`
-job instead. Everything else it ignores without a log line.
+for a job from any repo but a private `zeroae` one (fence 3), `{"ignored":
+"<repo>", "job_id": ..., "why": ...}` for a job of our shape with no job label,
+or a bad one (see "The job label" in `stack.md`), and `{"anomaly": "runner of
+another job", "runner": ..., "launched_for": <job id>, "took": {...}}` if a
+runner starts a job other than its own, which only a job without a job label
+can make it do (`docs/traps.md`). Everything else it ignores without a log line.
 
 **The launcher** logs one JSON line per job, carrying the job's fields plus one
 of:
 
 | Field | Meaning |
 |---|---|
-| `"launched": "i-..."`, `"runner"`, `"label"` | an instance is up for the job |
+| `"launched": "i-..."`, `"runner"`, `"label"` | an instance is up for the job; with `"swapped": [...]`, because the machines launched for it ran other jobs (a swap, see `docs/traps.md`) |
+| `"served": "i-..."` | a machine launched for the job is still up and its runner idle; the job is checked again in 5 minutes |
+| `"waiting": "relaunch <n> from <time>"` | the job's runners never took it; it is relaunched no sooner than that |
 | `"deferred": "20+8 of 24 spot vCPUs"` | the job's 8 vCPUs would take the capacity's 20 over its budget of 24; the job is back on the queue in 60 s |
 | `"dropped": "completed"` (or another status) | the job no longer waits (cancelled, or taken by another runner); nothing launched |
 | `"dropped": "job not found"` | GitHub answered 404 for the job |
