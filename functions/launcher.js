@@ -36,6 +36,11 @@ const RECHECK_SECONDS = 300;
 // hour. The message carries the count and the time of the job's last launch;
 // one without them (the webhook's) has had none.
 const relaunchGapMs = (launches) => Math.min(15 * 2 ** (launches - 1), 60) * 60e3;
+// A job GitHub can't read yet (#60) is read again this many seconds later, for
+// up to 5 minutes from its first 404: GitHub could read the jobs it 404'd
+// within seconds (2.6 s for one, from the launcher's logs, 2026-11-24).
+const UNREADABLE_RETRY_SECONDS = 10;
+const UNREADABLE_BOUND_MS = 5 * 60e3;
 
 const b64u = (s) => Buffer.from(s).toString('base64url');
 
@@ -245,17 +250,37 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     return Boolean(r && r.busy);
   }
 
-  async function handle(m) {
+  async function handle(received) {
+    // GitHub sends queued before it can read the job (#60). A job never read
+    // yet that reads 404 is tried again on a new message, as a deferral is, so
+    // waiting never counts towards the dead-letter queue; past the bound it is
+    // dropped. One read before (it has had a launch, or was re-sent marked
+    // read) and now 404 is gone (a deleted run), and is dropped at once.
+    const { unreadable_since: since, read: wasRead, ...m } = received;
     const job = { repo: m.repo, job_id: m.job_id };
+    const launches = Number.isInteger(m.launches) && m.launches > 0 ? m.launches : 0;
+    // A message re-sent with no launch yet carries that its job was read.
+    const onward = launches ? m : { ...m, read: true };
     const token = await installationToken(m.installation_id);
+    // The job as GitHub has it, or nothing on a 404.
+    const read = () => gh('GET', `/repos/${m.repo}/actions/jobs/${m.job_id}`, token).catch((e) => { if (e.status !== 404) throw e; });
     // Whether GitHub still has the job queued; a job it hasn't is dropped, logged.
-    const queued = async () => {
-      const j = await gh('GET', `/repos/${m.repo}/actions/jobs/${m.job_id}`, token).catch((e) => { if (e.status !== 404) throw e; });
+    const queued = (j) => {
       const dropped = !j ? 'job not found' : j.status !== 'queued' && j.status;
       if (dropped) log(JSON.stringify({ ...job, dropped }));
       return !dropped;
     };
-    if (!(await queued())) return;
+
+    const first = await read();
+    if (!first && !launches && wasRead !== true) {
+      const from = Number.isFinite(since) ? since : now();
+      if (now() - from < UNREADABLE_BOUND_MS) {
+        await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify({ ...m, unreadable_since: from }), DelaySeconds: UNREADABLE_RETRY_SECONDS });
+        return log(JSON.stringify({ ...job, retrying: 'job not readable yet', since: new Date(from).toISOString() }));
+      }
+      return log(JSON.stringify({ ...job, dropped: 'job not found', never_readable_s: Math.round((now() - from) / 1000) }));
+    }
+    if (!queued(first)) return;
 
     // One listing serves both checks. A job whose runner is still serving it is
     // not launched again: its check goes on, so a runner that idles out without
@@ -268,20 +293,19 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     const swapped = [];
     for (const x of serving) {
       if (!(await runnerBusy(x, token))) {
-        await sqs.sendMessage(checkLater(m));
+        await sqs.sendMessage(checkLater(onward));
         return log(JSON.stringify({ ...job, served: x.id }));
       }
       swapped.push(x.id);
     }
     // Every runner of the job is busy: one may have just taken the job itself.
-    if (swapped.length && !(await queued())) return;
+    if (swapped.length && !queued(await read())) return;
 
     // Launched before and not served now: wait out the gap before a relaunch.
     // A newly swapped job doesn't wait: its runner took another job, and it
     // gets a runner now, as it did when the webhook re-queued it. The message
     // remembers the swapped machines, so one still busy on a later check (the
     // relaunch's runner gone, the job still held) waives the gap only once.
-    const launches = Number.isInteger(m.launches) && m.launches > 0 ? m.launches : 0;
     const known = Array.isArray(m.swapped) ? m.swapped : [];
     const newlySwapped = swapped.some((id) => !known.includes(id));
     if (launches && !newlySwapped && now() - m.launched_at < relaunchGapMs(launches)) {
@@ -296,7 +320,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     const held = machines.filter((x) => x.capacity === type).reduce((n, x) => n + x.vcpus, 0);
     const { vcpus } = shapeOf(m);
     if (held + vcpus > budget) {
-      await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
+      await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(onward), DelaySeconds: 60 });
       return log(JSON.stringify({ ...job, deferred: `${held}+${vcpus} of ${budget} ${type} vCPUs`, ...(swapped.length && { swapped }) }));
     }
 
