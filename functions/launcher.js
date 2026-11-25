@@ -250,11 +250,20 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     return Boolean(r && r.busy);
   }
 
-  async function handle(msg) {
-    const job = { repo: msg.repo, job_id: msg.job_id };
-    const token = await installationToken(msg.installation_id);
+  async function handle(received) {
+    // GitHub sends queued before it can read the job (#60). A job never read
+    // yet that reads 404 is tried again on a new message, as a deferral is, so
+    // waiting never counts towards the dead-letter queue; past the bound it is
+    // dropped. One read before (it has had a launch, or was re-sent marked
+    // read) and now 404 is gone (a deleted run), and is dropped at once.
+    const { unreadable_since: since, read: wasRead, ...m } = received;
+    const job = { repo: m.repo, job_id: m.job_id };
+    const launches = Number.isInteger(m.launches) && m.launches > 0 ? m.launches : 0;
+    // A message re-sent with no launch yet carries that its job was read.
+    const onward = launches ? m : { ...m, read: true };
+    const token = await installationToken(m.installation_id);
     // The job as GitHub has it, or nothing on a 404.
-    const read = () => gh('GET', `/repos/${msg.repo}/actions/jobs/${msg.job_id}`, token).catch((e) => { if (e.status !== 404) throw e; });
+    const read = () => gh('GET', `/repos/${m.repo}/actions/jobs/${m.job_id}`, token).catch((e) => { if (e.status !== 404) throw e; });
     // Whether GitHub still has the job queued; a job it hasn't is dropped, logged.
     const queued = (j) => {
       const dropped = !j ? 'job not found' : j.status !== 'queued' && j.status;
@@ -262,15 +271,8 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
       return !dropped;
     };
 
-    // GitHub sends queued before it can read the job (#60). A job never read
-    // yet that reads 404 is tried again on a new message, as a deferral is, so
-    // waiting never counts towards the dead-letter queue; past the bound it is
-    // dropped. One that has had a launch was read, so a 404 now means it is
-    // gone (a deleted run), and it is dropped at once.
-    const { unreadable_since: since, ...m } = msg;
-    const launches = Number.isInteger(m.launches) && m.launches > 0 ? m.launches : 0;
     const first = await read();
-    if (!first && !launches) {
+    if (!first && !launches && wasRead !== true) {
       const from = Number.isFinite(since) ? since : now();
       if (now() - from < UNREADABLE_BOUND_MS) {
         await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify({ ...m, unreadable_since: from }), DelaySeconds: UNREADABLE_RETRY_SECONDS });
@@ -291,7 +293,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     const swapped = [];
     for (const x of serving) {
       if (!(await runnerBusy(x, token))) {
-        await sqs.sendMessage(checkLater(m));
+        await sqs.sendMessage(checkLater(onward));
         return log(JSON.stringify({ ...job, served: x.id }));
       }
       swapped.push(x.id);
@@ -318,7 +320,7 @@ function createHandler({ secret, fetch, ec2, ecs, sqs, now, env, log = console.l
     const held = machines.filter((x) => x.capacity === type).reduce((n, x) => n + x.vcpus, 0);
     const { vcpus } = shapeOf(m);
     if (held + vcpus > budget) {
-      await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(m), DelaySeconds: 60 });
+      await sqs.sendMessage({ QueueUrl: env.QUEUE_URL, MessageBody: JSON.stringify(onward), DelaySeconds: 60 });
       return log(JSON.stringify({ ...job, deferred: `${held}+${vcpus} of ${budget} ${type} vCPUs`, ...(swapped.length && { swapped }) }));
     }
 

@@ -371,7 +371,7 @@ of:
 | `"dropped": "completed"` (or another status) | the job no longer waits (cancelled, or taken by another runner); nothing launched |
 | `"retrying": "job not readable yet"`, `"since"` | GitHub answered 404 for a job the launcher never read: it does for a second or two after it sends `queued`. The job is read again in 10 s, for up to 5 minutes from `since` |
 | `"dropped": "job not found"`, `"never_readable_s": 300` | the job still read 404 that long after its first 404; nothing launched. Read the job yourself (`gh api repos/<repo>/actions/jobs/<id>`); if it is queued, cancel and re-run it |
-| `"dropped": "job not found"` with no `never_readable_s` | GitHub answered 404 for a job read before (it had a launch): the job is gone, such as a deleted run |
+| `"dropped": "job not found"` with no `never_readable_s` | GitHub answered 404 for a job read before (it had a launch, or was deferred or served before): the job is gone, such as a deleted run |
 | `"dropped": "malformed message"` | a message it can't read, consumed |
 | `"error": "..."` | the attempt failed; the message comes back in 120 s, and after 5 failures it goes to the dead-letter queue. `no instance launched: <code>: <message>` carries EC2 Fleet's errors |
 

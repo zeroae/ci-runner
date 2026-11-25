@@ -370,7 +370,7 @@ test('a job that would go over the Spot budget goes back on the queue with a del
   const ec2 = fakeEc2({ running: [spot(4), spot(16, 'arm64')] });
   const { handler, gh, sqs, logs } = setup({ ec2 });
   assert.deepEqual(await handler(sqsEvent(msg)), { batchItemFailures: [] }, 'the original is consumed');
-  assert.deepEqual(sqs, [{ QueueUrl: 'https://sqs.example/jobs', MessageBody: JSON.stringify(msg), DelaySeconds: 60 }]);
+  assert.deepEqual(sqs, [{ QueueUrl: 'https://sqs.example/jobs', MessageBody: JSON.stringify({ ...msg, read: true }), DelaySeconds: 60 }], 'marked read: it has had no launch (#60)');
   assert.ok(!launched(ec2));
   assert.ok(!gh.keys().some((k) => k.includes('generate-jitconfig')), 'nothing is minted');
   assert.equal(JSON.parse(logs.find((l) => l.includes('"deferred"'))).deferred, '20+8 of 24 spot vCPUs');
@@ -693,7 +693,7 @@ test('a Fargate job served by its own task is not launched again, and its check 
   const { handler, sqs } = setup({ ecs });
   assert.deepEqual(await handler(sqsEvent(FG_MSG)), { batchItemFailures: [] });
   assert.equal(runTaskInput(ecs), undefined, 'no RunTask');
-  assert.deepEqual(sqs, [checkLater(FG_MSG)]);
+  assert.deepEqual(sqs, [checkLater({ ...FG_MSG, read: true })], 'marked read: it has had no launch (#60)');
 });
 
 // --- a swap: the job's runner took another job (#56, widened) --------------
@@ -858,4 +858,35 @@ test('a job that keeps reading 404 is tried until 5 minutes from its first 404, 
   assert.equal(sqs.length, 30, 'not tried again');
   assert.equal(fleets(ec2), 0);
   assert.deepEqual(JSON.parse(logs.at(-1)), { repo: 'zeroae/app', job_id: 555, dropped: 'job not found', never_readable_s: 300 });
+});
+
+// A job read once is never "not readable yet" again, though it has had no
+// launch: a budget deferral, or a check of a job served by another delivery's
+// runner, re-sends it marked read.
+test('a job read and then deferred for budget is dropped at once if it then reads 404; the deferral leaves out unreadable_since', async () => {
+  let t = T0;
+  const gh = fakeGitHub({ jobHttp: 404 });
+  const ec2 = fakeEc2({ running: [spot(16), spot(8)] }); // the Spot budget is full
+  const { handler, sqs, logs } = setup({ gh, ec2, now: () => t });
+  await handler(sqsEvent(MSG)); // not readable yet
+  gh.job.http = 200;
+  t = T0 + 10e3;
+  await handler(sqsEvent(again(sqs, 0)));
+  assert.deepEqual(sqs[1], { QueueUrl: ENV.QUEUE_URL, MessageBody: JSON.stringify({ ...MSG, read: true }), DelaySeconds: 60 }, 'deferred, marked read');
+  gh.job.http = 404; // the run is deleted while it waits
+  t = T0 + 70e3;
+  assert.deepEqual(await handler(sqsEvent(again(sqs, 1))), { batchItemFailures: [] });
+  assert.equal(sqs.length, 2, 'no retry and no check');
+  assert.deepEqual(JSON.parse(logs.at(-1)), { repo: 'zeroae/app', job_id: 555, dropped: 'job not found' });
+  assert.equal(fleets(ec2), 0);
+});
+
+test('a job whose runner is busy, read again after the swap and gone (404), is dropped at once', async () => {
+  const ec2 = fakeEc2({ running: [{ job: MSG.job_id, capacity: 'spot', vcpus: 4, arch: 'x64', lifecycle: 'spot', runner: 77 }] });
+  const gh = fakeGitHub({ runners: { 77: () => { gh.job.http = 404; return { busy: true }; } } });
+  const { handler, sqs, logs } = setup({ gh, ec2 });
+  assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] });
+  assert.equal(fleets(ec2), 0);
+  assert.deepEqual(sqs, [], 'no retry and no check');
+  assert.deepEqual(JSON.parse(logs.at(-1)), { repo: 'zeroae/app', job_id: 555, dropped: 'job not found' });
 });
