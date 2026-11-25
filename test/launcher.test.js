@@ -35,7 +35,7 @@ function verifyJwt(auth) {
 // to a function that returns it (it may change the job, as GitHub would).
 function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }, groups = [{ id: 1, name: 'Default' }, { id: 3, name: 'ci-runner' }], runners = {} } = {}) {
   const calls = [];
-  const job = { status: jobStatus }; // a test can change it, as GitHub does
+  const job = { status: jobStatus, http: jobHttp }; // a test can change either, as GitHub does
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
     const key = `${init.method || 'GET'} ${u.pathname}`;
@@ -48,7 +48,7 @@ function fakeGitHub({ jobStatus = 'queued', jobHttp = 200, jit = { status: 201 }
       return res(201, { token: 'ghs_install', expires_at: new Date(T0 + 3600e3).toISOString() });
     }
     assert.equal(init.headers.authorization, 'Bearer ghs_install', key);
-    if (key === 'GET /repos/zeroae/app/actions/jobs/555') return res(jobHttp, jobHttp === 200 ? { id: 555, status: job.status } : { message: 'x' });
+    if (key === 'GET /repos/zeroae/app/actions/jobs/555') return res(job.http, job.http === 200 ? { id: 555, status: job.status } : { message: 'x' });
     if (key === 'GET /orgs/zeroae/actions/runner-groups') return res(200, { total_count: groups.length, runner_groups: groups });
     if (key === 'POST /orgs/zeroae/actions/runners/generate-jitconfig') {
       return jit.status === 201 ? res(201, { runner: { id: 77, name: body.name }, encoded_jit_config: JIT }) : res(jit.status, { message: 'nope' });
@@ -145,10 +145,12 @@ test('a job that is no longer queued is dropped: no JIT config, no instance', as
   }
 });
 
-test('a job GitHub no longer has (404) is dropped; any other failure retries the message', async () => {
+// A message with a launch was read before, so its job is gone (#60).
+test('a job read before that GitHub no longer has (404) is dropped at once; any other failure retries the message', async () => {
   const gone = setup({ gh: fakeGitHub({ jobHttp: 404 }) });
-  assert.deepEqual(await gone.handler(sqsEvent(MSG)), { batchItemFailures: [] });
-  assert.match(gone.logs.join('\n'), /job not found/);
+  assert.deepEqual(await gone.handler(sqsEvent({ ...MSG, launches: 1, launched_at: T0 })), { batchItemFailures: [] });
+  assert.deepEqual(gone.logs.map((l) => JSON.parse(l)), [{ repo: 'zeroae/app', job_id: 555, dropped: 'job not found' }]);
+  assert.deepEqual(gone.sqs, [], 'no retry and no check');
   const down = setup({ gh: fakeGitHub({ jobHttp: 502 }) });
   assert.deepEqual(await down.handler(sqsEvent(MSG)), { batchItemFailures: [{ itemIdentifier: 'm0' }] });
   assert.match(down.logs.join('\n'), /GET \/repos\/zeroae\/app\/actions\/jobs\/555: 502/);
@@ -808,4 +810,52 @@ test('a job whose runners never take it is relaunched with a growing gap: 15, th
   assert.equal(fleets(ec2), 4, 'the fourth launch, 60 minutes after the third');
   await checkAt(165);
   assert.equal(fleets(ec2), 5, 'the gap stays at 60 minutes');
+});
+
+// --- a job not readable yet (#60) ------------------------------------------
+// GitHub sends workflow_job queued before the job can be read: GET
+// /repos/{repo}/actions/jobs/{id} answers 404 for a second or two (2.6 s for
+// one job, measured from the launcher's logs on 2026-11-24). A job never read
+// yet waits for that, on a new delayed message, up to a bound; one read
+// before (it has had a launch) and now 404 is gone, and dropped at once.
+
+test('a job that reads 404 at first and queued later is launched, its check sent, and nothing dropped', async () => {
+  let t = T0;
+  const gh = fakeGitHub({ jobHttp: 404 });
+  const ec2 = fakeEc2();
+  const { handler, sqs, logs } = setup({ gh, ec2, now: () => t });
+  assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] });
+  assert.equal(fleets(ec2), 0, 'nothing launched while the job reads 404');
+  assert.equal(sqs.length, 1, 'the job is tried again');
+  gh.job.http = 200; // GitHub can read it now
+  t = T0 + 10e3;
+  assert.deepEqual(await handler(sqsEvent(again(sqs, 0))), { batchItemFailures: [] });
+  assert.equal(fleets(ec2), 1, 'launched');
+  assert.deepEqual(sqs[1], checkLater(stamped(MSG, 1, t)), 'its check is sent, as any launched job\'s');
+  assert.ok(!logs.some((l) => l.includes('"dropped"')), 'no dropped line');
+});
+
+test('waiting on a job not readable yet is a new message, 10 s on, not a failed receive, so it never reaches the dead-letter queue', async () => {
+  const { handler, sqs, logs } = setup({ gh: fakeGitHub({ jobHttp: 404 }) });
+  assert.deepEqual(await handler(sqsEvent(MSG)), { batchItemFailures: [] }, 'the original is consumed');
+  assert.deepEqual(sqs, [{ QueueUrl: ENV.QUEUE_URL, MessageBody: JSON.stringify({ ...MSG, unreadable_since: T0 }), DelaySeconds: 10 }]);
+  assert.deepEqual(logs.map((l) => JSON.parse(l)), [{ repo: 'zeroae/app', job_id: 555, retrying: 'job not readable yet', since: '2026-11-12T12:00:00.000Z' }]);
+});
+
+test('a job that keeps reading 404 is tried until 5 minutes from its first 404, then dropped, logged as never readable', async () => {
+  let t = T0;
+  const ec2 = fakeEc2();
+  const { handler, sqs, logs } = setup({ gh: fakeGitHub({ jobHttp: 404 }), ec2, now: () => t });
+  await handler(sqsEvent(MSG));
+  for (let s = 10; s < 300; s += 10) {
+    t = T0 + s * 1e3;
+    assert.deepEqual(await handler(sqsEvent(again(sqs, sqs.length - 1))), { batchItemFailures: [] });
+  }
+  assert.equal(sqs.length, 30, 'tried every 10 s for 5 minutes');
+  assert.equal(JSON.parse(sqs.at(-1).MessageBody).unreadable_since, T0, 'the bound runs from the first 404, across the messages');
+  t = T0 + 300e3;
+  assert.deepEqual(await handler(sqsEvent(again(sqs, sqs.length - 1))), { batchItemFailures: [] });
+  assert.equal(sqs.length, 30, 'not tried again');
+  assert.equal(fleets(ec2), 0);
+  assert.deepEqual(JSON.parse(logs.at(-1)), { repo: 'zeroae/app', job_id: 555, dropped: 'job not found', never_readable_s: 300 });
 });

@@ -332,8 +332,22 @@ failures per message), for each job:
    before the size labels) gets 4 vCPUs and `x64`.
 2. Signs an App JWT and gets an installation token for the job's
    installation. The token is cached until 5 minutes before it expires.
-3. `GET /repos/{repo}/actions/jobs/{job_id}`: anything but `queued` (or a
-   `404`) is dropped, and the message is consumed.
+3. `GET /repos/{repo}/actions/jobs/{job_id}`: anything but `queued` is
+   dropped, and the message is consumed. A `404` depends on whether the job
+   was read before (#60). GitHub sends `workflow_job` `queued` before it can
+   read the job, and answers `404` for a second or two (2.6 s for one job, from
+   the launcher's logs, 2026-11-24), so a message that has had no launch is
+   sent to the queue again with a 10 s delay (`UNREADABLE_RETRY_SECONDS`),
+   carrying `unreadable_since` (the time of its first `404`), and the original
+   is consumed, so waiting doesn't count towards the dead-letter queue. Its log
+   line says `"retrying": "job not readable yet"`. Once the job reads
+   `queued`, it goes on as any other, and its later messages drop
+   `unreadable_since`. One still `404` 5 minutes after its first
+   (`UNREADABLE_BOUND_MS`) is dropped, logged `"dropped": "job not found"`
+   with `never_readable_s`. A message that has had a launch was read, so a
+   `404` means the job is gone (a deleted run): it is dropped at once,
+   `"dropped": "job not found"` with no `never_readable_s`. So is a `404` on
+   the read again after a swap (below).
 4. **The vCPU budget:** sums the vCPUs of the stack's instances
    (`ci-runner:stack` tag) that are `pending`, `running`, `stopping` or
    `stopped` on the job's capacity, both architectures together, from their
